@@ -14,10 +14,26 @@ CONTENT_HASH = ""
 
 
 def get_local_ip():
+    import subprocess
+    try:
+        output = subprocess.check_output(['ipconfig', 'getifaddr', 'en0'], stderr=subprocess.DEVNULL).decode().strip()
+        if output:
+            return output
+    except Exception:
+        pass
+    try:
+        output = subprocess.check_output(['ipconfig', 'getifaddr', 'en1'], stderr=subprocess.DEVNULL).decode().strip()
+        if output:
+            return output
+    except Exception:
+        pass
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        s.connect(("8.8.8.8", 80))
+        s.settimeout(0.1)
+        s.connect(("192.168.1.1", 80))
         ip = s.getsockname()[0]
+    except Exception:
+        ip = "127.0.0.1"
     finally:
         s.close()
     return ip
