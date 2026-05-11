@@ -138,7 +138,7 @@ function calcHash(content) {
 }
 
 textarea.addEventListener('input', () => { localContent = textarea.value; });
-console.log('Connecting to WS...');
+console.log('Connecting to WS... v2');
 connect();
 </script>
 </body>
@@ -226,6 +226,9 @@ class SyncRequestHandler(http.server.SimpleHTTPRequestHandler):
     def serve_html(self):
         self.send_response(200)
         self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
+        self.send_header('Pragma', 'no-cache')
+        self.send_header('Expires', '0')
         self.send_header('Access-Control-Allow-Origin', '*')
         self.end_headers()
         self.wfile.write(HTML_PAGE.encode('utf-8'))
