@@ -80,6 +80,7 @@ function connect() {
 
   ws.onopen = () => { startPing(); };
   ws.onmessage = (e) => {
+    console.log('WS message:', e.data);
     const msg = JSON.parse(e.data);
     if (msg.type === 'content') {
       if (msg.hash !== lastHash) {
@@ -88,6 +89,7 @@ function connect() {
         lastHash = msg.hash;
         document.getElementById('contentHash').textContent = msg.hash;
         document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
+        console.log('Content updated from sync');
       }
     } else if (msg.type === 'count') {
       document.getElementById('connCount').textContent = msg.count;
@@ -99,7 +101,8 @@ function connect() {
       document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
     }
   };
-  ws.onclose = () => { setTimeout(connect, 2000); };
+  ws.onclose = () => { console.log('WS closed, reconnecting...'); setTimeout(connect, 2000); };
+  ws.onerror = (e) => { console.log('WS error:', e); };
 }
 
 function startPing() {
@@ -131,10 +134,11 @@ function calcHash(content) {
     h = ((h << 5) - h) + content.charCodeAt(i);
     h |= 0;
   }
-  return Math.abs(h).toString(16);
+  return Math.abs(h || 1).toString(16);
 }
 
 textarea.addEventListener('input', () => { localContent = textarea.value; });
+console.log('Connecting to WS...');
 connect();
 </script>
 </body>
@@ -239,7 +243,7 @@ class SyncRequestHandler(http.server.SimpleHTTPRequestHandler):
             if not key:
                 self.send_error(400)
                 return
-            resp_key = base64.b64encode(hashlib.sha1((key + '258EAFA5-E914-47DA-95CA-C5AC0F8C8C8E').encode()).digest()).decode()
+            resp_key = base64.b64encode(hashlib.sha1(base64.b64decode(key) + '258EAFA5-E914-47DA-95CA-C5AC0F8C8C8E'.encode()).digest()).decode()
             response = (
                 b'HTTP/1.1 101 Switching Protocols\r\n'
                 b'Upgrade: websocket\r\n'
