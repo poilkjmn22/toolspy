@@ -16,6 +16,10 @@ TOOLS = {
         'module': 'tools.file_share.server',
         'help': 'LAN file sharing server with drag-and-drop upload',
     },
+    'llm-chat': {
+        'module': 'tools.llm_chat.server',
+        'help': 'Local LLM chat server via Ollama API',
+    },
 }
 
 

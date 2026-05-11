@@ -16,6 +16,9 @@ toolspy/
 │   └── file_share/         # 工具C：局域网文件传输
 │       ├── __init__.py
 │       └── server.py
+│   └── llm_chat/          # 工具D：本地 LLM 聊天
+│       ├── __init__.py
+│       └── server.py
 ├── docs/                   # 文档/参考文件
 ├── src/                    # 旧版/归档代码
 ├── requirements.txt        # 依赖
@@ -51,6 +54,10 @@ TOOLS = {
     },
     'file-share': {
         'module': 'tools.file_share.server',
+        'help': '...',
+    },
+    'llm-chat': {
+        'module': 'tools.llm_chat.server',
         'help': '...',
     },
     'new-tool': {
