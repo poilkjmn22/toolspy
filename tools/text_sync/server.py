@@ -154,7 +154,7 @@ async def ws_handler(websocket):
         print(f"DEBUG: client connected. total: {len(ws_clients)}")
 
     try:
-        await websocket.send(json.dumps({'type': 'init', 'content': CONTENT, 'hash': CONTENT_HASH}))
+        await websocket.send_str(json.dumps({'type': 'init', 'content': CONTENT, 'hash': CONTENT_HASH}))
     except Exception:
         pass
 
@@ -177,7 +177,7 @@ async def ws_handler(websocket):
                         print(f"DEBUG: sync received. {len(ws_clients)} clients, sending to {len(clients_to_notify)}")
                         for c in clients_to_notify:
                             try:
-                                await c.send(json.dumps({'type': 'content', 'content': new_content, 'hash': new_hash}))
+                                await c.send_str(json.dumps({'type': 'content', 'content': new_content, 'hash': new_hash}))
                             except Exception as e:
                                 print(f"DEBUG: send error: {e}")
                                 pass
@@ -185,7 +185,7 @@ async def ws_handler(websocket):
                     async with ws_clients_lock:
                         count = len(ws_clients)
                     try:
-                        await websocket.send(json.dumps({'type': 'count', 'count': count}))
+                        await websocket.send_str(json.dumps({'type': 'count', 'count': count}))
                     except Exception:
                         pass
             except Exception as e:
