@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
+import asyncio
 import socket
-import threading
 import argparse
 import os
 import json
-import base64
-import hashlib
-import struct
 
 PORT_DEFAULT = 8000
 CONTENT = ""
@@ -139,201 +136,110 @@ function calcHash(content) {
 }
 
 textarea.addEventListener('input', () => { localContent = textarea.value; });
-console.log('Connecting to WS... v9');
+console.log('Connecting to WS... v13');
 connect();
 </script>
 </body>
 </html>
 """
 
-ws_clients = []
-ws_clients_lock = threading.Lock()
-content_lock = threading.Lock()
-SERVER_PORT = [8000]
+ws_clients = set()
+ws_clients_lock = asyncio.Lock()
 
 
-def send_ws_frame(conn, data):
-    payload = data.encode('utf-8')
-    length = len(payload)
-    frame = bytearray()
-    frame.append(0x81)
-    if length < 126:
-        frame.append(length)
-    elif length < 65536:
-        frame.append(126)
-        frame.extend(struct.pack('>H', length))
-    else:
-        frame.append(127)
-        frame.extend(struct.pack('>Q', length))
-    frame.extend(payload)
-    conn.sendall(bytes(frame))
-
-
-def recv_ws_frame(conn):
-    try:
-        first = conn.recv(1)
-        if not first:
-            return None
-        b = first[0]
-        opcode = b & 0x0F
-        if opcode == 0x08:
-            return None
-        if opcode != 0x01:
-            return recv_ws_frame(conn)
-        b2 = conn.recv(1)[0]
-        length = b2 & 0x7F
-        if length == 126:
-            length = struct.unpack('>H', conn.recv(2))[0]
-        elif length == 127:
-            length = struct.unpack('>Q', conn.recv(8))[0]
-        payload = conn.recv(length)
-        return payload.decode('utf-8', errors='replace')
-    except Exception:
-        return None
-
-
-def parse_http_request(data):
-    lines = data.decode('utf-8', errors='replace').split('\r\n')
-    if not lines:
-        return None, None
-    request_line = lines[0].split(' ')
-    if len(request_line) < 2:
-        return None, None
-    method, path = request_line[0], request_line[1]
-    headers = {}
-    for line in lines[1:]:
-        if ':' in line:
-            key, val = line.split(':', 1)
-            headers[key.strip().lower()] = val.strip()
-    return method, path, headers
-
-
-def handle_client(conn, addr):
+async def ws_handler(websocket):
     global CONTENT, CONTENT_HASH
+    async with ws_clients_lock:
+        ws_clients.add(websocket)
 
     try:
-        data = b''
-        while b'\r\n\r\n' not in data:
-            chunk = conn.recv(1)
-            if not chunk:
-                conn.close()
-                return
-            data += chunk
+        await websocket.send(json.dumps({'type': 'init', 'content': CONTENT, 'hash': CONTENT_HASH}))
+    except Exception:
+        pass
 
-        method, path, headers = parse_http_request(data)
-        if path == '/ws' and headers.get('upgrade', '') == 'websocket':
-            key = headers.get('sec-websocket-key', '')
-            if key:
-                resp_key = base64.b64encode(
-                    hashlib.sha1(base64.b64decode(key) + b'258EAFA5-E914-47DA-95CA-C5AC0F8C8C8E').digest()
-                ).decode()
-                response = (
-                    b'HTTP/1.1 101 Switching Protocols\r\n'
-                    b'Upgrade: websocket\r\n'
-                    b'Connection: Upgrade\r\n'
-                    b'Sec-WebSocket-Accept: ' + resp_key.encode() + b'\r\n'
-                    b'\r\n'
-                )
-                conn.sendall(response)
-
-                with ws_clients_lock:
-                    ws_clients.append(conn)
-
-                try:
-                    send_ws_frame(conn, json.dumps({'type': 'init', 'content': CONTENT, 'hash': CONTENT_HASH}))
-                except Exception:
-                    pass
-
-                while True:
-                    frame_data = recv_ws_frame(conn)
-                    if not frame_data:
-                        break
+    try:
+        async for message in websocket:
+            try:
+                msg = json.loads(message)
+                t = msg.get('type')
+                if t == 'sync':
+                    new_content = msg.get('content', '')
+                    new_hash = msg.get('hash', '')
+                    async with ws_clients_lock:
+                        CONTENT = new_content
+                        CONTENT_HASH = new_hash
+                        for c in ws_clients:
+                            if c is not websocket:
+                                try:
+                                    await c.send(json.dumps({'type': 'content', 'content': new_content, 'hash': new_hash}))
+                                except Exception:
+                                    pass
+                elif t == 'ping':
+                    async with ws_clients_lock:
+                        count = len(ws_clients)
                     try:
-                        msg = json.loads(frame_data)
-                        t = msg.get('type')
-                        if t == 'sync':
-                            new_content = msg.get('content', '')
-                            new_hash = msg.get('hash', '')
-                            CONTENT = new_content
-                            CONTENT_HASH = new_hash
-                            with ws_clients_lock:
-                                for c in ws_clients:
-                                    if c is not conn:
-                                        try:
-                                            send_ws_frame(c, json.dumps({'type': 'content', 'content': new_content, 'hash': new_hash}))
-                                        except Exception:
-                                            pass
-                        elif t == 'ping':
-                            with ws_clients_lock:
-                                count = len([c for c in ws_clients if c])
-                            try:
-                                send_ws_frame(conn, json.dumps({'type': 'count', 'count': count}))
-                            except Exception:
-                                pass
+                        await websocket.send(json.dumps({'type': 'count', 'count': count}))
                     except Exception:
                         pass
-        elif path in ('/', '/index.html', ''):
-            response = (
-                b'HTTP/1.1 200 OK\r\n'
-                b'Content-Type: text/html; charset=utf-8\r\n'
-                b'Cache-Control: no-cache\r\n'
-                b'Access-Control-Allow-Origin: *\r\n'
-                b'\r\n'
-            )
-            response += HTML_PAGE.encode('utf-8')
-            conn.sendall(response)
-
-            while True:
-                chunk = conn.recv(1)
-                if not chunk:
-                    break
-    except Exception as e:
-        print(f"Client error: {e}")
+            except Exception:
+                pass
+    except Exception:
+        pass
     finally:
-        with ws_clients_lock:
-            if conn in ws_clients:
-                ws_clients.remove(conn)
-        conn.close()
+        async with ws_clients_lock:
+            ws_clients.discard(websocket)
 
 
-def main():
-    global SERVER_PORT
+async def http_handler(request):
+    global HTML_PAGE
+    from aiohttp import web
+    return web.Response(text=HTML_PAGE, content_type='text/html', status=200, headers={'Cache-Control': 'no-cache'})
+
+
+async def websocket_handler(request):
+    from aiohttp import web
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+    await ws_handler(ws)
+    return ws
+
+
+async def main(port, directory):
+    global CONTENT, CONTENT_HASH
+    os.chdir(directory or os.getcwd())
+
+    from aiohttp import web
+
+    app = web.Application()
+    app.router.add_get('/', http_handler)
+    app.router.add_get('/ws', websocket_handler)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '', port)
+    await site.start()
+
+    ip = get_local_ip()
+    print(f"Serving at http://{ip}:{port}")
+    print(f"Or http://localhost:{port}")
+    print(f"Press Ctrl+C to stop")
+
+    try:
+        while True:
+            await asyncio.sleep(1)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        await runner.cleanup()
+
+
+if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='HTTP server with real-time text sync')
     parser.add_argument('-l', '--listen', type=int, default=PORT_DEFAULT, help=f'Port (default {PORT_DEFAULT})')
     parser.add_argument('-d', '--directory', help='Directory to serve (default current directory)')
     args = parser.parse_args()
-    SERVER_PORT[0] = args.listen
-
-    os.chdir(args.directory or os.getcwd())
-
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(('', args.listen))
-    server.listen(50)
-
-    ip = get_local_ip()
-    print(f"Serving at http://{ip}:{args.listen}")
-    print(f"Or http://localhost:{args.listen}")
-    print(f"Press Ctrl+C to stop")
-
-    def accept_loop():
-        while True:
-            try:
-                conn, addr = server.accept()
-                t = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
-                t.start()
-            except Exception:
-                break
-
-    accept_thread = threading.Thread(target=accept_loop, daemon=True)
-    accept_thread.start()
 
     try:
-        accept_thread.join()
+        asyncio.run(main(args.listen, args.directory))
     except KeyboardInterrupt:
         print("\nShutting down...")
-        server.close()
-
-
-if __name__ == '__main__':
-    main()
