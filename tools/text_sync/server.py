@@ -75,9 +75,8 @@ function connect() {
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(protocol + '//' + location.host + '/ws');
 
-  ws.onopen = () => { startPing(); console.log('WS connected'); };
+  ws.onopen = () => { startPing(); };
   ws.onmessage = (e) => {
-    console.log('WS message:', e.data);
     const msg = JSON.parse(e.data);
     if (msg.type === 'content') {
       if (msg.hash !== lastHash) {
@@ -86,7 +85,6 @@ function connect() {
         lastHash = msg.hash;
         document.getElementById('contentHash').textContent = msg.hash;
         document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
-        console.log('Content updated from sync');
       }
     } else if (msg.type === 'count') {
       document.getElementById('connCount').textContent = msg.count;
@@ -98,8 +96,8 @@ function connect() {
       document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
     }
   };
-  ws.onclose = () => { console.log('WS closed, reconnecting...'); setTimeout(connect, 2000); };
-  ws.onerror = (e) => { console.log('WS error:', e); };
+  ws.onclose = () => { setTimeout(connect, 2000); };
+  ws.onerror = () => { };
 }
 
 function startPing() {
@@ -111,7 +109,7 @@ function startPing() {
 }
 
 function syncContent() {
-  if (!ws || ws.readyState !== WebSocket.OPEN) { console.log('WS not ready'); return; }
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
   const btn = document.getElementById('syncBtn');
   btn.classList.add('syncing');
   const content = textarea.value;
@@ -123,7 +121,6 @@ function syncContent() {
   const status = document.getElementById('status');
   status.style.display = 'block';
   setTimeout(() => { status.style.display = 'none'; btn.classList.remove('syncing'); }, 1500);
-  console.log('Sync sent:', content.substring(0, 50));
 }
 
 function calcHash(content) {
@@ -136,7 +133,6 @@ function calcHash(content) {
 }
 
 textarea.addEventListener('input', () => { localContent = textarea.value; });
-console.log('Connecting to WS... v13');
 connect();
 </script>
 </body>
@@ -151,7 +147,6 @@ async def ws_handler(websocket):
     global CONTENT, CONTENT_HASH
     async with ws_clients_lock:
         ws_clients.add(websocket)
-        print(f"DEBUG: client connected. total: {len(ws_clients)}")
 
     try:
         await websocket.send_str(json.dumps({'type': 'init', 'content': CONTENT, 'hash': CONTENT_HASH}))
@@ -164,7 +159,6 @@ async def ws_handler(websocket):
                 msg_data = message.data
                 if isinstance(msg_data, tuple):
                     msg_data = msg_data[1]
-                print(f"DEBUG: received: {str(msg_data)[:50]}")
                 msg = json.loads(msg_data)
                 t = msg.get('type')
                 if t == 'sync':
@@ -173,14 +167,12 @@ async def ws_handler(websocket):
                     async with ws_clients_lock:
                         CONTENT = new_content
                         CONTENT_HASH = new_hash
-                        clients_to_notify = [c for c in ws_clients if c is not websocket]
-                        print(f"DEBUG: sync received. {len(ws_clients)} clients, sending to {len(clients_to_notify)}")
-                        for c in clients_to_notify:
-                            try:
-                                await c.send_str(json.dumps({'type': 'content', 'content': new_content, 'hash': new_hash}))
-                            except Exception as e:
-                                print(f"DEBUG: send error: {e}")
-                                pass
+                        for c in ws_clients:
+                            if c is not websocket:
+                                try:
+                                    await c.send_str(json.dumps({'type': 'content', 'content': new_content, 'hash': new_hash}))
+                                except Exception:
+                                    pass
                 elif t == 'ping':
                     async with ws_clients_lock:
                         count = len(ws_clients)
@@ -188,16 +180,13 @@ async def ws_handler(websocket):
                         await websocket.send_str(json.dumps({'type': 'count', 'count': count}))
                     except Exception:
                         pass
-            except Exception as e:
-                print(f"DEBUG: inner exception: {e}")
+            except Exception:
                 pass
-    except Exception as e:
-        print(f"DEBUG: outer exception: {e}")
+    except Exception:
         pass
     finally:
         async with ws_clients_lock:
             ws_clients.discard(websocket)
-            print(f"DEBUG: client disconnected. total: {len(ws_clients)}")
 
 
 async def http_handler(request):
