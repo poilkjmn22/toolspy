@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+myenv/
+.DS_Store
+*.un~
+*.docx
