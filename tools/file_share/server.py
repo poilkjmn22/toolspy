@@ -356,13 +356,12 @@ async def upload_handler(request):
     content_length = request.content_length or 0
 
     if content_length > MAX_FILE_SIZE:
-        return web.Response(status=413, text=f'File too large. Max size is 5GB.')
+        return web.Response(status=413, text='File too large. Max size is 5GB.')
 
-    file_data = b''
-    async for chunk in field.chunk(1024 * 1024):
-        file_data += chunk
-        if len(file_data) > MAX_FILE_SIZE:
-            return web.Response(status=413, text=f'File too large. Max size is 5GB.')
+    file_data = await field.read()
+
+    if len(file_data) > MAX_FILE_SIZE:
+        return web.Response(status=413, text='File too large. Max size is 5GB.')
 
     file_id = hashlib.sha1((filename + str(time.time())).encode()).hexdigest()[:16]
 
