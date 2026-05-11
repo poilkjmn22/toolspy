@@ -1,0 +1,14 @@
+#!/bin/bash
+# toolspy - Run ToolsPy tools
+# Place this script in the project root and chmod +x it
+
+DIR="$(cd "$(dirname "$0")" && pwd)"
+MYENV="$DIR/myenv/bin/python"
+
+if [ ! -f "$MYENV" ]; then
+    echo "Error: myenv not found. Run:" >&2
+    echo "  python3 -m venv myenv && myenv/bin/pip install -r requirements.txt" >&2
+    exit 1
+fi
+
+exec "$MYENV" -m tools "$@"
