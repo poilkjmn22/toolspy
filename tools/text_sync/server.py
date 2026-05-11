@@ -160,8 +160,10 @@ async def ws_handler(websocket):
 
     try:
         async for message in websocket:
+            print(f"DEBUG: received message: {message[:50] if message else 'empty'}")
             try:
                 msg = json.loads(message)
+                print(f"DEBUG: parsed msg type: {msg.get('type')}")
                 t = msg.get('type')
                 if t == 'sync':
                     new_content = msg.get('content', '')
@@ -184,9 +186,11 @@ async def ws_handler(websocket):
                         await websocket.send(json.dumps({'type': 'count', 'count': count}))
                     except Exception:
                         pass
-            except Exception:
+            except Exception as e:
+                print(f"DEBUG: inner exception: {e}")
                 pass
-    except Exception:
+    except Exception as e:
+        print(f"DEBUG: outer exception: {e}")
         pass
     finally:
         async with ws_clients_lock:
