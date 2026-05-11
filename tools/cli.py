@@ -12,6 +12,10 @@ TOOLS = {
         'module': 'tools.text_sync.server',
         'help': 'HTTP server with real-time text sync',
     },
+    'file-share': {
+        'module': 'tools.file_share.server',
+        'help': 'LAN file sharing server with drag-and-drop upload',
+    },
 }
 
 

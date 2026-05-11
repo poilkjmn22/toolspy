@@ -10,7 +10,10 @@ toolspy/
 │   ├── docx_merger/        # 工具A：TSX → DOCX 合并
 │   │   ├── __init__.py
 │   │   └── main.py
-│   └── text_sync/          # 工具B：实时文本同步服务器
+│   ├── text_sync/          # 工具B：实时文本同步服务器
+│   │   ├── __init__.py
+│   │   └── server.py
+│   └── file_share/         # 工具C：局域网文件传输
 │       ├── __init__.py
 │       └── server.py
 ├── docs/                   # 文档/参考文件
@@ -44,6 +47,10 @@ TOOLS = {
     },
     'text-sync': {
         'module': 'tools.text_sync.server',
+        'help': '...',
+    },
+    'file-share': {
+        'module': 'tools.file_share.server',
         'help': '...',
     },
     'new-tool': {

@@ -14,10 +14,12 @@ python -m tools --list
 # Run a specific tool
 python -m tools docx-merger <args>
 python -m tools text-sync -l 8000
+python -m tools file-share -l 8001
 
-# Or run tools directly (without going through CLI)
+# Or run tools directly
 python tools/docx_merger/main.py <args>
 python tools/text_sync/server.py -l 8000
+python tools/file_share/server.py -l 8001
 ```
 
 ## Architecture
@@ -32,9 +34,10 @@ python tools/text_sync/server.py -l 8000
 
 - **docx-merger** - Merges `.tsx` files into a DOCX document
 - **text-sync** - HTTP server with real-time text sync across devices via WebSocket
+- **file-share** - LAN file sharing with drag-and-drop upload, image preview, max 5GB per file, 20 files max
 
 ## Key facts
 
 - `setup.sh` has a typo: installs `python-docs` instead of `python-docx`; use `requirements.txt` directly.
-- Dependencies: `lxml`, `pillow`, `python-docx`, `typing_extensions`.
+- Dependencies: `lxml`, `pillow`, `python-docx`, `typing_extensions`, `aiohttp`.
 - No tests, no lint/typecheck configured.
