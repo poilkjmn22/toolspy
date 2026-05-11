@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-import argparse
-import os
+import http.server
+import socketserver
 import socket
 import threading
+import argparse
+import os
 import struct
 import json
 import base64
@@ -78,7 +80,7 @@ function connect() {
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(protocol + '//' + location.host + '/ws');
 
-  ws.onopen = () => { startPing(); };
+  ws.onopen = () => { startPing(); console.log('WS connected'); };
   ws.onmessage = (e) => {
     console.log('WS message:', e.data);
     const msg = JSON.parse(e.data);
@@ -114,7 +116,7 @@ function startPing() {
 }
 
 function syncContent() {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN) { console.log('WS not ready'); return; }
   const btn = document.getElementById('syncBtn');
   btn.classList.add('syncing');
   const content = textarea.value;
@@ -126,6 +128,7 @@ function syncContent() {
   const status = document.getElementById('status');
   status.style.display = 'block';
   setTimeout(() => { status.style.display = 'none'; btn.classList.remove('syncing'); }, 1500);
+  console.log('Sync sent:', content.substring(0, 50));
 }
 
 function calcHash(content) {
@@ -138,7 +141,7 @@ function calcHash(content) {
 }
 
 textarea.addEventListener('input', () => { localContent = textarea.value; });
-console.log('Connecting to WS... v2');
+console.log('Connecting to WS... v5');
 connect();
 </script>
 </body>
@@ -150,42 +153,34 @@ ws_clients_lock = threading.Lock()
 content_lock = threading.Lock()
 
 
-class WebSocketStream:
-    def __init__(self, rfile, wfile):
-        self.rfile = rfile
-        self.wfile = wfile
+class FrameSocket:
+    def __init__(self, conn):
+        self.conn = conn
         self.closed = False
 
-    def read(self):
+    def read_frame(self):
         try:
-            first_byte = self.rfile.read(1)
-            if not first_byte:
+            first = self.conn.recv(1)
+            if not first:
                 return None
-            b = first_byte[0]
+            b = first[0]
             opcode = b & 0x0F
             if opcode == 0x08:
                 return None
             if opcode != 0x01:
-                return self.read()
-            b2 = self.rfile.read(1)[0]
-            mask = (b2 >> 7) & 1
+                return self.read_frame()
+            b2 = self.conn.recv(1)[0]
             length = b2 & 0x7F
             if length == 126:
-                length = struct.unpack('>H', self.rfile.read(2))[0]
+                length = struct.unpack('>H', self.conn.recv(2))[0]
             elif length == 127:
-                length = struct.unpack('>Q', self.rfile.read(8))[0]
-            if mask:
-                masking = self.rfile.read(4)
-                payload = bytearray(self.rfile.read(length))
-                for i in range(len(payload)):
-                    payload[i] ^= masking[i % 4]
-                return payload.decode('utf-8', errors='replace')
-            else:
-                return self.rfile.read(length).decode('utf-8', errors='replace')
+                length = struct.unpack('>Q', self.conn.recv(8))[0]
+            payload = self.conn.recv(length)
+            return payload.decode('utf-8', errors='replace')
         except Exception:
             return None
 
-    def write(self, data):
+    def send_frame(self, data):
         try:
             payload = data.encode('utf-8')
             length = len(payload)
@@ -200,25 +195,16 @@ class WebSocketStream:
                 frame.append(127)
                 frame.extend(struct.pack('>Q', length))
             frame.extend(payload)
-            self.wfile.write(bytes(frame))
-            self.wfile.flush()
+            self.conn.sendall(bytes(frame))
         except Exception:
             self.closed = True
-
-
-class SyncRequestHandler:
-    pass
-
-
-import http.server
-import socketserver
 
 
 class SyncRequestHandler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/ws':
             self.handle_websocket()
-        elif self.path == '/' or self.path == '/index.html' or self.path == '':
+        elif self.path in ('/', '/index.html', ''):
             self.serve_html()
         else:
             super().do_GET()
@@ -227,16 +213,12 @@ class SyncRequestHandler(http.server.SimpleHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-Type', 'text/html; charset=utf-8')
         self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
-        self.send_header('Pragma', 'no-cache')
-        self.send_header('Expires', '0')
         self.send_header('Access-Control-Allow-Origin', '*')
         self.end_headers()
         self.wfile.write(HTML_PAGE.encode('utf-8'))
 
-    def do_POST(self):
-        super().do_POST()
-
     def handle_websocket(self):
+        global CONTENT, CONTENT_HASH
         try:
             headers = self.headers
             if headers.get('Upgrade', '').lower() != 'websocket':
@@ -246,75 +228,62 @@ class SyncRequestHandler(http.server.SimpleHTTPRequestHandler):
             if not key:
                 self.send_error(400)
                 return
-            resp_key = base64.b64encode(hashlib.sha1(base64.b64decode(key) + '258EAFA5-E914-47DA-95CA-C5AC0F8C8C8E'.encode()).digest()).decode()
-            response = (
-                b'HTTP/1.1 101 Switching Protocols\r\n'
-                b'Upgrade: websocket\r\n'
-                b'Connection: Upgrade\r\n'
-                b'Sec-WebSocket-Accept: ' + resp_key.encode() + b'\r\n'
-                b'\r\n'
-            )
-            self.wfile.write(response)
+
+            resp_key = base64.b64encode(
+                hashlib.sha1(base64.b64decode(key) + b'258EAFA5-E914-47DA-95CA-C5AC0F8C8C8E').digest()
+            ).decode()
+
+            self.send_response_only(101, 'Switching Protocols')
+            self.send_header('Upgrade', 'websocket')
+            self.send_header('Connection', 'Upgrade')
+            self.send_header('Sec-WebSocket-Accept', resp_key)
+            self.end_headers()
             self.wfile.flush()
         except Exception as e:
-            print(f"WebSocket handshake error: {e}")
+            print(f"WS handshake error: {e}")
             return
 
-        stream = WebSocketStream(self.rfile, self.wfile)
+        fs = FrameSocket(self.connection)
         with ws_clients_lock:
-            ws_clients.append(stream)
+            ws_clients.append(fs)
+
         try:
-            with content_lock:
-                stream.write(json.dumps({
-                    'type': 'init',
-                    'content': CONTENT,
-                    'hash': CONTENT_HASH
-                }))
+            fs.send_frame(json.dumps({'type': 'init', 'content': CONTENT, 'hash': CONTENT_HASH}))
         except Exception:
             pass
 
-        try:
-            while not stream.closed:
-                data = stream.read()
-                if not data:
-                    break
-                try:
-                    msg = json.loads(data)
-                    t = msg.get('type')
-                    if t == 'sync':
-                        new_content = msg.get('content', '')
-                        new_hash = msg.get('hash', '')
-                        with content_lock:
-                            CONTENT = new_content
-                            CONTENT_HASH = new_hash
-                        with ws_clients_lock:
-                            for c in ws_clients:
-                                if c is not stream and not c.closed:
-                                    try:
-                                        c.write(json.dumps({'type': 'content', 'content': new_content, 'hash': new_hash}))
-                                    except Exception:
-                                        c.closed = True
-                    elif t == 'ping':
-                        with ws_clients_lock:
-                            count = len([c for c in ws_clients if not c.closed])
-                        try:
-                            stream.write(json.dumps({'type': 'count', 'count': count}))
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        finally:
-            with ws_clients_lock:
-                if stream in ws_clients:
-                    ws_clients.remove(stream)
-                count = len([c for c in ws_clients if not c.closed])
-                for c in ws_clients:
+        while True:
+            data = fs.read_frame()
+            if not data:
+                break
+            try:
+                msg = json.loads(data)
+                t = msg.get('type')
+                if t == 'sync':
+                    new_content = msg.get('content', '')
+                    new_hash = msg.get('hash', '')
+                    CONTENT = new_content
+                    CONTENT_HASH = new_hash
+                    with ws_clients_lock:
+                        for c in ws_clients:
+                            if c is not fs and not c.closed:
+                                c.send_frame(json.dumps({'type': 'content', 'content': new_content, 'hash': new_hash}))
+                elif t == 'ping':
+                    with ws_clients_lock:
+                        count = len([c for c in ws_clients if not c.closed])
                     try:
-                        c.write(json.dumps({'type': 'count', 'count': count}))
+                        fs.send_frame(json.dumps({'type': 'count', 'count': count}))
                     except Exception:
                         pass
+            except Exception:
+                pass
+
+        with ws_clients_lock:
+            if fs in ws_clients:
+                ws_clients.remove(fs)
+            count = len([c for c in ws_clients if not c.closed])
+            for c in ws_clients:
+                c.send_frame(json.dumps({'type': 'count', 'count': count}))
 
     def log_message(self, format, *args):
         pass
@@ -325,26 +294,23 @@ class ThreadedHTTPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     daemon_threads = True
 
 
-def run(port, directory):
-    os.chdir(directory or os.getcwd())
-    server = ThreadedHTTPServer(('', port), SyncRequestHandler)
+def main():
+    parser = argparse.ArgumentParser(description='HTTP server with real-time text sync')
+    parser.add_argument('-l', '--listen', type=int, default=PORT_DEFAULT, help=f'Port (default {PORT_DEFAULT})')
+    parser.add_argument('-d', '--directory', help='Directory to serve (default current directory)')
+    args = parser.parse_args()
+
+    os.chdir(args.directory or os.getcwd())
+    server = ThreadedHTTPServer(('', args.listen), SyncRequestHandler)
     ip = get_local_ip()
-    print(f"Serving at http://{ip}:{port}")
-    print(f"Or http://localhost:{port}")
+    print(f"Serving at http://{ip}:{args.listen}")
+    print(f"Or http://localhost:{args.listen}")
     print(f"Press Ctrl+C to stop")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nShutting down...")
         server.shutdown()
-
-
-def main():
-    parser = argparse.ArgumentParser(description='HTTP server with real-time text sync')
-    parser.add_argument('-l', '--listen', type=int, default=PORT_DEFAULT, help=f'Port (default {PORT_DEFAULT})')
-    parser.add_argument('-d', '--directory', help='Directory to serve (default current directory)')
-    args = parser.parse_args()
-    run(args.listen, args.directory)
 
 
 if __name__ == '__main__':
