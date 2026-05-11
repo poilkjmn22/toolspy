@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
-import http.server
-import socketserver
 import socket
 import threading
 import argparse
 import os
-import struct
 import json
 import base64
 import hashlib
+import struct
 
 PORT_DEFAULT = 8000
 CONTENT = ""
@@ -141,7 +139,7 @@ function calcHash(content) {
 }
 
 textarea.addEventListener('input', () => { localContent = textarea.value; });
-console.log('Connecting to WS... v5');
+console.log('Connecting to WS... v8');
 connect();
 </script>
 </body>
@@ -151,166 +149,190 @@ connect();
 ws_clients = []
 ws_clients_lock = threading.Lock()
 content_lock = threading.Lock()
+SERVER_PORT = [8000]
 
 
-class FrameSocket:
-    def __init__(self, conn):
-        self.conn = conn
-        self.closed = False
+def send_ws_frame(conn, data):
+    payload = data.encode('utf-8')
+    length = len(payload)
+    frame = bytearray()
+    frame.append(0x81)
+    if length < 126:
+        frame.append(length)
+    elif length < 65536:
+        frame.append(126)
+        frame.extend(struct.pack('>H', length))
+    else:
+        frame.append(127)
+        frame.extend(struct.pack('>Q', length))
+    frame.extend(payload)
+    conn.sendall(bytes(frame))
 
-    def read_frame(self):
-        try:
-            first = self.conn.recv(1)
-            if not first:
-                return None
-            b = first[0]
-            opcode = b & 0x0F
-            if opcode == 0x08:
-                return None
-            if opcode != 0x01:
-                return self.read_frame()
-            b2 = self.conn.recv(1)[0]
-            length = b2 & 0x7F
-            if length == 126:
-                length = struct.unpack('>H', self.conn.recv(2))[0]
-            elif length == 127:
-                length = struct.unpack('>Q', self.conn.recv(8))[0]
-            payload = self.conn.recv(length)
-            return payload.decode('utf-8', errors='replace')
-        except Exception:
+
+def recv_ws_frame(conn):
+    try:
+        first = conn.recv(1)
+        if not first:
             return None
-
-    def send_frame(self, data):
-        try:
-            payload = data.encode('utf-8')
-            length = len(payload)
-            frame = bytearray()
-            frame.append(0x81)
-            if length < 126:
-                frame.append(length)
-            elif length < 65536:
-                frame.append(126)
-                frame.extend(struct.pack('>H', length))
-            else:
-                frame.append(127)
-                frame.extend(struct.pack('>Q', length))
-            frame.extend(payload)
-            self.conn.sendall(bytes(frame))
-        except Exception:
-            self.closed = True
+        b = first[0]
+        opcode = b & 0x0F
+        if opcode == 0x08:
+            return None
+        if opcode != 0x01:
+            return recv_ws_frame(conn)
+        b2 = conn.recv(1)[0]
+        length = b2 & 0x7F
+        if length == 126:
+            length = struct.unpack('>H', conn.recv(2))[0]
+        elif length == 127:
+            length = struct.unpack('>Q', conn.recv(8))[0]
+        payload = conn.recv(length)
+        return payload.decode('utf-8', errors='replace')
+    except Exception:
+        return None
 
 
-class SyncRequestHandler(http.server.SimpleHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == '/ws':
-            self.handle_websocket()
-        elif self.path in ('/', '/index.html', ''):
-            self.serve_html()
-        else:
-            super().do_GET()
+def parse_http_request(data):
+    lines = data.decode('utf-8', errors='replace').split('\r\n')
+    if not lines:
+        return None, None
+    request_line = lines[0].split(' ')
+    if len(request_line) < 2:
+        return None, None
+    method, path = request_line[0], request_line[1]
+    headers = {}
+    for line in lines[1:]:
+        if ':' in line:
+            key, val = line.split(':', 1)
+            headers[key.strip().lower()] = val.strip()
+    return method, path, headers
 
-    def serve_html(self):
-        self.send_response(200)
-        self.send_header('Content-Type', 'text/html; charset=utf-8')
-        self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.end_headers()
-        self.wfile.write(HTML_PAGE.encode('utf-8'))
 
-    def handle_websocket(self):
-        global CONTENT, CONTENT_HASH
-        try:
-            headers = self.headers
-            if headers.get('Upgrade', '').lower() != 'websocket':
-                self.send_error(400)
+def handle_client(conn, addr):
+    global CONTENT, CONTENT_HASH
+
+    try:
+        data = b''
+        while b'\r\n\r\n' not in data:
+            chunk = conn.recv(1)
+            if not chunk:
+                conn.close()
                 return
-            key = headers.get('Sec-WebSocket-Key', '')
-            if not key:
-                self.send_error(400)
-                return
+            data += chunk
 
-            resp_key = base64.b64encode(
-                hashlib.sha1(base64.b64decode(key) + b'258EAFA5-E914-47DA-95CA-C5AC0F8C8C8E').digest()
-            ).decode()
+        method, path, headers = parse_http_request(data)
+        if path == '/ws' and headers.get('upgrade', '') == 'websocket':
+            key = headers.get('sec-websocket-key', '')
+            if key:
+                resp_key = base64.b64encode(
+                    hashlib.sha1(base64.b64decode(key) + b'258EAFA5-E914-47DA-95CA-C5AC0F8C8C8E').digest()
+                ).decode()
+                response = (
+                    b'HTTP/1.1 101 Switching Protocols\r\n'
+                    b'Upgrade: websocket\r\n'
+                    b'Connection: Upgrade\r\n'
+                    b'Sec-WebSocket-Accept: ' + resp_key.encode() + b'\r\n'
+                    b'\r\n'
+                )
+                conn.sendall(response)
 
-            self.send_response_only(101, 'Switching Protocols')
-            self.send_header('Upgrade', 'websocket')
-            self.send_header('Connection', 'Upgrade')
-            self.send_header('Sec-WebSocket-Accept', resp_key)
-            self.end_headers()
-            self.wfile.flush()
-        except Exception as e:
-            print(f"WS handshake error: {e}")
-            return
+                with ws_clients_lock:
+                    ws_clients.append(conn)
 
-        fs = FrameSocket(self.connection)
-        with ws_clients_lock:
-            ws_clients.append(fs)
+                try:
+                    send_ws_frame(conn, json.dumps({'type': 'init', 'content': CONTENT, 'hash': CONTENT_HASH}))
+                except Exception:
+                    pass
 
-        try:
-            fs.send_frame(json.dumps({'type': 'init', 'content': CONTENT, 'hash': CONTENT_HASH}))
-        except Exception:
-            pass
-
-        while True:
-            data = fs.read_frame()
-            if not data:
-                break
-            try:
-                msg = json.loads(data)
-                t = msg.get('type')
-                if t == 'sync':
-                    new_content = msg.get('content', '')
-                    new_hash = msg.get('hash', '')
-                    CONTENT = new_content
-                    CONTENT_HASH = new_hash
-                    with ws_clients_lock:
-                        for c in ws_clients:
-                            if c is not fs and not c.closed:
-                                c.send_frame(json.dumps({'type': 'content', 'content': new_content, 'hash': new_hash}))
-                elif t == 'ping':
-                    with ws_clients_lock:
-                        count = len([c for c in ws_clients if not c.closed])
+                while True:
+                    frame_data = recv_ws_frame(conn)
+                    if not frame_data:
+                        break
                     try:
-                        fs.send_frame(json.dumps({'type': 'count', 'count': count}))
+                        msg = json.loads(frame_data)
+                        t = msg.get('type')
+                        if t == 'sync':
+                            new_content = msg.get('content', '')
+                            new_hash = msg.get('hash', '')
+                            CONTENT = new_content
+                            CONTENT_HASH = new_hash
+                            with ws_clients_lock:
+                                for c in ws_clients:
+                                    if c is not conn:
+                                        try:
+                                            send_ws_frame(c, json.dumps({'type': 'content', 'content': new_content, 'hash': new_hash}))
+                                        except Exception:
+                                            pass
+                        elif t == 'ping':
+                            with ws_clients_lock:
+                                count = len([c for c in ws_clients if c])
+                            try:
+                                send_ws_frame(conn, json.dumps({'type': 'count', 'count': count}))
+                            except Exception:
+                                pass
                     except Exception:
                         pass
-            except Exception:
-                pass
+        elif path in ('/', '/index.html', ''):
+            response = (
+                b'HTTP/1.1 200 OK\r\n'
+                b'Content-Type: text/html; charset=utf-8\r\n'
+                b'Cache-Control: no-cache\r\n'
+                b'Access-Control-Allow-Origin: *\r\n'
+                b'\r\n'
+            )
+            response += HTML_PAGE.encode('utf-8')
+            conn.sendall(response)
 
+            while True:
+                chunk = conn.recv(1)
+                if not chunk:
+                    break
+    except Exception as e:
+        print(f"Client error: {e}")
+    finally:
         with ws_clients_lock:
-            if fs in ws_clients:
-                ws_clients.remove(fs)
-            count = len([c for c in ws_clients if not c.closed])
-            for c in ws_clients:
-                c.send_frame(json.dumps({'type': 'count', 'count': count}))
-
-    def log_message(self, format, *args):
-        pass
-
-
-class ThreadedHTTPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
-    allow_reuse_address = True
-    daemon_threads = True
+            if conn in ws_clients:
+                ws_clients.remove(conn)
+        conn.close()
 
 
 def main():
+    global SERVER_PORT
     parser = argparse.ArgumentParser(description='HTTP server with real-time text sync')
     parser.add_argument('-l', '--listen', type=int, default=PORT_DEFAULT, help=f'Port (default {PORT_DEFAULT})')
     parser.add_argument('-d', '--directory', help='Directory to serve (default current directory)')
     args = parser.parse_args()
+    SERVER_PORT[0] = args.listen
 
     os.chdir(args.directory or os.getcwd())
-    server = ThreadedHTTPServer(('', args.listen), SyncRequestHandler)
+
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(('', args.listen))
+    server.listen(50)
+
     ip = get_local_ip()
     print(f"Serving at http://{ip}:{args.listen}")
     print(f"Or http://localhost:{args.listen}")
     print(f"Press Ctrl+C to stop")
+
+    def accept_loop():
+        while True:
+            try:
+                conn, addr = server.accept()
+                t = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
+                t.start()
+            except Exception:
+                break
+
+    accept_thread = threading.Thread(target=accept_loop, daemon=True)
+    accept_thread.start()
+
     try:
-        server.serve_forever()
+        accept_thread.join()
     except KeyboardInterrupt:
         print("\nShutting down...")
-        server.shutdown()
+        server.close()
 
 
 if __name__ == '__main__':
