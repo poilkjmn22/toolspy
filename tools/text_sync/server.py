@@ -139,7 +139,7 @@ function calcHash(content) {
 }
 
 textarea.addEventListener('input', () => { localContent = textarea.value; });
-console.log('Connecting to WS... v8');
+console.log('Connecting to WS... v9');
 connect();
 </script>
 </body>
