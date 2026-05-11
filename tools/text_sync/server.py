@@ -245,9 +245,9 @@ class SyncRequestHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header('Connection', 'Upgrade')
             self.send_header('Sec-WebSocket-Accept', resp_key)
             self.end_headers()
-            self.wfile.write(b'\r\n')
             self.wfile.flush()
-        except Exception:
+        except Exception as e:
+            print(f"WebSocket handshake error: {e}")
             return
 
         stream = WebSocketStream(self.rfile, self.wfile)
