@@ -160,10 +160,12 @@ async def ws_handler(websocket):
 
     try:
         async for message in websocket:
-            print(f"DEBUG: received message: {message[:50] if message else 'empty'}")
             try:
-                msg = json.loads(message)
-                print(f"DEBUG: parsed msg type: {msg.get('type')}")
+                msg_data = message.data
+                if isinstance(msg_data, tuple):
+                    msg_data = msg_data[1]
+                print(f"DEBUG: received: {str(msg_data)[:50]}")
+                msg = json.loads(msg_data)
                 t = msg.get('type')
                 if t == 'sync':
                     new_content = msg.get('content', '')
