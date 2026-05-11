@@ -240,11 +240,14 @@ class SyncRequestHandler(http.server.SimpleHTTPRequestHandler):
                 self.send_error(400)
                 return
             resp_key = base64.b64encode(hashlib.sha1((key + '258EAFA5-E914-47DA-95CA-C5AC0F8C8C8E').encode()).digest()).decode()
-            self.send_response(101, 'Switching Protocols')
-            self.send_header('Upgrade', 'websocket')
-            self.send_header('Connection', 'Upgrade')
-            self.send_header('Sec-WebSocket-Accept', resp_key)
-            self.end_headers()
+            response = (
+                b'HTTP/1.1 101 Switching Protocols\r\n'
+                b'Upgrade: websocket\r\n'
+                b'Connection: Upgrade\r\n'
+                b'Sec-WebSocket-Accept: ' + resp_key.encode() + b'\r\n'
+                b'\r\n'
+            )
+            self.wfile.write(response)
             self.wfile.flush()
         except Exception as e:
             print(f"WebSocket handshake error: {e}")
