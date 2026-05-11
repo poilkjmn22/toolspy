@@ -7,8 +7,7 @@ import socket
 
 
 PORT_DEFAULT = 8002
-DEFAULT_MODEL = "qwen2.5:3b-instruct-q4_K_M"
-OLLAMA_HOST = "http://localhost:11434"
+LLAMA_SERVER = "http://localhost:8080"
 
 
 def get_local_ip():
@@ -54,17 +53,14 @@ HTML_PAGE = """<!DOCTYPE html>
   #clearBtn { padding: 6px 16px; background: #dc3545; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 13px; margin-left: 12px; }
   #clearBtn:hover { background: #c82333; }
   #chat { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 16px; }
-  .message { max-width: 80%; padding: 12px 16px; border-radius: 16px; line-height: 1.5; font-size: 15px; white-space: pre-wrap; word-break: break-word; }
+  .message { max-width: 80%; padding: 12px 16px; border-radius: 16px; line-height: 1.6; font-size: 15px; white-space: pre-wrap; word-break: break-word; }
   .user { align-self: flex-end; background: #4dabf7; color: white; border-bottom-right-radius: 4px; }
   .assistant { align-self: flex-start; background: #f1f3f5; color: #333; border-bottom-left-radius: 4px; }
-  .assistant.streaming .cursor { display: inline; animation: blink 0.8s infinite; }
-  .cursor { display: none; }
-  @keyframes blink { 0%, 50% { opacity: 1; } 51%, 100% { opacity: 0; } }
-  .typing-indicator { display: flex; gap: 4px; padding: 12px 16px; background: #f1f3f5; border-radius: 16px; align-self: flex-start; }
-  .typing-indicator span { width: 8px; height: 8px; background: #666; border-radius: 50%; animation: bounce 1.4s infinite ease-in-out; }
-  .typing-indicator span:nth-child(1) { animation-delay: 0s; }
-  .typing-indicator span:nth-child(2) { animation-delay: 0.2s; }
-  .typing-indicator span:nth-child(3) { animation-delay: 0.4s; }
+  .typing { display: flex; gap: 4px; padding: 12px 16px; background: #f1f3f5; border-radius: 16px; align-self: flex-start; }
+  .typing span { width: 8px; height: 8px; background: #666; border-radius: 50%; animation: bounce 1.4s infinite ease-in-out; }
+  .typing span:nth-child(1) { animation-delay: 0s; }
+  .typing span:nth-child(2) { animation-delay: 0.2s; }
+  .typing span:nth-child(3) { animation-delay: 0.4s; }
   @keyframes bounce { 0%, 80%, 100% { transform: scale(0); } 40% { transform: scale(1); } }
   #inputArea { padding: 16px 20px; background: #f8f9fa; border-top: 1px solid #dee2e6; display: flex; gap: 12px; flex-shrink: 0; }
   #input { flex: 1; padding: 12px 16px; border: 1px solid #ddd; border-radius: 24px; font-size: 15px; outline: none; resize: none; max-height: 120px; font-family: inherit; }
@@ -72,9 +68,10 @@ HTML_PAGE = """<!DOCTYPE html>
   #sendBtn { padding: 12px 24px; background: #4dabf7; color: white; border: none; border-radius: 24px; cursor: pointer; font-size: 15px; font-weight: 500; }
   #sendBtn:hover { background: #339af0; }
   #sendBtn:disabled { background: #adb5bd; cursor: not-allowed; }
-  .empty-state { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; color: #999; }
-  .empty-state .icon { font-size: 48px; margin-bottom: 16px; }
+  .empty { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; color: #999; }
+  .empty .icon { font-size: 48px; margin-bottom: 16px; }
   .error { background: #fff5f5; color: #c53030; border: 1px solid #feb2b2; padding: 12px 16px; border-radius: 8px; align-self: stretch; }
+  .info { background: #ebf8ff; color: #2b6cb0; border: 1px solid #90cdf4; padding: 12px 16px; border-radius: 8px; align-self: stretch; font-size: 14px; }
 </style>
 </head>
 <body>
@@ -82,18 +79,18 @@ HTML_PAGE = """<!DOCTYPE html>
   <h1>LLM Chat</h1>
   <div style="display: flex; align-items: center;">
     <select id="modelSelect">
-      <option value="qwen2.5:3b-instruct-q4_K_M">qwen2.5:3b</option>
-      <option value="gemma3:4b">gemma3:4b</option>
-      <option value="phi3.5:3.8b-mini-instruct-4k">phi3.5:3.8b</option>
+      <option value="qwen2.5-3b-instruct-q4_K_M">qwen2.5:3b</option>
+      <option value="llama3.2:3b">llama3.2:3b</option>
+      <option value="phi3.5-mini-instruct">phi3.5:3.8b</option>
     </select>
     <button id="clearBtn" onclick="clearChat()">新对话</button>
   </div>
 </div>
 
 <div id="chat">
-  <div class="empty-state">
+  <div class="empty">
     <div class="icon">💬</div>
-    <p>开始聊天吧！</p>
+    <p>开始聊天吧</p>
   </div>
 </div>
 
@@ -106,7 +103,6 @@ HTML_PAGE = """<!DOCTYPE html>
 const chat = document.getElementById('chat');
 const input = document.getElementById('input');
 const sendBtn = document.getElementById('sendBtn');
-const modelSelect = document.getElementById('modelSelect');
 
 let messages = [];
 let isGenerating = false;
@@ -125,24 +121,18 @@ input.addEventListener('input', () => {
 
 function clearChat() {
   messages = [];
-  chat.innerHTML = '<div class="empty-state"><div class="icon">💬</div><p>开始聊天吧！</p></div>';
+  chat.innerHTML = '<div class="empty"><div class="icon">💬</div><p>开始聊天吧</p></div>';
 }
 
 function addMessage(role, content) {
-  const empty = chat.querySelector('.empty-state');
+  const empty = chat.querySelector('.empty');
   if (empty) empty.remove();
-
   const div = document.createElement('div');
   div.className = 'message ' + role;
   div.textContent = content;
   chat.appendChild(div);
   chat.scrollTop = chat.scrollHeight;
   return div;
-}
-
-function appendChunk(el, chunk) {
-  el.textContent += chunk;
-  chat.scrollTop = chat.scrollHeight;
 }
 
 async function sendMessage() {
@@ -158,11 +148,10 @@ async function sendMessage() {
   messages.push({ role: 'user', content: text });
   addMessage('user', text);
 
-  const model = modelSelect.value;
-  const assistantEl = addMessage('assistant', '');
+  const model = document.getElementById('modelSelect').value;
   const typingEl = document.createElement('div');
-  typingEl.className = 'typing-indicator';
-  typingEl.innerHTML = '<span></span><span></span><span></span>';
+  typingEl.className = 'message assistant';
+  typingEl.innerHTML = '<div class="typing"><span></span><span></span><span></span></div>';
   chat.appendChild(typingEl);
 
   try {
@@ -183,12 +172,11 @@ async function sendMessage() {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-
       const chunk = decoder.decode(value);
       full += chunk;
-      typingEl.remove();
-      appendChunk(assistantEl, full);
-      assistantEl.classList.add('assistant');
+      typingEl.className = 'message assistant';
+      typingEl.textContent = full;
+      chat.scrollTop = chat.scrollHeight;
     }
 
     messages.push({ role: 'assistant', content: full });
@@ -210,143 +198,76 @@ async function sendMessage() {
 """
 
 
-async def chat_handler(request):
-    data = await request.json()
-    model = data.get('model', DEFAULT_MODEL)
-    messages = data.get('messages', [])
+def main():
+    global LLAMA_SERVER
 
-    url = f"{OLLAMA_HOST}/api/chat"
-    payload = {
-        "model": model,
-        "messages": messages,
-        "stream": True
-    }
+    parser = argparse.ArgumentParser(description='Local LLM Chat Server')
+    parser.add_argument('-l', '--listen', type=int, default=PORT_DEFAULT, help='Port')
+    parser.add_argument('-s', '--server', default=None, help='llama.cpp server URL')
+    args = parser.parse_args()
 
-    headers = {
-        'Content-Type': 'application/json',
-        'Accept': 'text/event-stream'
-    }
+    if args.server:
+        LLAMA_SERVER = args.server
 
-    response = aiohttp.ClientSession()
-    try:
-        async with response.post(url, json=payload, headers=headers) as resp:
-            return web.StreamResponse(
-                status=200,
-                reason='OK',
-                headers={
-                    'Content-Type': 'text/event-stream',
-                    'Cache-Control': 'no-cache',
-                    'Connection': 'keep-alive',
-                }
-            )
-    except Exception as e:
-        return web.Response(status=500, text=f'Failed to connect to Ollama: {e}')
+    from aiohttp import web
 
-
-async def main_async(port, model):
     app = web.Application()
 
-    async def sse_chat_handler(request):
-        data = await request.json()
-        model_name = data.get('model', model)
-        msgs = data.get('messages', [])
-
-        async def stream_response():
-            url = f"{OLLAMA_HOST}/api/chat"
-            payload = {"model": model_name, "messages": msgs, "stream": True}
-
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=300)) as resp:
-                        if resp.status != 200:
-                            yield b'event: error\ndata: API error\n\n'
-                            return
-
-                        async for chunk in resp.content.iter_chunked(1024):
-                            if chunk:
-                                yield b'data: ' + chunk + b'\n\n'
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                yield f'event: error\ndata: {str(e)}\n\n'.encode()
-
-        return web.StreamResponse(
-            stream_response(),
-            status=200,
-            reason='OK',
-            headers={
-                'Content-Type': 'text/event-stream',
-                'Cache-Control': 'no-cache',
-                'X-Accel-Buffering': 'no',
-            }
-        )
+    async def index_handler(request):
+        return web.Response(text=HTML_PAGE, content_type='text/html')
 
     async def chat_api(request):
         data = await request.json()
-        model_name = data.get('model', model)
+        model = data.get('model', 'qwen2.5-3b-instruct-q4_K_M')
         msgs = data.get('messages', [])
 
-        payload = {"model": model_name, "messages": msgs, "stream": True}
+        url = f"{LLAMA_SERVER}/v1/chat/completions"
+        payload = {"model": model, "messages": msgs, "stream": True}
 
-        response = web.StreamResponse(
-            status=200,
-            reason='OK',
-            headers={
-                'Content-Type': 'text/event-stream',
-                'Cache-Control': 'no-cache',
-                'X-Accel-Buffering': 'no',
-            }
-        )
+        response = web.StreamResponse(status=200, headers={'Content-Type': 'text/event-stream', 'X-Accel-Buffering': 'no'})
         await response.prepare(request)
 
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(f"{OLLAMA_HOST}/api/chat", json=payload, timeout=aiohttp.ClientTimeout(total=300)) as resp:
-                    async for chunk in resp.content.iter_chunked(512):
-                        if chunk:
-                            await response.write(b'data: ' + chunk + b'\n\n')
-                            await response.drain()
+                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=300)) as resp:
+                    if resp.status != 200:
+                        await response.write(f'Error: API returned {resp.status}'.encode())
+                    else:
+                        async for chunk in resp.content.iter_chunked(512):
+                            if chunk:
+                                await response.write(chunk)
+                                await response.drain()
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            await response.write(f'event: error\ndata: {str(e)}\n\n'.encode())
+            await response.write(f'Error: {str(e)}'.encode())
         finally:
-            await response.write(b'data: [DONE]\n\n')
             await response.write_eof()
         return response
-
-    async def index_handler(request):
-        return web.Response(text=HTML_PAGE, content_type='text/html', headers={'Cache-Control': 'no-cache'})
 
     app.router.add_get('/', index_handler)
     app.router.add_post('/api/chat', chat_api)
 
     runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '', port)
-    await site.start()
 
-    ip = get_local_ip()
-    print(f"LLM Chat at http://{ip}:{port}")
-    print(f"Ollama API: {OLLAMA_HOST}")
-    print(f"Default model: {model}")
-    print(f"Press Ctrl+C to stop")
-
-    try:
-        while True:
-            await asyncio.sleep(1)
-    except asyncio.CancelledError:
-        pass
-    finally:
-        await runner.cleanup()
-
-
-def main():
-    parser = argparse.ArgumentParser(description='Local LLM Chat Server')
-    parser.add_argument('-l', '--listen', type=int, default=PORT_DEFAULT, help=f'Port (default {PORT_DEFAULT})')
-    parser.add_argument('-m', '--model', default=DEFAULT_MODEL, help='Default Ollama model')
-    args = parser.parse_args()
+    async def run():
+        await runner.setup()
+        site = web.TCPSite(runner, '', args.listen)
+        await site.start()
+        ip = get_local_ip()
+        print(f"LLM Chat at http://{ip}:{args.listen}")
+        print(f"LLM Server: {LLAMA_SERVER}")
+        print(f"Press Ctrl+C to stop")
+        try:
+            while True:
+                await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            await runner.cleanup()
 
     try:
-        asyncio.run(main_async(args.listen, args.model))
+        asyncio.run(run())
     except KeyboardInterrupt:
         print("\nShutting down...")
 
