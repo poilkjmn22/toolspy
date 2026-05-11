@@ -223,12 +223,28 @@ async def main(port, directory):
     print(f"Or http://localhost:{port}")
     print(f"Press Ctrl+C to stop")
 
+    async def cleanup_dead_connections():
+        while True:
+            await asyncio.sleep(30)
+            async with ws_clients_lock:
+                dead = []
+                for c in ws_clients:
+                    if c.closed:
+                        dead.append(c)
+                for c in dead:
+                    ws_clients.discard(c)
+                if dead:
+                    print(f"Cleaned up {len(dead)} dead connections")
+
+    cleanup_task = asyncio.create_task(cleanup_dead_connections())
+
     try:
         while True:
             await asyncio.sleep(1)
     except asyncio.CancelledError:
         pass
     finally:
+        cleanup_task.cancel()
         await runner.cleanup()
 
 
