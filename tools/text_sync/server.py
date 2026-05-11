@@ -151,6 +151,7 @@ async def ws_handler(websocket):
     global CONTENT, CONTENT_HASH
     async with ws_clients_lock:
         ws_clients.add(websocket)
+        print(f"DEBUG: client connected. total: {len(ws_clients)}")
 
     try:
         await websocket.send(json.dumps({'type': 'init', 'content': CONTENT, 'hash': CONTENT_HASH}))
@@ -168,12 +169,14 @@ async def ws_handler(websocket):
                     async with ws_clients_lock:
                         CONTENT = new_content
                         CONTENT_HASH = new_hash
-                        for c in ws_clients:
-                            if c is not websocket:
-                                try:
-                                    await c.send(json.dumps({'type': 'content', 'content': new_content, 'hash': new_hash}))
-                                except Exception:
-                                    pass
+                        clients_to_notify = [c for c in ws_clients if c is not websocket]
+                        print(f"DEBUG: sync received. {len(ws_clients)} clients, sending to {len(clients_to_notify)}")
+                        for c in clients_to_notify:
+                            try:
+                                await c.send(json.dumps({'type': 'content', 'content': new_content, 'hash': new_hash}))
+                            except Exception as e:
+                                print(f"DEBUG: send error: {e}")
+                                pass
                 elif t == 'ping':
                     async with ws_clients_lock:
                         count = len(ws_clients)
@@ -188,6 +191,7 @@ async def ws_handler(websocket):
     finally:
         async with ws_clients_lock:
             ws_clients.discard(websocket)
+            print(f"DEBUG: client disconnected. total: {len(ws_clients)}")
 
 
 async def http_handler(request):
