@@ -48,9 +48,11 @@ HTML_PAGE = """<!DOCTYPE html>
   #header { padding: 12px 16px; background: #f5f5f5; border-bottom: 1px solid #ddd; display: flex; align-items: center; gap: 12px; flex-shrink: 0; }
   #header .info { flex: 1; font-size: 13px; color: #666; }
   #header .info span { margin-right: 16px; }
-  #syncBtn { padding: 6px 16px; background: #2563eb; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; }
-  #syncBtn:hover { background: #1d4ed8; }
+  #header .actions { display: flex; gap: 8px; }
+  #syncBtn, #copyBtn { padding: 6px 16px; background: #2563eb; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; }
+  #syncBtn:hover, #copyBtn:hover { background: #1d4ed8; }
   #syncBtn.syncing { opacity: 0.6; pointer-events: none; }
+  #copyBtn.copied { background: #16a34a; }
   #status { padding: 6px 16px; background: #fef9c3; border: 1px solid #fef08a; border-radius: 6px; font-size: 13px; color: #854d0e; display: none; }
   #textarea { flex: 1; width: 100%; resize: none; border: none; outline: none; padding: 16px; font-size: 16px; line-height: 1.6; }
   #footer { padding: 8px 16px; background: #f5f5f5; border-top: 1px solid #ddd; font-size: 12px; color: #999; flex-shrink: 0; }
@@ -61,7 +63,10 @@ HTML_PAGE = """<!DOCTYPE html>
   <div class="info">
     <span id="connCount">0</span> 在线设备 &nbsp;|&nbsp; Hash: <span id="contentHash">--</span>
   </div>
-  <button id="syncBtn" onclick="syncContent()">同步到多端</button>
+  <div class="actions">
+    <button id="copyBtn" onclick="copyContent()">复制</button>
+    <button id="syncBtn" onclick="syncContent()">同步到多端</button>
+  </div>
   <div id="status">已同步</div>
 </div>
 <textarea id="textarea" placeholder="在此输入文本内容..."></textarea>
@@ -133,6 +138,33 @@ function calcHash(content) {
 }
 
 textarea.addEventListener('input', () => { localContent = textarea.value; });
+
+async function copyContent() {
+  const btn = document.getElementById('copyBtn');
+  const text = textarea.value;
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.left = '-9999px';
+      ta.style.top = '0';
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+    }
+    btn.textContent = '已复制';
+    btn.classList.add('copied');
+    setTimeout(() => { btn.textContent = '复制'; btn.classList.remove('copied'); }, 1500);
+  } catch (e) {
+    console.error('Copy failed:', e);
+  }
+}
+
 connect();
 </script>
 </body>
