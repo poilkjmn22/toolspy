@@ -20,6 +20,14 @@ TOOLS = {
         'module': 'tools.llm_chat.server',
         'help': 'Local LLM chat server via Ollama API',
     },
+    'text-extractor': {
+        'module': 'tools.text_extractor',
+        'help': 'Extract text from PDF/XLS/XLSX files to .txt (originals untouched)',
+    },
+    'pdf-organize': {
+        'module': 'tools.pdf_organize',
+        'help': 'Find PDFs containing a target string; copy/move matches to a new folder',
+    },
 }
 
 

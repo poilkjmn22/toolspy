@@ -11,6 +11,10 @@ setup(
         'pillow',
         'python-docx',
         'typing_extensions',
+        'pdfplumber',
+        'openpyxl',
+        'xlrd',
+        'pytesseract',
     ],
     entry_points={
         'console_scripts': [
