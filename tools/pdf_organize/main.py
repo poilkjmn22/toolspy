@@ -25,6 +25,7 @@ class PdfOrganizer:
         overwrite: bool = False,
         lang: str = 'chi_sim+eng',
         dpi: int = 300,
+        rotation: Optional[int] = None,
     ):
         self.input_folder = Path(input_folder).expanduser()
         self.target = target
@@ -37,6 +38,7 @@ class PdfOrganizer:
         self.overwrite = overwrite
         self.lang = lang
         self.dpi = dpi
+        self.rotation = rotation
         self.stats = {
             'total': 0,
             'matched': 0,
@@ -141,6 +143,7 @@ class PdfOrganizer:
                     lang=self.lang,
                     dpi=self.dpi,
                     warn=False,
+                    rotation=self.rotation,
                 )
             except Exception as e:
                 print(f"错误: {e}")
@@ -251,6 +254,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--overwrite', action='store_true', help='Overwrite files with same name in output (default: skip)')
     parser.add_argument('--lang', default='chi_sim+eng', help='Tesseract language packs (default: chi_sim+eng)')
     parser.add_argument('--dpi', type=int, default=300, help='OCR render DPI, 150-400 (default: 300; use 300+ for small text in technical drawings)')
+    parser.add_argument('--rotation', type=int, default=None, choices=[0, 90, 180, 270],
+                        help='Force PDF page rotation in degrees (CW=positive). Default: auto-detect.')
     parser.add_argument('--list', action='store_true', help='Dry-run: show matches without copying/moving')
     args = parser.parse_args()
     if not (150 <= args.dpi <= 400):
@@ -273,6 +278,7 @@ def main():
         overwrite=args.overwrite,
         lang=args.lang,
         dpi=args.dpi,
+        rotation=args.rotation,
     )
 
     valid, msg = organizer.validate()

@@ -70,7 +70,11 @@ def _pdfplumber_extract(path: Path, warn: bool = True) -> str:
     return "".join(parts)
 
 
-def _ocr_extract(path: Path, lang: str, dpi: int) -> str:
+def _ocr_extract(path: Path, lang: str, dpi: int, rotation: Optional[int] = None) -> str:
+    """OCR a PDF. If `rotation` is None (default), try both orientations and pick
+    the better result. If set to 0/90/180/270 (degrees, CW = positive), force that
+    rotation.
+    """
     parts = [OCR_HEADER_TEMPLATE.format(name=path.name, lang=lang, dpi=dpi)]
     pdf = pdfium.PdfDocument(str(path))
     try:
@@ -79,13 +83,68 @@ def _ocr_extract(path: Path, lang: str, dpi: int) -> str:
             parts.append(f"\n=== Page {i} ===\n\n")
             pil = page.render(scale=scale).to_pil()
             try:
-                text = pytesseract.image_to_string(pil, lang=lang) or ""
+                if rotation is not None:
+                    # Manual rotation (CW = positive in user-facing convention)
+                    if rotation != 0:
+                        pil = pil.rotate(-rotation, expand=True)
+                    text = pytesseract.image_to_string(pil, lang=lang) or ""
+                    if rotation != 0:
+                        parts.append(f"# OCR rotated {rotation}° CW (forced)\n")
+                    parts.append(text)
+                else:
+                    # Auto: try original + 90° CW, pick better
+                    text_default = pytesseract.image_to_string(pil, lang=lang) or ""
+                    pil_rot = pil.rotate(-90, expand=True)
+                    try:
+                        text_rotated = pytesseract.image_to_string(pil_rot, lang=lang) or ""
+                    finally:
+                        pil_rot.close()
+                    text, used_rot = _pick_better_text(text_default, text_rotated)
+                    if used_rot:
+                        parts.append("# OCR auto-rotated 90° CW (text was vertical in original)\n")
+                    parts.append(text)
             finally:
                 pil.close()
-            parts.append(text)
     finally:
         pdf.close()
     return "".join(parts)
+
+
+def _detect_rotation(pil: 'PIL.Image.Image') -> tuple:
+    """Use Tesseract OSD to detect image rotation. Returns (confidence, degrees)."""
+    try:
+        osd = pytesseract.image_to_osd(pil)
+        # Parse output: "Orientation in degrees: 90\nRotate: 90\nOrientation confidence: 12.34"
+        rot_deg = 0
+        rot_conf = 0.0
+        for line in osd.split('\n'):
+            if 'Orientation in degrees' in line or 'Rotate:' in line:
+                try:
+                    rot_deg = int(line.split(':')[-1].strip())
+                except (ValueError, IndexError):
+                    pass
+            elif 'Orientation confidence' in line:
+                try:
+                    rot_conf = float(line.split(':')[-1].strip())
+                except (ValueError, IndexError):
+                    pass
+        return (rot_conf, rot_deg)
+    except Exception:
+        return (0.0, 0)
+
+
+def _pick_better_text(text_a: str, text_b: str) -> tuple:
+    """Pick the OCR output with more Chinese characters (better text recognition).
+    Returns (text, used_b).
+    """
+    def chinese_count(s):
+        return sum(1 for c in s if '\u4e00' <= c <= '\u9fff')
+    ca = chinese_count(text_a)
+    cb = chinese_count(text_b)
+    # Prefer rotated only if it has 30%+ more Chinese (to avoid noise)
+    if cb > ca * 1.3 and cb > 50:
+        return (text_b, True)
+    return (text_a, False)
 
 
 def _xlsx_extract(path: Path) -> str:
@@ -125,6 +184,7 @@ def extract_text(
     lang: str = 'chi_sim+eng',
     dpi: int = 300,
     warn: bool = True,
+    rotation: Optional[int] = None,
 ) -> str:
     """Extract text from a single file. Convenience function for use by other tools.
 
@@ -134,6 +194,8 @@ def extract_text(
         lang: Tesseract language packs (e.g. 'chi_sim+eng', 'eng')
         dpi: render DPI for OCR (150-400)
         warn: if True, print a warning to stderr when a PDF has no text layer and ocr=False
+        rotation: if set, force PDF page rotation in degrees (0/90/180/270, CW=positive).
+                   Default None = auto-detect (try both orientations, pick the better one).
 
     Returns:
         Extracted text with file header and per-page/per-sheet markers.
@@ -142,7 +204,7 @@ def extract_text(
     ext = path.suffix.lower()
     if ext == '.pdf':
         if ocr:
-            return _ocr_extract(path, lang, dpi)
+            return _ocr_extract(path, lang, dpi, rotation=rotation)
         return _pdfplumber_extract(path, warn=warn)
     if ext == '.xlsx':
         return _xlsx_extract(path)
@@ -161,7 +223,8 @@ class TextExtractor:
         overwrite: bool = False,
         ocr: bool = False,
         lang: str = 'chi_sim+eng',
-        dpi: int = 200,
+        dpi: int = 300,
+        rotation: Optional[int] = None,
     ):
         self.sources = [Path(s).expanduser() for s in sources]
         self.output = Path(output).expanduser() if output else None
@@ -171,6 +234,7 @@ class TextExtractor:
         self.ocr = ocr
         self.lang = lang
         self.dpi = dpi
+        self.rotation = rotation
         self.stats = {
             'total': 0,
             'processed': 0,
@@ -233,7 +297,7 @@ class TextExtractor:
         return self.output / rel.with_suffix('.txt')
 
     def _extract(self, path: Path) -> str:
-        return extract_text(path, ocr=self.ocr, lang=self.lang, dpi=self.dpi, warn=True)
+        return extract_text(path, ocr=self.ocr, lang=self.lang, dpi=self.dpi, warn=True, rotation=self.rotation)
 
     def _write_output(self, out_path: Path, content: str) -> None:
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -332,6 +396,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--ocr', action='store_true', help='Use Tesseract OCR for image-only PDFs (needs `brew install tesseract tesseract-lang`)')
     parser.add_argument('--lang', default='chi_sim+eng', help='Tesseract language packs (default: chi_sim+eng)')
     parser.add_argument('--dpi', type=int, default=300, help='OCR render DPI, 150-400 (default: 300; use 300+ for small text in technical drawings)')
+    parser.add_argument('--rotation', type=int, default=None, choices=[0, 90, 180, 270],
+                        help='Force PDF page rotation in degrees (CW=positive). Default: auto-detect by comparing OCR of original vs rotated.')
     args = parser.parse_args()
     if not (150 <= args.dpi <= 400):
         parser.error(f"--dpi must be 150-400, got {args.dpi}")
@@ -361,6 +427,7 @@ def main():
         ocr=args.ocr,
         lang=args.lang,
         dpi=args.dpi,
+        rotation=args.rotation,
     )
 
     if args.list:

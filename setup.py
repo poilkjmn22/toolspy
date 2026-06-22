@@ -15,6 +15,7 @@ setup(
         'openpyxl',
         'xlrd',
         'pytesseract',
+        'aiohttp',
     ],
     entry_points={
         'console_scripts': [
