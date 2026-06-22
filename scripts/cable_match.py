@@ -33,6 +33,24 @@ import pypdfium2 as pdfium
 import pytesseract
 from PIL import Image, ImageFilter, ImageOps
 
+# Auto-detect Tesseract binary on Windows. macOS / Linux usually have tesseract
+# on PATH via brew / apt; Windows installers (UB-Mannheim) put it under
+# `C:\Program Files\Tesseract-OCR\tesseract.exe` which is NOT on PATH by default
+# for Python's child process unless explicitly configured.
+if sys.platform == 'win32' and not pytesseract.pytesseract.tesseract_cmd:
+    for candidate in (
+        r'C:\Program Files\Tesseract-OCR\tesseract.exe',
+        r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
+    ):
+        if Path(candidate).exists():
+            pytesseract.pytesseract.tesseract_cmd = candidate
+            break
+    else:
+        print('Warning: Tesseract not found in standard Windows paths. '
+              'Install from https://github.com/UB-Mannheim/tesseract/wiki '
+              'or set pytesseract.pytesseract.tesseract_cmd manually.',
+              file=sys.stderr)
+
 # === Project root resolution ===
 # Make the toolspy project importable regardless of where this script is run from
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent

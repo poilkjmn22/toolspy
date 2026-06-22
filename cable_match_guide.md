@@ -247,18 +247,110 @@ Tesseract 在密集端子图上有两类典型毛病：
 **应对策略**（按推荐顺序）：
 1. **先用默认 pipeline 跑完**——大多数页 5/6 已足够，剩下的少量漏字可以人工补
 2. **对高优先级电缆号，单独验证**——在 PDF viewer 里肉眼找，确认 OCR 是否漏
-3. **局部重 OCR 优化**：
+3. **4 阶段 union 并行**（推荐，16 核机器约 1 小时搞定 1882 PDF）——见下节
+4. **局部重 OCR 优化**：
    - 把目标 CSV 拆成两批：
      - 批 1（中文相关电缆号）`--lang chi_sim --preprocess gauss_otsu`
      - 批 2（纯英文相关电缆号）`--lang chi_sim+eng`（默认）
    - 用 `--input` 指向同一目录，工具会按 content_hash + preprocess 复合键复用缓存
-4. **后处理规则**（如果只关心一个页）：发现 `3B-469` 且本图其他位置有 `3B-464/465/466`，把 `3B-469` 改 `3B-463`（基于"46X 序列不应跳过 463"上下文推理）
+5. **后处理规则**（如果只关心一个页）：发现 `3B-469` 且本图其他位置有 `3B-464/465/466`，把 `3B-469` 改 `3B-463`（基于"46X 序列不应跳过 463"上下文推理）
 
 **`--preprocess gauss_otsu` 的实现细节**（仅供 debug）：
 - 灰度化 → `ImageFilter.GaussianBlur(radius=1)` → Otsu 阈值（`-5` 偏移）
 - 目的：把每个像素的噪声平均掉，让 `3` 不再被读成 `J`/`9`
 - 副作用：会把 `F` 这种细笔画字符也平均掉，所以"1F-151"被破坏
 - 缓存键已包含 preprocess 标签，切换 recipe 不会污染旧 cache
+
+## 九之2、4 阶段 union 并行（高召回完整跑法）
+
+既然没有任何单一 recipe 在所有页都达到 100%，干脆把 4 种组合（2 lang × 2 preprocess）都跑一遍取并集。脚本一次性启动 4 个后台进程：
+
+### 4 个 stage
+
+| Stage | 命令 | 找什么 |
+|-------|------|--------|
+| `chieng+none` | `chi_sim+eng + --preprocess none` | 1F-151 之类纯英文（基线，v1 同等质量）|
+| `chieng+gauss` | `chi_sim+eng + --preprocess gauss_otsu` | 字符级误读修复（部分页有增益）|
+| `chisim+none` | `chi_sim + --preprocess none` | 中文密集页更准 |
+| **`chisim+gauss`** | `chi_sim + --preprocess gauss_otsu` | **3B-463 这类必须这个组合** |
+
+每个 stage 写到自己独立的 `.stage_*` 子目录（cache + state + _matches.csv 都分开），互不干扰。OCR 完成后用 `merge_4stage_matches.py` 按 (cable, content_hash[:16]) 复合键去重并集。
+
+### 一键启动
+
+**Mac / Linux / WSL**（bash）：
+```bash
+bash scripts/run_4stage_union.sh 4    # 4 workers × 4 stages = 16 workers 总
+```
+
+**Windows 原生**（PowerShell）：
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\run_4stage_union.ps1 -WorkersPerStage 4
+```
+
+### 监控
+
+**Mac / Linux / WSL**：
+```bash
+bash scripts/wuhan_status.sh
+```
+
+**Windows 原生**：
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\wuhan_status.ps1
+```
+
+### 合并结果
+
+4 个 stage 都完成后：
+```bash
+python scripts/merge_4stage_matches.py /path/to/wuhan/pdf
+# 写入 <wuhan/pdf>/_matches.csv (去重后的并集)
+```
+
+### 实际时间估算
+
+| 机器 | workers | 总时间(1882 PDF × 4 OCR) |
+|------|---------|--------------------------|
+| Mac M-series 8 核 (--workers 4 各 stage) | 16 | **45-50h**（二次图 拖慢）|
+| Win11 16 核 (--workers 4 各 stage) | 16 | **~1-1.5h** |
+| Win11 16 核 (--workersPerStage 4 4 stage 并行) | 16 | **~1h** |
+
+差异主要在二次图 目录（多页 A1 加长图，渲染 5-10s/页）。Win11 16 核足够一锅端。
+
+## 九之3、Windows 特定配置
+
+`cable_match.py` 启动时会自动检测 Tesseract 路径（无需手动配置）：
+```python
+if sys.platform == 'win32' and not pytesseract.pytesseract.tesseract_cmd:
+    # 自动尝试 C:\Program Files\Tesseract-OCR\tesseract.exe
+    # 自动尝试 C:\Program Files (x86)\Tesseract-OCR\tesseract.exe
+```
+
+如果 Tesseract 装在非标准位置，需手动设：
+```python
+import pytesseract
+pytesseract.pytesseract.tesseract_cmd = r'D:\tools\tesseract\tesseract.exe'
+```
+
+**Windows 环境准备**：
+```powershell
+# 1. 装 Tesseract 5.5.x: https://github.com/UB-Mannheim/tesseract/wiki
+#    安装时勾选 "Additional language data > Chinese (Simplified)"
+# 2. 装 Python 3.11/3.12
+# 3. 克隆 + venv
+git clone https://github.com/poilkjmn22/toolspy.git
+cd toolspy
+py -3.11 -m venv myenv
+myenv\Scripts\pip install -r requirements.txt
+# 4. 验证
+myenv\Scripts\python -c "import pytesseract; print(pytesseract.get_tesseract_version())"
+```
+
+**Windows 路径注意**：
+- 路径有中文或空格：用双引号 `python scripts\cable_match.py --input "C:\Users\...\wuhan\pdf"`
+- 临时文件位置：Tesseract 用 `%TEMP%\tess_*`，长跑后定期清 `Remove-Item "$env:TEMP\tess_*"`
+- 大 PDF 内存：137MB 的 D0223-26 渲染 80MB/页 × 4 workers = 320MB 峰值 × 4 stage = 1.3GB
 
 ### 6. OCR 失败是正常的
 
