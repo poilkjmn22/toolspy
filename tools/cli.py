@@ -28,6 +28,10 @@ TOOLS = {
         'module': 'tools.pdf_organize',
         'help': 'Find PDFs containing a target string; copy/move matches to a new folder',
     },
+    'process-xlsx-row': {
+        'module': 'tools.process_xlsx_row',
+        'help': 'Highlight xlsx rows that match a boolean expression of cell rules',
+    },
 }
 
 

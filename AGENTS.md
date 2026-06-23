@@ -35,6 +35,7 @@ A bash wrapper at the repo root `./toolspy` does the same as `python -m tools` b
 | `llm-chat`     | `tools.llm_chat.server`     | Ollama-backed chat, default port 8002 (expects `http://localhost:8081`) |
 | `text-extractor` | `tools.text_extractor`    | PDF/XLS/XLSX → .txt extraction; originals untouched; per-file default, `--combine` for single .txt; `--ocr` for scanned/image-only PDFs |
 | `pdf-organize`  | `tools.pdf_organize`      | Find PDFs containing a target string; copy/move matches to a new folder named after the target; recursive scan; OCR-aware |
+| `process-xlsx-row` | `tools.process_xlsx_row` | Highlight xlsx rows that match a boolean expression (`& \| ! ()`) of cell rules. Rules defined in JSON (`--rules-file`) and/or Python (`--rules-script`); built-in matchers: `equals`, `contains`, `startswith`, `endswith`, `regex`; color by name (`yellow`) or hex (`#FFFF00` / `AARRGGBB`). Default writes `<input>_colored.xlsx`; `--in-place` to overwrite |
 
 ## Add a new tool
 
@@ -51,6 +52,8 @@ A bash wrapper at the repo root `./toolspy` does the same as `python -m tools` b
 - **`requirements.txt` is now complete.** As of the latest update it includes all pip deps the tools need: `lxml`, `pillow`, `python-docx`, `typing_extensions`, `pdfplumber`, `openpyxl`, `xlrd`, `pytesseract`, `aiohttp`, `python-Levenshtein`. `pypdfium2` is a transitive dep of `pdfplumber` (>=4.18.0) so it installs automatically. **System-level**: Tesseract must be on PATH for `text-extractor --ocr` and `pdf-organize` on scanned PDFs (see Tesseract note below). `python-Levenshtein` is used by `cable_match.py` for the experimental Levenshtein fuzzy tier (off by default).
 - **`setup.py` `entry_points` is wrong.** It points at `tools:cli` (a package, not a module); would need `tools.cli:main`. Don't rely on `pip install -e .` for a working `toolspy` console command — use the bash wrapper or `python -m tools`.
 - **`text-extractor --ocr` and `pdf-organize` need Tesseract.** `text-extractor` on image-only PDFs yields empty `.txt` files unless you pass `--ocr`. `pdf-organize` on a scanned-PDF corpus will skip those PDFs unless Tesseract is on PATH. Install with `brew install tesseract tesseract-lang` (macOS) or `apt install tesseract-ocr tesseract-ocr-chi-sim` (Linux). The `chi_sim` (Simplified Chinese) language pack comes with `tesseract-lang`. The tools print a clear install hint if Tesseract is missing.
+
+- **OCR engine is pluggable.** All three tools (`text-extractor`, `pdf-organize`, `cable_match`) accept `--engine {tesseract|paddleocr}` (default `tesseract`). PaddleOCR (PP-OCRv3) typically reaches ~85-95% recall on Chinese small-text + dense terminal-block layouts vs Tesseract's ~70-80% on the same. To enable: `pip install -r requirements-paddleocr.txt` (~250 MB pip deps + ~100 MB model files downloaded on first use). On macOS Apple Silicon paddlepaddle runs CPU only — Win/Linux + CUDA recommended for speed. The `cable_match.py` cache schema stores an `ocr_engine` column so Tesseract and PaddleOCR caches coexist without collision.
 
 ## Things to ignore at the repo root
 
