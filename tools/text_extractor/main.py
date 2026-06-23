@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import argparse
 import shlex
-import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -10,34 +9,31 @@ from typing import List, Optional, Tuple
 import openpyxl
 import pdfplumber
 import pypdfium2 as pdfium
-import pytesseract
 import xlrd
+
+from tools.ocr_engine import (
+    OCREngine,
+    check_engine,
+    get_engine,
+)
 
 
 SUPPORTED_EXTS = {'.pdf', '.xls', '.xlsx'}
 FILE_HEADER_TEMPLATE = "# Extracted from {name} by text-extractor\n"
 OCR_HEADER_TEMPLATE = (
     "# Extracted from {name} by text-extractor "
-    "(OCR via Tesseract, lang={lang}, dpi={dpi})\n"
+    "(OCR via {engine}, lang={lang}, dpi={dpi})\n"
 )
 
 
 def check_tesseract() -> Tuple[bool, str]:
-    """Verify Tesseract binary is installed and return its version.
+    """Backwards-compat wrapper for `check_engine('tesseract')`."""
+    return check_engine('tesseract')
 
-    Returns (ok, message). On failure, message contains install instructions.
-    """
-    if shutil.which('tesseract') is None:
-        return False, (
-            "Tesseract 未安装。请运行:\n"
-            "  macOS:  brew install tesseract tesseract-lang\n"
-            "  Linux:  apt install tesseract-ocr tesseract-ocr-chi-sim"
-        )
-    try:
-        ver = pytesseract.get_tesseract_version()
-        return True, f"Tesseract {ver}"
-    except Exception as e:
-        return False, f"Tesseract 检查失败: {e}"
+
+def check_paddleocr() -> Tuple[bool, str]:
+    """Backwards-compat wrapper for `check_engine('paddleocr')`."""
+    return check_engine('paddleocr')
 
 
 def _row_is_empty(row) -> bool:
@@ -70,12 +66,23 @@ def _pdfplumber_extract(path: Path, warn: bool = True) -> str:
     return "".join(parts)
 
 
-def _ocr_extract(path: Path, lang: str, dpi: int, rotation: Optional[int] = None) -> str:
-    """OCR a PDF. If `rotation` is None (default), try both orientations and pick
-    the better result. If set to 0/90/180/270 (degrees, CW = positive), force that
-    rotation.
+def _ocr_extract(path: Path, lang: str, dpi: int,
+                 rotation: Optional[int] = None,
+                 engine: Optional[OCREngine] = None) -> str:
+    """OCR a PDF via the supplied (or default) engine.
+
+    If `rotation` is None (default), try both orientations and pick the
+    better result. If set to 0/90/180/270 (degrees, CW = positive), force
+    that rotation. PaddleOCR (with use_angle_cls=True) handles rotation
+    internally — the rotation arg is ignored in that case.
+
+    If `engine` is None, defaults to TesseractEngine('chi_sim+eng').
     """
-    parts = [OCR_HEADER_TEMPLATE.format(name=path.name, lang=lang, dpi=dpi)]
+    if engine is None:
+        engine = get_engine('tesseract', lang=lang)
+        engine.init()
+    parts = [OCR_HEADER_TEMPLATE.format(
+        name=path.name, lang=lang, dpi=dpi, engine=engine.name)]
     pdf = pdfium.PdfDocument(str(path))
     try:
         scale = dpi / 72.0
@@ -84,19 +91,22 @@ def _ocr_extract(path: Path, lang: str, dpi: int, rotation: Optional[int] = None
             pil = page.render(scale=scale).to_pil()
             try:
                 if rotation is not None:
-                    # Manual rotation (CW = positive in user-facing convention)
+                    # Manual rotation (CW = positive in user-facing convention).
+                    # Ignored for PaddleOCR (it rotates via angle_cls internally).
                     if rotation != 0:
                         pil = pil.rotate(-rotation, expand=True)
-                    text = pytesseract.image_to_string(pil, lang=lang) or ""
+                    text = engine.ocr(pil)
                     if rotation != 0:
                         parts.append(f"# OCR rotated {rotation}° CW (forced)\n")
                     parts.append(text)
                 else:
-                    # Auto: try original + 90° CW, pick better
-                    text_default = pytesseract.image_to_string(pil, lang=lang) or ""
+                    # Auto: try original + 90° CW, pick better.
+                    # For PaddleOCR (use_angle_cls=True) the second pass is
+                    # redundant — but cheap, and keeps the behavior uniform.
+                    text_default = engine.ocr(pil)
                     pil_rot = pil.rotate(-90, expand=True)
                     try:
-                        text_rotated = pytesseract.image_to_string(pil_rot, lang=lang) or ""
+                        text_rotated = engine.ocr(pil_rot)
                     finally:
                         pil_rot.close()
                     text, used_rot = _pick_better_text(text_default, text_rotated)
@@ -110,27 +120,12 @@ def _ocr_extract(path: Path, lang: str, dpi: int, rotation: Optional[int] = None
     return "".join(parts)
 
 
-def _detect_rotation(pil: 'PIL.Image.Image') -> tuple:
-    """Use Tesseract OSD to detect image rotation. Returns (confidence, degrees)."""
-    try:
-        osd = pytesseract.image_to_osd(pil)
-        # Parse output: "Orientation in degrees: 90\nRotate: 90\nOrientation confidence: 12.34"
-        rot_deg = 0
-        rot_conf = 0.0
-        for line in osd.split('\n'):
-            if 'Orientation in degrees' in line or 'Rotate:' in line:
-                try:
-                    rot_deg = int(line.split(':')[-1].strip())
-                except (ValueError, IndexError):
-                    pass
-            elif 'Orientation confidence' in line:
-                try:
-                    rot_conf = float(line.split(':')[-1].strip())
-                except (ValueError, IndexError):
-                    pass
-        return (rot_conf, rot_deg)
-    except Exception:
-        return (0.0, 0)
+def _detect_rotation(pil: 'PIL.Image.Image', engine: Optional[OCREngine] = None) -> tuple:
+    """Detect page rotation via the engine's own OSD. Returns (confidence, degrees)."""
+    if engine is None:
+        engine = get_engine('tesseract')
+        engine.init()
+    return engine.detect_rotation(pil)
 
 
 def _pick_better_text(text_a: str, text_b: str) -> tuple:
@@ -185,17 +180,21 @@ def extract_text(
     dpi: int = 300,
     warn: bool = True,
     rotation: Optional[int] = None,
+    engine: Optional[OCREngine] = None,
 ) -> str:
     """Extract text from a single file. Convenience function for use by other tools.
 
     Args:
         path: file path (PDF/XLS/XLSX)
-        ocr: if True, use Tesseract OCR for PDFs (slower; works on scanned/image-only PDFs)
-        lang: Tesseract language packs (e.g. 'chi_sim+eng', 'eng')
+        ocr: if True, use OCR for PDFs (slower; works on scanned/image-only PDFs)
+        lang: OCR language packs (e.g. 'chi_sim+eng', 'eng')
         dpi: render DPI for OCR (150-400)
         warn: if True, print a warning to stderr when a PDF has no text layer and ocr=False
         rotation: if set, force PDF page rotation in degrees (0/90/180/270, CW=positive).
                    Default None = auto-detect (try both orientations, pick the better one).
+        engine: optional pre-built OCREngine instance. If None and ocr=True,
+                a TesseractEngine is created on the fly. Pass an existing engine
+                to avoid per-file initialization cost (model load for PaddleOCR).
 
     Returns:
         Extracted text with file header and per-page/per-sheet markers.
@@ -204,7 +203,7 @@ def extract_text(
     ext = path.suffix.lower()
     if ext == '.pdf':
         if ocr:
-            return _ocr_extract(path, lang, dpi, rotation=rotation)
+            return _ocr_extract(path, lang, dpi, rotation=rotation, engine=engine)
         return _pdfplumber_extract(path, warn=warn)
     if ext == '.xlsx':
         return _xlsx_extract(path)
@@ -225,6 +224,8 @@ class TextExtractor:
         lang: str = 'chi_sim+eng',
         dpi: int = 300,
         rotation: Optional[int] = None,
+        engine: str = 'tesseract',
+        use_gpu: bool = False,
     ):
         self.sources = [Path(s).expanduser() for s in sources]
         self.output = Path(output).expanduser() if output else None
@@ -235,6 +236,9 @@ class TextExtractor:
         self.lang = lang
         self.dpi = dpi
         self.rotation = rotation
+        self.engine_name = engine
+        self.use_gpu = use_gpu
+        self._engine: Optional[OCREngine] = None
         self.stats = {
             'total': 0,
             'processed': 0,
@@ -243,6 +247,8 @@ class TextExtractor:
             'start_time': datetime.now(),
         }
         self.failures: List[Tuple[Path, str]] = []
+
+
 
     def _default_output_dir(self) -> Path:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -297,7 +303,23 @@ class TextExtractor:
         return self.output / rel.with_suffix('.txt')
 
     def _extract(self, path: Path) -> str:
-        return extract_text(path, ocr=self.ocr, lang=self.lang, dpi=self.dpi, warn=True, rotation=self.rotation)
+        return extract_text(path, ocr=self.ocr, lang=self.lang, dpi=self.dpi,
+                            warn=True, rotation=self.rotation, engine=self._get_engine())
+
+    def _get_engine(self) -> Optional[OCREngine]:
+        """Lazy-build the OCR engine on first use (model load is expensive)."""
+        if not self.ocr:
+            return None
+        if self._engine is None:
+            try:
+                self._engine = get_engine(self.engine_name, lang=self.lang, use_gpu=self.use_gpu)
+                self._engine.init()
+            except Exception as e:
+                print(f'Warning: failed to init engine {self.engine_name}: {e}', file=sys.stderr)
+                # Fall back to Tesseract
+                self._engine = get_engine('tesseract', lang=self.lang)
+                self._engine.init()
+        return self._engine
 
     def _write_output(self, out_path: Path, content: str) -> None:
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -310,7 +332,7 @@ class TextExtractor:
             return False, msg
 
         if self.ocr:
-            ok, tmsg = check_tesseract()
+            ok, tmsg = check_engine(self.engine_name)
             if not ok:
                 return False, tmsg
             print(f"OCR 引擎: {tmsg}")
@@ -393,11 +415,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--combine', action='store_true', help='Concatenate all extracted text into a single .txt file')
     parser.add_argument('--overwrite', action='store_true', help='Overwrite existing output files')
     parser.add_argument('--list', action='store_true', help='List discoverable files without extracting')
-    parser.add_argument('--ocr', action='store_true', help='Use Tesseract OCR for image-only PDFs (needs `brew install tesseract tesseract-lang`)')
-    parser.add_argument('--lang', default='chi_sim+eng', help='Tesseract language packs (default: chi_sim+eng)')
+    parser.add_argument('--ocr', action='store_true', help='Use OCR for image-only PDFs (default engine: tesseract; --engine paddleocr for Chinese small-text recall)')
+    parser.add_argument('--engine', default='tesseract', choices=['tesseract', 'paddleocr'],
+                        help='OCR engine when --ocr is set. Tesseract (default, ~700MB system deps) is good for typed documents. '
+                             'PaddleOCR (~250MB pip + 100MB model, better on Chinese small-text) needs `pip install -r requirements-paddleocr.txt`.')
+    parser.add_argument('--use-gpu', action='store_true',
+                        help='Enable GPU for PaddleOCR (Win/Linux + CUDA only; ignored on macOS Apple Silicon).')
+    parser.add_argument('--lang', default='chi_sim+eng', help='OCR language packs (Tesseract format; PaddleOCR maps chi_sim->ch, eng->en)')
     parser.add_argument('--dpi', type=int, default=300, help='OCR render DPI, 150-400 (default: 300; use 300+ for small text in technical drawings)')
     parser.add_argument('--rotation', type=int, default=None, choices=[0, 90, 180, 270],
-                        help='Force PDF page rotation in degrees (CW=positive). Default: auto-detect by comparing OCR of original vs rotated.')
+                        help='Force PDF page rotation in degrees (CW=positive). Default: auto-detect by comparing OCR of original vs rotated. Ignored by PaddleOCR (rotates internally).')
     args = parser.parse_args()
     if not (150 <= args.dpi <= 400):
         parser.error(f"--dpi must be 150-400, got {args.dpi}")
@@ -428,6 +455,8 @@ def main():
         lang=args.lang,
         dpi=args.dpi,
         rotation=args.rotation,
+        engine=args.engine,
+        use_gpu=args.use_gpu,
     )
 
     if args.list:

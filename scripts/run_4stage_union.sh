@@ -45,14 +45,31 @@ if [ ! -f "$CSV" ]; then
     echo "ERROR: CSV not found at $CSV" >&2
     exit 1
 fi
-if ! command -v tesseract >/dev/null; then
-    echo "ERROR: tesseract not on PATH. Install: brew install tesseract tesseract-lang" >&2
+# Default engine is tesseract (system binary on PATH).
+# To use paddleocr instead, pass ENGINE=paddleocr as env var, e.g.:
+#   ENGINE=paddleocr bash scripts/run_4stage_union.sh 4
+# PaddleOCR is checked lazily (each worker init); missing deps will print
+# a clear error per worker rather than blocking the whole batch.
+ENGINE="${ENGINE:-tesseract}"
+if [ "$ENGINE" = "tesseract" ]; then
+    if ! command -v tesseract >/dev/null; then
+        echo "ERROR: tesseract not on PATH. Install: brew install tesseract tesseract-lang" >&2
+        exit 1
+    fi
+elif [ "$ENGINE" = "paddleocr" ]; then
+    if ! python -c "import paddleocr" 2>/dev/null; then
+        echo "ERROR: paddleocr not installed. Run: pip install -r requirements-paddleocr.txt" >&2
+        exit 1
+    fi
+else
+    echo "ERROR: unknown ENGINE=$ENGINE (expected 'tesseract' or 'paddleocr')" >&2
     exit 1
 fi
 
 echo "=== 4-stage union launcher ==="
 echo "  WUHAN_DIR:            $WUHAN_DIR"
 echo "  CSV:                  $CSV"
+echo "  engine:               $ENGINE  (override: ENGINE=paddleocr bash ...)"
 echo "  workers_per_stage:    $WORKERS_PER_STAGE"
 echo "  total workers:        $((WORKERS_PER_STAGE * 4))"
 echo "  logs:                 $LOG_DIR"
@@ -71,6 +88,7 @@ launch() {
         --input "$WUHAN_DIR" \
         --output "$outdir" \
         --workers "$WORKERS_PER_STAGE" \
+        --engine "$ENGINE" \
         $extra_args \
         > "$log" 2>&1 &
     local pid=$!

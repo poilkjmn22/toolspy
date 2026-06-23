@@ -12,7 +12,9 @@ After all stages finish:
 
 param(
     [int]$WorkersPerStage = 4,
-    [string]$WuhanDir = "$env:USERPROFILE\Documents\work\nengzhong\wuhan\pdf"
+    [string]$WuhanDir = "$env:USERPROFILE\Documents\work\nengzhong\wuhan\pdf",
+    [ValidateSet('tesseract','paddleocr')]
+    [string]$Engine = 'tesseract'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -27,8 +29,15 @@ if (-not (Test-Path $pythonExe)) {
 if (-not (Test-Path $csv)) {
     Write-Error "Cable CSV not found at $csv"
 }
-if (-not (Get-Command tesseract -ErrorAction SilentlyContinue)) {
-    Write-Warning "tesseract not on PATH. Install from https://github.com/UB-Mannheim/tesseract/wiki"
+if ($Engine -eq 'tesseract') {
+    if (-not (Get-Command tesseract -ErrorAction SilentlyContinue)) {
+        Write-Warning "tesseract not on PATH. Install from https://github.com/UB-Mannheim/tesseract/wiki"
+    }
+} elseif ($Engine -eq 'paddleocr') {
+    $paddleCheck = & $pythonExe -c "import paddleocr" 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "paddleocr not installed. Run: myenv\Scripts\pip install -r requirements-paddleocr.txt"
+    }
 }
 
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
@@ -43,6 +52,7 @@ $stages = @(
 Write-Host '=== 4-stage union launcher (PowerShell) ==='
 Write-Host "  WuhanDir:         $WuhanDir"
 Write-Host "  CSV:               $csv"
+Write-Host "  Engine:            $Engine  (override: -Engine paddleocr)"
 Write-Host "  WorkersPerStage:   $WorkersPerStage"
 Write-Host "  Total workers:     $($WorkersPerStage * 4)"
 Write-Host "  Logs:              $logDir"
@@ -58,7 +68,8 @@ foreach ($stage in $stages) {
         '--csv', $csv,
         '--input', $WuhanDir,
         '--output', $outDir,
-        '--workers', "$WorkersPerStage"
+        '--workers', "$WorkersPerStage",
+        '--engine', $Engine
     ) + $stage.Args
 
     Write-Host ("  launching: {0,-14}  ->  {1}" -f $stage.Name, $outDir)

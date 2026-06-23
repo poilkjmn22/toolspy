@@ -26,6 +26,8 @@ class PdfOrganizer:
         lang: str = 'chi_sim+eng',
         dpi: int = 300,
         rotation: Optional[int] = None,
+        engine: str = 'tesseract',
+        use_gpu: bool = False,
     ):
         self.input_folder = Path(input_folder).expanduser()
         self.target = target
@@ -39,6 +41,9 @@ class PdfOrganizer:
         self.lang = lang
         self.dpi = dpi
         self.rotation = rotation
+        self.engine_name = engine
+        self.use_gpu = use_gpu
+        self._engine = None
         self.stats = {
             'total': 0,
             'matched': 0,
@@ -107,6 +112,22 @@ class PdfOrganizer:
                 return candidate
             n += 1
 
+    def _get_engine(self):
+        """Lazy-build the OCR engine on first use (PaddleOCR model load is ~10s)."""
+        if self.no_ocr:
+            return None
+        if self._engine is None:
+            try:
+                from tools.ocr_engine import get_engine
+                self._engine = get_engine(self.engine_name, lang=self.lang, use_gpu=self.use_gpu)
+                self._engine.init()
+            except Exception as e:
+                print(f'Warning: failed to init engine {self.engine_name}: {e}', file=sys.stderr)
+                from tools.ocr_engine import get_engine
+                self._engine = get_engine('tesseract', lang=self.lang)
+                self._engine.init()
+        return self._engine
+
     def _output_has_same_content(self, src: Path) -> bool:
         """Check whether any file in the output dir has the same content as src.
 
@@ -144,6 +165,7 @@ class PdfOrganizer:
                     dpi=self.dpi,
                     warn=False,
                     rotation=self.rotation,
+                    engine=self._get_engine(),
                 )
             except Exception as e:
                 print(f"错误: {e}")
@@ -172,7 +194,8 @@ class PdfOrganizer:
             return False, msg
 
         if not self.no_ocr:
-            ok, tmsg = check_tesseract()
+            from tools.ocr_engine import check_engine, get_engine, EngineNotAvailable
+            ok, tmsg = check_engine(self.engine_name)
             if not ok:
                 return False, tmsg
 
@@ -252,10 +275,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--ignore-case', action='store_true', help='Case-insensitive match (default: case-sensitive)')
     parser.add_argument('--no-normalize', action='store_true', help='Disable whitespace normalization (default: normalize)')
     parser.add_argument('--overwrite', action='store_true', help='Overwrite files with same name in output (default: skip)')
-    parser.add_argument('--lang', default='chi_sim+eng', help='Tesseract language packs (default: chi_sim+eng)')
+    parser.add_argument('--lang', default='chi_sim+eng', help='OCR language packs (Tesseract format; PaddleOCR maps chi_sim->ch)')
     parser.add_argument('--dpi', type=int, default=300, help='OCR render DPI, 150-400 (default: 300; use 300+ for small text in technical drawings)')
     parser.add_argument('--rotation', type=int, default=None, choices=[0, 90, 180, 270],
-                        help='Force PDF page rotation in degrees (CW=positive). Default: auto-detect.')
+                        help='Force PDF page rotation in degrees (CW=positive). Default: auto-detect. Ignored by PaddleOCR.')
+    parser.add_argument('--engine', default='tesseract', choices=['tesseract', 'paddleocr'],
+                        help='OCR engine (default: tesseract; paddleocr needs `pip install -r requirements-paddleocr.txt`)')
+    parser.add_argument('--use-gpu', action='store_true',
+                        help='Enable GPU for PaddleOCR (Win/Linux + CUDA only).')
     parser.add_argument('--list', action='store_true', help='Dry-run: show matches without copying/moving')
     args = parser.parse_args()
     if not (150 <= args.dpi <= 400):
@@ -279,6 +306,8 @@ def main():
         lang=args.lang,
         dpi=args.dpi,
         rotation=args.rotation,
+        engine=args.engine,
+        use_gpu=args.use_gpu,
     )
 
     valid, msg = organizer.validate()
@@ -287,11 +316,12 @@ def main():
         sys.exit(1)
 
     if not args.no_ocr:
-        ok, tmsg = check_tesseract()
+        from tools.ocr_engine import check_engine
+        ok, tmsg = check_engine(args.engine)
         if not ok:
             print(f"错误: {tmsg}")
             sys.exit(1)
-        ocr_info = f"Tesseract ({args.lang}, {args.dpi} dpi)"
+        ocr_info = f"{args.engine} ({args.lang}, {args.dpi} dpi)"
     else:
         ocr_info = "off (text layer only)"
 

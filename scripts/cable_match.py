@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""cable_match v2: multi-target PDF organizer with SQLite cache, state.json, multiprocessing.
+"""cable_match v3: multi-target PDF organizer with SQLite cache, state.json, multiprocessing.
 
 v2 improvements over v1:
   1. SQLite OCR cache — re-runs are instant for unchanged PDFs (skip OCR)
@@ -8,10 +8,20 @@ v2 improvements over v1:
   4. --resume <state.json|auto> (built-in resume, no external scripts)
   5. multiprocessing (true parallel, 4-6x speedup vs ThreadPoolExecutor)
 
+v3 additions:
+  - Pluggable OCR engine (--engine {tesseract|paddleocr}); default = tesseract
+  - --preprocess {none|gauss_otsu|both} (image preprocessing for OCR)
+  - --psm / --oem (Tesseract-only tuning; ignored by PaddleOCR)
+  - 4-tier fuzzy matching (exact → normalized → confusion → levenshtein)
+    with a `匹配方式` column in _matches.csv
+  - SQLite OCR cache schema: cache key includes (preprocess, psm, oem, engine)
+    so e.g. --engine paddleocr and --engine tesseract don't collide
+
 Usage:
   python scripts/cable_match.py --csv <path> --input <folder> [--output <root>] [--list]
+                                  [--engine tesseract|paddleocr]
                                   [--workers N] [--rotation 0|90|180|270]
-                                  [--preprocess none|gauss_otsu]
+                                  [--preprocess none|gauss_otsu|both]
                                   [--resume <state.json|auto>] [--no-cache]
 """
 import argparse
@@ -30,26 +40,7 @@ import time
 from pathlib import Path
 
 import pypdfium2 as pdfium
-import pytesseract
 from PIL import Image, ImageFilter, ImageOps
-
-# Auto-detect Tesseract binary on Windows. macOS / Linux usually have tesseract
-# on PATH via brew / apt; Windows installers (UB-Mannheim) put it under
-# `C:\Program Files\Tesseract-OCR\tesseract.exe` which is NOT on PATH by default
-# for Python's child process unless explicitly configured.
-if sys.platform == 'win32' and not pytesseract.pytesseract.tesseract_cmd:
-    for candidate in (
-        r'C:\Program Files\Tesseract-OCR\tesseract.exe',
-        r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
-    ):
-        if Path(candidate).exists():
-            pytesseract.pytesseract.tesseract_cmd = candidate
-            break
-    else:
-        print('Warning: Tesseract not found in standard Windows paths. '
-              'Install from https://github.com/UB-Mannheim/tesseract/wiki '
-              'or set pytesseract.pytesseract.tesseract_cmd manually.',
-              file=sys.stderr)
 
 # === Project root resolution ===
 # Make the toolspy project importable regardless of where this script is run from
@@ -57,6 +48,33 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if not (_PROJECT_ROOT / "myenv").exists() and not (_PROJECT_ROOT / "tools").exists():
     _PROJECT_ROOT = Path.home() / "Documents" / "WebDev" / "toolspy"
 sys.path.insert(0, str(_PROJECT_ROOT))
+
+from tools.ocr_engine import (
+    OCREngine,
+    TesseractEngine,
+    check_engine,
+    get_engine,
+    EngineNotAvailable,
+)
+
+# Auto-detect Tesseract binary on Windows. macOS / Linux usually have tesseract
+# on PATH via brew / apt; Windows installers (UB-Mannheim) put it under
+# `C:\Program Files\Tesseract-OCR\tesseract.exe` which is NOT on PATH by default
+# for Python's child process unless explicitly configured.
+if sys.platform == 'win32':
+    try:
+        import pytesseract  # noqa: F401
+        if not pytesseract.pytesseract.tesseract_cmd:
+            for candidate in (
+                r'C:\Program Files\Tesseract-OCR\tesseract.exe',
+                r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
+            ):
+                if Path(candidate).exists():
+                    pytesseract.pytesseract.tesseract_cmd = candidate
+                    break
+    except ImportError:
+        # pytesseract may not be installed if only paddleocr is used.
+        pass
 
 
 # === Constants ===
@@ -66,7 +84,7 @@ MATCHES_CSV_FILENAME = '_matches.csv'
 STATE_FLUSH_INTERVAL = 30  # seconds
 OCR_HEADER_TEMPLATE = (
     "# Extracted from {name} by text-extractor "
-    "(OCR via Tesseract, lang={lang}, dpi={dpi}, preprocess={preprocess}, "
+    "(OCR via {engine}, lang={lang}, dpi={dpi}, preprocess={preprocess}, "
     "psm={psm}, oem={oem})\n"
 )
 
@@ -79,6 +97,8 @@ _WORKER_PREPROCESS = None
 _WORKER_PSM = None
 _WORKER_OEM = None
 _WORKER_USE_LEVENSHTEIN = False
+_WORKER_ENGINE_NAME = 'tesseract'
+_WORKER_ENGINE = None  # OCREngine instance
 
 
 # === Image preprocessing (improves OCR recall on technical drawings) ===
@@ -157,13 +177,20 @@ def _build_tesseract_config(psm=None, oem=None):
     return ' '.join(parts)
 
 
-def _render_and_ocr(pdf_path, dpi, lang, rotation, preprocess, psm=None, oem=None):
-    """Render PDF pages and OCR with optional preprocessing and Tesseract config.
-    Mirrors text_extractor._ocr_extract but applies preprocessing per page variant.
+def _render_and_ocr(pdf_path, dpi, lang, rotation, preprocess,
+                    psm=None, oem=None, engine=None):
+    """Render PDF pages and OCR with optional preprocessing.
+
+    If `engine` is provided, it's used directly (assumed already initialized).
+    Otherwise a TesseractEngine is constructed from the (psm, oem) args.
+    PaddleOCR ignores --psm / --oem and uses its angle classifier instead.
     """
-    config = _build_tesseract_config(psm, oem)
+    if engine is None:
+        engine = TesseractEngine(lang=lang, psm=psm, oem=oem)
+        engine.init()
     parts = [OCR_HEADER_TEMPLATE.format(
-        name=pdf_path.name, lang=lang, dpi=dpi, preprocess=preprocess,
+        name=pdf_path.name, engine=engine.name, lang=lang, dpi=dpi,
+        preprocess=preprocess,
         psm=psm if psm is not None else 'default',
         oem=oem if oem is not None else 'default',
     )]
@@ -178,16 +205,16 @@ def _render_and_ocr(pdf_path, dpi, lang, rotation, preprocess, psm=None, oem=Non
                     if rotation != 0:
                         pil = pil.rotate(-rotation, expand=True)
                     pil_pre = _preprocess_for_ocr(pil, preprocess)
-                    text = pytesseract.image_to_string(pil_pre, lang=lang, config=config) or ""
+                    text = engine.ocr(pil_pre) or ""
                     if rotation != 0:
                         parts.append(f"# OCR rotated {rotation}° CW (forced)\n")
                     parts.append(text)
                 else:
                     pil_pre = _preprocess_for_ocr(pil, preprocess)
-                    text_default = pytesseract.image_to_string(pil_pre, lang=lang, config=config) or ""
+                    text_default = engine.ocr(pil_pre) or ""
                     pil_rot = pil_pre.rotate(-90, expand=True)
                     try:
-                        text_rotated = pytesseract.image_to_string(pil_rot, lang=lang, config=config) or ""
+                        text_rotated = engine.ocr(pil_rot) or ""
                     finally:
                         pil_rot.close()
                     text, used_rot = _pick_better_text(text_default, text_rotated)
@@ -201,16 +228,17 @@ def _render_and_ocr(pdf_path, dpi, lang, rotation, preprocess, psm=None, oem=Non
     return "".join(parts)
 
 
-def _render_and_ocr_both(pdf_path, dpi, lang, rotation, psm=None, oem=None):
+def _render_and_ocr_both(pdf_path, dpi, lang, rotation,
+                         psm=None, oem=None, engine=None):
     """Run OCR with both 'none' and 'gauss_otsu' preprocess recipes.
     Returns (text_none, text_gauss_otsu). Each text is independently cacheable
     (different preprocess key) and will be concatenated by the caller for
     cable-ID matching, taking the union of both pipelines' findings.
     """
     text_none = _render_and_ocr(pdf_path, dpi=dpi, lang=lang, rotation=rotation,
-                                preprocess='none', psm=psm, oem=oem)
+                                preprocess='none', psm=psm, oem=oem, engine=engine)
     text_gauss = _render_and_ocr(pdf_path, dpi=dpi, lang=lang, rotation=rotation,
-                                 preprocess='gauss_otsu', psm=psm, oem=oem)
+                                 preprocess='gauss_otsu', psm=psm, oem=oem, engine=engine)
     return text_none, text_gauss
 
 
@@ -387,21 +415,31 @@ def find_matches(combined_text: str, targets: list, use_levenshtein: bool = Fals
 
 # === SQLite cache ===
 
-def _cache_key(content_hash: str, preprocess: str = 'none', psm=None, oem=None) -> str:
-    """Derive a cache row key that distinguishes (content_hash, preprocess, psm, oem) tuples.
-    For default config (preprocess='none', psm in (None, 3), oem in (None, 3)) we use the
-    raw hash (backward compatible with rows written before the psm/oem columns existed).
-    Other recipes get a suffix that captures the non-default dimensions.
+def _cache_key(content_hash: str, preprocess: str = 'none',
+               psm=None, oem=None, engine: str = 'tesseract') -> str:
+    """Derive a cache row key that distinguishes
+    (content_hash, preprocess, psm, oem, engine) tuples.
+
+    Default config (preprocess='none', psm default, oem default, engine='tesseract')
+    uses the raw hash for backward compat with rows written before psm/oem/engine
+    columns existed. Non-default dimensions get a `::recipe__dim__dim` suffix so the
+    same PDF can have multiple cache rows under different parameter combinations.
     """
     psm_part = '' if psm in (None, 3) else f'__psm{psm}'
     oem_part = '' if oem in (None, 3) else f'__oem{oem}'
-    if preprocess == 'none' and not psm_part and not oem_part:
+    engine_part = '' if engine in (None, '', 'tesseract') else f'__{engine}'
+    if preprocess == 'none' and not psm_part and not oem_part and not engine_part:
         return content_hash
-    return f"{content_hash}::{preprocess}{psm_part}{oem_part}"
+    return f"{content_hash}::{preprocess}{psm_part}{oem_part}{engine_part}"
 
 
 def init_db(db_path: Path):
-    """Create the cache DB if it doesn't exist. Migrate schema for new columns."""
+    """Create the cache DB if it doesn't exist. Migrate schema for new columns.
+
+    Migration order: ocr_preprocess → ocr_psm → ocr_oem → ocr_engine (all default 'tesseract').
+    Existing rows are assumed to be Tesseract (since the column was added in v3 when
+    the engine abstraction was introduced).
+    """
     conn = sqlite3.connect(str(db_path), timeout=30)
     try:
         conn.execute('''
@@ -414,6 +452,7 @@ def init_db(db_path: Path):
                 ocr_preprocess TEXT,
                 ocr_psm INTEGER,
                 ocr_oem INTEGER,
+                ocr_engine TEXT,
                 ocr_at TEXT,
                 pdf_size INTEGER,
                 pdf_mtime REAL
@@ -426,6 +465,8 @@ def init_db(db_path: Path):
             conn.execute('ALTER TABLE ocr_cache ADD COLUMN ocr_psm INTEGER')
         if 'ocr_oem' not in cols:
             conn.execute('ALTER TABLE ocr_cache ADD COLUMN ocr_oem INTEGER')
+        if 'ocr_engine' not in cols:
+            conn.execute("ALTER TABLE ocr_cache ADD COLUMN ocr_engine TEXT DEFAULT 'tesseract'")
         # WAL mode for concurrent reads/writes
         conn.execute('PRAGMA journal_mode=WAL')
         conn.commit()
@@ -434,8 +475,8 @@ def init_db(db_path: Path):
 
 
 def get_cached_text(db_path: Path, content_hash: str, preprocess: str = 'none',
-                    psm=None, oem=None) -> str:
-    """Retrieve cached OCR text matching content hash + preprocess + psm + oem.
+                    psm=None, oem=None, engine: str = 'tesseract') -> str:
+    """Retrieve cached OCR text matching content hash + preprocess + psm + oem + engine.
     Returns None on miss (including: cached with different params, or DB error).
     """
     try:
@@ -443,7 +484,7 @@ def get_cached_text(db_path: Path, content_hash: str, preprocess: str = 'none',
         try:
             row = conn.execute(
                 'SELECT ocr_text FROM ocr_cache WHERE content_hash = ?',
-                (_cache_key(content_hash, preprocess, psm, oem),)
+                (_cache_key(content_hash, preprocess, psm, oem, engine),)
             ).fetchone()
             if row:
                 return row[0]
@@ -457,21 +498,24 @@ def get_cached_text(db_path: Path, content_hash: str, preprocess: str = 'none',
 def put_cached_text(db_path: Path, content_hash: str, text: str,
                     dpi: int, lang: str, rotation,
                     preprocess: str, psm=None, oem=None,
+                    engine: str = 'tesseract',
                     pdf_size: int = 0, pdf_mtime: float = 0.0):
-    """Store OCR text in cache. Key is (content_hash, preprocess, psm, oem) — a PDF cached
-    with one param set does not serve as cache for a different param set.
-    Uses a derived key (`hash::recipe__psmN__oemN`) so the same PDF can have multiple
-    cache rows when run with different param combinations."""
+    """Store OCR text in cache. Key is (content_hash, preprocess, psm, oem, engine) — a PDF
+    cached with one param set does not serve as cache for a different param set.
+    Uses a derived key so the same PDF can have multiple cache rows when run with
+    different param combinations (e.g. tesseract + psm=6 vs paddleocr vs gauss_otsu)."""
     try:
         conn = sqlite3.connect(str(db_path), timeout=10)
         try:
             conn.execute('''
                 INSERT OR REPLACE INTO ocr_cache
                 (content_hash, ocr_text, ocr_dpi, ocr_lang, ocr_rotation,
-                 ocr_preprocess, ocr_psm, ocr_oem, ocr_at, pdf_size, pdf_mtime)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (_cache_key(content_hash, preprocess, psm, oem), text, dpi, lang, rotation,
-                  preprocess, psm, oem, datetime.datetime.now().isoformat(),
+                 ocr_preprocess, ocr_psm, ocr_oem, ocr_engine, ocr_at, pdf_size, pdf_mtime)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (_cache_key(content_hash, preprocess, psm, oem, engine),
+                  text, dpi, lang, rotation,
+                  preprocess, psm, oem, engine,
+                  datetime.datetime.now().isoformat(),
                   pdf_size, pdf_mtime))
             conn.commit()
         finally:
@@ -520,11 +564,17 @@ def discover_pdfs(input_path: Path, target_set: set) -> list:
 
 # === Worker function (for multiprocessing) ===
 
-def _worker_init(targets, dpi, lang, rotation, preprocess, psm=None, oem=None,
-                  use_levenshtein=False):
-    """Initialize worker globals. Called once per worker process."""
+def _worker_init(targets, dpi, lang, rotation, preprocess,
+                  psm=None, oem=None, use_levenshtein=False,
+                  engine_name='tesseract'):
+    """Initialize worker globals. Called once per worker process.
+
+    Also builds the OCREngine instance and runs `engine.init()` to load any
+    heavy models (PaddleOCR ~10s on first call; Tesseract is a no-op).
+    """
     global _WORKER_TARGETS, _WORKER_DPI, _WORKER_LANG, _WORKER_ROTATION, _WORKER_PREPROCESS
     global _WORKER_PSM, _WORKER_OEM, _WORKER_USE_LEVENSHTEIN
+    global _WORKER_ENGINE_NAME, _WORKER_ENGINE
     _WORKER_TARGETS = targets
     _WORKER_DPI = dpi
     _WORKER_LANG = lang
@@ -533,6 +583,16 @@ def _worker_init(targets, dpi, lang, rotation, preprocess, psm=None, oem=None,
     _WORKER_PSM = psm
     _WORKER_OEM = oem
     _WORKER_USE_LEVENSHTEIN = use_levenshtein
+    _WORKER_ENGINE_NAME = engine_name
+    try:
+        _WORKER_ENGINE = get_engine(engine_name, lang=lang, psm=psm, oem=oem)
+        _WORKER_ENGINE.init()
+    except EngineNotAvailable as e:
+        print(f'Worker: engine {engine_name!r} not available: {e}', file=sys.stderr)
+        print(f'Worker: falling back to tesseract', file=sys.stderr)
+        _WORKER_ENGINE = TesseractEngine(lang=lang, psm=psm, oem=oem)
+        _WORKER_ENGINE.init()
+        _WORKER_ENGINE_NAME = 'tesseract'
 
 
 def _process_pdf(item):
@@ -563,7 +623,7 @@ def _process_pdf(item):
     if db_path:
         for prep in recipes:
             cached = get_cached_text(db_path, content_hash, prep,
-                                     _WORKER_PSM, _WORKER_OEM)
+                                     _WORKER_PSM, _WORKER_OEM, _WORKER_ENGINE_NAME)
             if cached is not None:
                 texts[prep] = cached
                 cache_hit = True
@@ -576,17 +636,17 @@ def _process_pdf(item):
                 texts['none'] = _render_and_ocr(
                     pdf_path, dpi=_WORKER_DPI, lang=_WORKER_LANG,
                     rotation=_WORKER_ROTATION, preprocess='none',
-                    psm=_WORKER_PSM, oem=_WORKER_OEM)
+                    psm=_WORKER_PSM, oem=_WORKER_OEM, engine=_WORKER_ENGINE)
             elif missing == ['gauss_otsu']:
                 texts['gauss_otsu'] = _render_and_ocr(
                     pdf_path, dpi=_WORKER_DPI, lang=_WORKER_LANG,
                     rotation=_WORKER_ROTATION, preprocess='gauss_otsu',
-                    psm=_WORKER_PSM, oem=_WORKER_OEM)
+                    psm=_WORKER_PSM, oem=_WORKER_OEM, engine=_WORKER_ENGINE)
             else:  # both missing — run the dual pass
                 t_none, t_gauss = _render_and_ocr_both(
                     pdf_path, dpi=_WORKER_DPI, lang=_WORKER_LANG,
                     rotation=_WORKER_ROTATION,
-                    psm=_WORKER_PSM, oem=_WORKER_OEM)
+                    psm=_WORKER_PSM, oem=_WORKER_OEM, engine=_WORKER_ENGINE)
                 texts['none'] = t_none
                 texts['gauss_otsu'] = t_gauss
 
@@ -599,7 +659,7 @@ def _process_pdf(item):
                             put_cached_text(
                                 db_path, content_hash, t,
                                 _WORKER_DPI, _WORKER_LANG, _WORKER_ROTATION,
-                                prep, _WORKER_PSM, _WORKER_OEM,
+                                prep, _WORKER_PSM, _WORKER_OEM, _WORKER_ENGINE_NAME,
                                 pdf_stat.st_size, pdf_stat.st_mtime)
                 except Exception:
                     pass
@@ -677,13 +737,23 @@ def main():
                              'other pages. "both" runs both recipes per PDF and takes the '
                              'union of matches (2x OCR time, best recall, recommended when '
                              'missing critical cable IDs is worse than re-OCR cost).')
+    parser.add_argument('--engine', default='tesseract', choices=['tesseract', 'paddleocr'],
+                        help='OCR engine. Default "tesseract" works without extra deps. '
+                             '"paddleocr" (PP-OCRv3, better on Chinese small-text + dense '
+                             'layouts) needs `pip install -r requirements-paddleocr.txt`. '
+                             '--psm / --oem are ignored when --engine paddleocr '
+                             '(PaddleOCR has its own angle classifier).')
+    parser.add_argument('--use-gpu', action='store_true',
+                        help='Enable GPU for PaddleOCR (Win/Linux + CUDA only; ignored on '
+                             'macOS Apple Silicon). Default: CPU.')
     parser.add_argument('--psm', type=int, default=None,
                         help='Tesseract page segmentation mode. Default: 3 (fully auto). '
                              '6 = single uniform text block (good for tech drawings). '
-                             '11 = sparse text. See https://tesseract-ocr.github.io/tessdoc/PSM.html')
+                             '11 = sparse text. IGNORED by PaddleOCR. '
+                             'See https://tesseract-ocr.github.io/tessdoc/PSM.html')
     parser.add_argument('--oem', type=int, default=None,
                         help='Tesseract OCR engine mode. Default: 3 (auto). '
-                             '1 = LSTM only, 0 = legacy only. '
+                             '1 = LSTM only, 0 = legacy only. IGNORED by PaddleOCR. '
                              'See https://tesseract-ocr.github.io/tessdoc/OEM.html')
     parser.add_argument('--workers', type=int, default=4, help='Parallel workers (default: 4)')
     parser.add_argument('--list', action='store_true', help='Dry-run: show matches, no copying')
@@ -719,7 +789,7 @@ def main():
     print(f"Loaded {len(targets)} unique targets from CSV", flush=True)
     print(f"Input: {input_path}", flush=True)
     print(f"Output: {output_path}", flush=True)
-    print(f"OCR: Tesseract ({args.lang}, {args.dpi} dpi, {args.workers} workers, "
+    print(f"OCR: {args.engine} ({args.lang}, {args.dpi} dpi, {args.workers} workers, "
           f"rotation={args.rotation or 'auto'}, preprocess={args.preprocess}, "
           f"psm={args.psm if args.psm is not None else 'default'}, "
           f"oem={args.oem if args.oem is not None else 'default'}, "
@@ -747,6 +817,8 @@ def main():
         'lang': args.lang,
         'rotation': args.rotation,
         'preprocess': args.preprocess,
+        'engine': args.engine,
+        'use_gpu': args.use_gpu,
         'psm': args.psm,
         'oem': args.oem,
         'total': 0,
@@ -844,7 +916,8 @@ def main():
     completed = 0
     total = len(todo)
 
-    initargs = (targets, args.dpi, args.lang, args.rotation, args.preprocess, args.psm, args.oem, args.levenshtein)
+    initargs = (targets, args.dpi, args.lang, args.rotation, args.preprocess,
+                args.psm, args.oem, args.levenshtein, args.engine)
 
     print(f"Processing {total} PDFs with {args.workers} workers (multiprocessing)...", flush=True)
 

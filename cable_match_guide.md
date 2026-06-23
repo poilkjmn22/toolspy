@@ -1,4 +1,4 @@
-# 多目标电缆号匹配工具 — 同事上手指南 (v2)
+# 多目标电缆号匹配工具 — 同事上手指南 (v3)
 
 ## 这是什么
 
@@ -11,29 +11,71 @@ v2 相比 v1 的改进：
 4. **`--resume <state.json|auto>`** — 内置断点续跑
 5. **multiprocessing 真并行** — 比 ThreadPoolExecutor 快 4-6x
 
+v3 新增：
+1. **可插拔 OCR 引擎**（`--engine {tesseract|paddleocr}`）— 默认 Tesseract，可选 PaddleOCR 提升小字+密集图表召回
+2. **图像预处理**（`--preprocess {none|gauss_otsu|both}`）— 灰度+高斯+Otsu 救回 3B-463 这类漏字
+3. **4 级递进式召回匹配**（exact → normalized → confusion → levenshtein）— 把 OCR 字符错（`3`↔`8` 等）捞回来
+4. **Tesseract 微调**（`--psm` / `--oem`）— 实验性，多数情况默认即可
+5. **`匹配方式` 列**写进 `_matches.csv` — 方便 review 哪些是 fuzzy 命中的
+
 它比 `pdf-organize` 强的地方是**多目标一次扫描**：29 个电缆号 × 450 个 PDF 的批次，单 OCR 扫描就能完成，不会把 OCR 跑 29 遍。
 
-## 一、前置环境
+## 一、选 OCR 引擎（Tesseract vs PaddleOCR）
 
-同事的机器需要（macOS / Linux 都行）：
+同事的机器需要**至少装其中一个**。两个引擎的差异：
 
-| 工具 | 用途 | 安装命令 |
-|------|------|---------|
-| Python 3.8+ | 运行环境 | 系统自带或 [python.org](https://python.org) |
-| Homebrew（macOS）| 装 Tesseract | `brew install tesseract tesseract-lang` |
-| `tesseract` 二进制 | OCR 引擎 | `brew install tesseract tesseract-lang`（含 `chi_sim` 中文包）|
-| `pytesseract` | Python 调用 tesseract | `myenv/bin/pip install pytesseract` |
+| 引擎 | 系统依赖 | 体积 | 中文小字+密集图表召回 | 安装难度 | 适用场景 |
+|------|---------|------|----------------------|---------|---------|
+| **Tesseract**(默认) | 系统二进制(~700MB) | 700MB | ~70-80% | ⭐ 简单 | 通用文档、PDF 文字层、英文 |
+| **PaddleOCR** | pip 包装(~250MB) + 模型(~100MB) | 350MB | ~85-95% | ⭐⭐ 中等 | 电力图纸、二次图、扫描件 |
 
-**为什么需要单独装 Tesseract**：它不是 pip 包，是系统二进制，~700MB（含中文语言包）。`requirements.txt` 里只有 `pytesseract` 包装器，binary 必须独立装。
+**经验值**:Tesseract 70~80% → PaddleOCR 85~95% **不是夸张**,特别是 `3B-463`、`1F-151` 这种小字密集场景。
 
-验证：
+**怎么选**:
+- 文档以排版正文为主 → Tesseract
+- 大量电力二次图、端子排、扫描件 → PaddleOCR
+- 不知道 → 先 Tesseract 跑,看漏报情况,不满意再切 PaddleOCR
+
+两个引擎可以共存,`cable_match.py` 的 SQLite cache 用 `ocr_engine` 列区分,**Tesseract 的结果不会被 PaddleOCR 覆盖**,反之亦然。
+
+## 二、装 Tesseract(默认,先装这个)
+
+| 平台 | 命令 |
+|------|------|
+| macOS | `brew install tesseract tesseract-lang` |
+| Linux (Debian/Ubuntu) | `apt install tesseract-ocr tesseract-ocr-chi-sim` |
+| Windows | 从 [UB-Mannheim](https://github.com/UB-Mannheim/tesseract/wiki) 下载安装包,默认装到 `C:\Program Files\Tesseract-OCR\`(脚本会自动检测该路径)|
+
+验证:
 ```bash
 tesseract --version
 tesseract --list-langs | grep chi_sim
 # 两个都有输出 = OK
 ```
 
-## 二、项目准备
+`requirements.txt` 已包含 `pytesseract` 包装器,**Tesseract 二进制必须独立装**(它不是 pip 包)。
+
+## 三、可选:加装 PaddleOCR
+
+```bash
+myenv/bin/pip install -r requirements-paddleocr.txt
+```
+
+这会装 `paddleocr==2.7.3` + `paddlepaddle==2.6.1`(~250MB pip 依赖)。**第一次跑 PaddleOCR 时会自动下载模型**(~100MB,放在 `~/.paddleocr/` 下)。
+
+**平台注意**:
+- macOS Apple Silicon: paddlepaddle 没有 GPU wheel,**强制 CPU 模式**,单 PDF ~30s-1min
+- Windows + NVIDIA GPU: 自动 CUDA 加速,单 PDF ~5-10s
+- Linux + NVIDIA GPU: 同上,推荐
+- 没 GPU 的 Linux/Windows: CPU 模式,Mac 类似速度
+
+验证:
+```bash
+myenv/bin/python -c "from paddleocr import PaddleOCR; print('OK')"
+# 第一次会下载模型,等 1-2 min
+```
+
+## 四、项目准备
 
 ```bash
 git clone <repo-url>
@@ -41,10 +83,11 @@ cd toolspy
 
 python3 -m venv myenv
 myenv/bin/pip install -r requirements.txt
-myenv/bin/pip install pytesseract     # ← requirements.txt 里有，保险再装
+# 可选:加装 PaddleOCR
+myenv/bin/pip install -r requirements-paddleocr.txt
 ```
 
-## 三、CSV 准备
+## 五、CSV 准备
 
 CSV 必须有一列叫 `电缆编号`（含表头），UTF-8 或 UTF-8-BOM 编码。例：
 
@@ -57,21 +100,27 @@ CSV 必须有一列叫 `电缆编号`（含表头），UTF-8 或 UTF-8-BOM 编�
 
 脚本会**自动去重**（保留首次出现的顺序），空值会被跳过。
 
-## 四、运行
+## 六、运行
+
+`scripts/cable_match.py` 的核心调用:
 
 ```bash
-cd <project>/toolspy
-
-# Dry-run
+# 推荐:先 --list 看匹配,不复制
 myenv/bin/python scripts/cable_match.py \
-    --csv /path/to/cable_list.csv \
-    --input /path/to/pdf/folder \
+    --csv /path/to/cables.csv \
+    --input /path/to/pdf_folder \
     --list
 
-# 实际跑
+# 实际跑(Tesseract 默认,推荐起点)
 myenv/bin/python scripts/cable_match.py \
-    --csv /path/to/cable_list.csv \
-    --input /path/to/pdf/folder
+    --csv /path/to/cables.csv \
+    --input /path/to/pdf_folder
+
+# 想要更高召回:切到 PaddleOCR
+myenv/bin/python scripts/cable_match.py \
+    --csv /path/to/cables.csv \
+    --input /path/to/pdf_folder \
+    --engine paddleocr
 ```
 
 ### 常用参数
@@ -81,18 +130,28 @@ myenv/bin/python scripts/cable_match.py \
 | `--csv` | 必填 | 含 `电缆编号` 列的 CSV |
 | `--input` | 必填 | 要扫描的 PDF 根目录（递归）|
 | `--output` | =`--input` | 命中 PDF 的输出根目录 |
+| `--engine` | `tesseract` | OCR 引擎：`tesseract`（默认，~700MB 系统包）或 `paddleocr`（~250MB pip + ~100MB 模型，小字密集场景召回更高）|
+| `--use-gpu` | off | 启用 PaddleOCR GPU 推理（Win/Linux + CUDA only;macOS Apple Silicon 忽略）|
 | `--dpi` | 300 | OCR 渲染 DPI（150-400）。**300 是技术图纸的甜点** |
 | `--workers` | 4 | 并行 workers 数（**multiprocessing 进程**，不是线程）|
 | `--list` | off | 只看匹配，不复制 |
-| `--lang` | `chi_sim+eng` | Tesseract 语言包 |
-| `--rotation` | auto | 强制 PDF 页面旋转（0/90/180/270，CW=正）|
+| `--lang` | `chi_sim+eng` | OCR 语言包。PaddleOCR 自动映射 `chi_sim`→`ch`、`eng`→`en` |
+| `--rotation` | auto | 强制 PDF 页面旋转（0/90/180/270，CW=正）。**PaddleOCR 忽略此参数**(自带角度分类器) |
 | `--preprocess` | `none` | 图像预处理：`none`（原图）/`gauss_otsu`（灰度+高斯+Otsu）/ `both`（两者并集）。见下方"已知 OCR 漏字"权衡 |
-| `--psm` | default | Tesseract PSM。**实测 psm=6 对电缆图纸是负优化（-30% recall），不要用** |
-| `--oem` | default | Tesseract OEM（默认 3 即可）|
+| `--psm` | default | Tesseract PSM。**实测 psm=6 对电缆图纸是负优化（-30% recall），不要用**。**PaddleOCR 忽略此参数** |
+| `--oem` | default | Tesseract OEM（默认 3 即可）。**PaddleOCR 忽略此参数** |
 | `--levenshtein` | off | **实验性**：启用第 4 级 Levenshtein 距离匹配。D0202 实测产生 ~58 误报，**默认关闭** |
 | `--resume` | off | 续跑：`--resume auto`（默认 state.json）或 `--resume <path>` |
 | `--no-cache` | off | 禁用 SQLite 缓存 |
 | `--no-state` | off | 不写 state.json（无法 resume）|
+
+### OCR 引擎选择建议
+
+- **先用默认 Tesseract 跑** — 不需要额外依赖
+- **Tesseract 漏报多时**:`--engine paddleocr`(预期 +10-15% recall on 电力图纸)
+- **两种都跑**:开 2 个输出目录,各跑一次,`merge_4stage_matches.py` 合并
+
+### 关于 OMP_THREAD_LIMIT（v2 不再需要）
 
 ### 关于 OMP_THREAD_LIMIT（v2 不再需要）
 
@@ -106,7 +165,7 @@ myenv/bin/python scripts/cable_match.py --csv ... --input ... --workers 6
 
 29 个目标 × 450 PDF 的批次大约 **1-1.5 小时**（取决于机器配置）。先 `--list` 跑一遍确认工具能识别出预期的匹配，再正式跑。
 
-## 五、输出结构（v2）
+## 七、输出结构（v2）
 
 每个命中的目标会在 `--output` 下创建一个以电缆号命名的子目录（用于存 PDF 副本）。**所有匹配记录**集中写入输出根目录的 `_matches.csv`：
 
@@ -163,7 +222,7 @@ D0202 baseline 实测（75 PDF）：
 
 跑的过程中可以 `tail -f <output>/_matches.csv` 实时看进度。
 
-## 六、断点续跑（v2 新增）
+## 八、断点续跑（v2 新增）
 
 脚本会在以下时机写 `state.json`：
 - 每 30 秒一次（`STATE_FLUSH_INTERVAL`）
@@ -185,7 +244,7 @@ myenv/bin/python scripts/cable_match.py \
 
 如果 `--resume auto` 找不到默认 state.json，会从头开始（不报错）。
 
-## 七、SQLite OCR 缓存（v2 新增）
+## 九、SQLite OCR 缓存（v2 新增）
 
 `.cable_match_cache.db` 存了每个 PDF 的 OCR 结果（按 content_hash 索引）。**重跑时直接查缓存**：
 - 第一次跑：OCR 所有 PDF → 写缓存 → 几小时
@@ -202,7 +261,7 @@ print('cached:', c.execute('SELECT COUNT(*) FROM ocr_cache').fetchone()[0])
 
 PDF 内容变化时，content_hash 会变，自动重新 OCR（旧的缓存项孤立但不浪费空间）。
 
-## 八、性能参考
+## 十、性能参考
 
 | 批次规模 | 首次跑（v2, 6 workers）| 重跑（命中缓存）|
 |---------|---------|---------|
@@ -219,7 +278,7 @@ v2 比 v1 的加速（同样硬件）：
 - 时间紧可以 `--dpi 200`（约快 30%，但小字可能漏）
 - 仅跑子目录：用 `--input` 指向子目录
 
-## 九、重要的坑
+## 十一、重要的坑
 
 ### 1. 路径要带空格、引号用 `shlex`
 
@@ -290,7 +349,7 @@ Tesseract 在密集端子图上有两类典型毛病：
 - 副作用：会把 `F` 这种细笔画字符也平均掉，所以"1F-151"被破坏
 - 缓存键已包含 preprocess 标签，切换 recipe 不会污染旧 cache
 
-## 九之2、4 阶段 union 并行（高召回完整跑法）
+## 十一之2、4 阶段 union 并行（高召回完整跑法）
 
 既然没有任何单一 recipe 在所有页都达到 100%，干脆把 4 种组合（2 lang × 2 preprocess）都跑一遍取并集。脚本一次性启动 4 个后台进程：
 
@@ -339,11 +398,12 @@ python scripts/merge_4stage_matches.py /path/to/wuhan/pdf
 
 ### 实际时间估算
 
-| 机器 | workers | 总时间(1882 PDF × 4 OCR) |
-|------|---------|--------------------------|
-| Mac M-series 8 核 (--workers 4 各 stage) | 16 | **45-50h**（二次图 拖慢）|
-| Win11 16 核 (--workers 4 各 stage) | 16 | **~1-1.5h** |
-| Win11 16 核 (--workersPerStage 4 4 stage 并行) | 16 | **~1h** |
+| 机器 | engine | workers | 总时间(1882 PDF × 4 OCR) |
+|------|--------|---------|--------------------------|
+| Mac M-series 8 核 | tesseract | 16 (--workers 4 各 stage) | **45-50h**（二次图 拖慢）|
+| Mac M-series 8 核 | paddleocr CPU | 16 | **更长** (PaddleOCR CPU 慢,~1-2x tesseract) |
+| Win11 16 核 | tesseract | 16 (--workersPerStage 4 4 stage 并行) | **~1-1.5h** |
+| Win11 16 核 + GPU | paddleocr | 16 | **~30-60min**(GPU 加速) |
 
 差异主要在二次图 目录（多页 A1 加长图，渲染 5-10s/页）。Win11 16 核足够一锅端。
 

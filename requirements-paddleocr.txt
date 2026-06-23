@@ -1,0 +1,17 @@
+# Optional OCR engine extras. Install with:
+#   pip install -r requirements-paddleocr.txt
+#
+# This installs PaddleOCR (PP-OCRv3) plus paddlepaddle. ~250 MB of pip deps
+# plus ~100 MB of model files downloaded on first use.
+#
+# Why optional: Tesseract is the default engine and works without these
+# heavy deps. Only install PaddleOCR if you need its better recall on
+# Chinese power-drawing PDFs (typically +10-15% recall over Tesseract).
+#
+# Use it via:  python scripts/cable_match.py --engine paddleocr ...
+#
+# macOS Apple Silicon note: paddlepaddle 3.0+ has no GPU wheel for M-series;
+# use `--use_gpu` flag only on Linux/Windows with CUDA.
+
+paddleocr==2.7.3
+paddlepaddle>=2.6.2
