@@ -149,7 +149,7 @@ myenv/bin/python scripts/cable_match.py \
 
 - **先用默认 Tesseract 跑** — 不需要额外依赖
 - **Tesseract 漏报多时**:`--engine paddleocr`(预期 +10-15% recall on 电力图纸)
-- **两种都跑**:开 2 个输出目录,各跑一次,`merge_5stage_matches.py` 合并
+- **两种都跑**:开 2 个输出目录,各跑一次,`merge_5stage_matches.py` 合并(同时合并 PDF 到 `_matched_pdfs/`)
 
 ### 关于 OMP_THREAD_LIMIT（v2 不再需要）
 
@@ -423,9 +423,52 @@ powershell -ExecutionPolicy Bypass -File scripts\wuhan_status.ps1
 
 6 个 stage 都完成后：
 ```bash
+# 默认: 合并 CSV + 复制各 stage 命中的 PDF 到 <wuhan/pdf>/_matched_pdfs/
 python scripts/merge_5stage_matches.py /path/to/wuhan/pdf
-# 写入 <wuhan/pdf>/_matches.csv (去重后的并集)
-# match_type 自动升级到 best tier: exact > normalized > confusion > levenshtein
+
+# 只要 CSV,不要 PDF 副本
+python scripts/merge_5stage_matches.py /path/to/wuhan/pdf --no-pdf-merge
+
+# 自定义 PDF 输出子目录
+python scripts/merge_5stage_matches.py /path/to/wuhan/pdf --pdf-output pdfs
+```
+
+合并做两件事:
+1. **CSV 去重并集** — 写 `<wuhan/pdf>/_matches.csv`,按 `(cable, content_hash)` 复合键合并 6 个 stage 的结果,`match_type` 自动升级到 best tier:`exact > normalized > confusion > levenshtein`
+2. **PDF 物理合并** — 把所有 stage 命中过的 PDF **按内容去重**后,复制到 `<wuhan/pdf>/_matched_pdfs/<电缆编号>/<pdf_stem>__<hash8>.pdf`:
+   - 相同 content_hash 的 PDF 跨多个 stage 只保留一份(`(cable, content_hash)` 一一对应)
+   - 同一电缆编号但**不同内容**的 PDF(不同 content_hash,例如同一图号的不同版本)会全部归到该电缆编号文件夹下,每个 PDF 用 `<pdf_stem>__<hash8>.pdf` 命名避免冲突
+   - **幂等**:重复运行 `merge_5stage_matches.py` 不会重复复制已存在的文件
+
+**输出示例**:
+```
+<wuhan>/pdf/
+├── _matches.csv                       # 合并后的去重并集(13-21+ 行)
+└── _matched_pdfs/                     # 默认输出子目录(可改)
+    ├── 3B-426/
+    │   └── test_d0202_04__495aced2.pdf
+    ├── 3B-463/
+    │   └── test_d0202_33__2e17e019.pdf  # 跨 6 stages 唯一文件(去重)
+    ├── 1F-151/
+    │   └── test_d0202_67__a2bb91e9.pdf
+    └── 3B-437/
+        └── test_d0202_xx__b8c4f1a9.pdf  # 同一电缆多版本时都保留
+```
+
+**典型输出 stats** (实测 Mac 3 PDF + 6 stages):
+```
+stage row counts:
+  chieng+tess          13 rows
+  chieng+tess+gauss    17 rows
+  chisim+tess          10 rows
+  chisim+tess_gauss    14 rows
+  chieng+paddle        12 rows
+  chisim+paddle        10 rows
+unique (cable, content_hash) pairs: 22
+unique cable IDs: 21 / 364 targets
+PDF merge output: <wuhan>/pdf/_matched_pdfs
+  copied:   22
+  skipped:  35  (3B-463 跨 stage 重复,etc.)
 ```
 
 ### 实际时间估算
