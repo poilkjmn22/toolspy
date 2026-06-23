@@ -149,7 +149,7 @@ myenv/bin/python scripts/cable_match.py \
 
 - **先用默认 Tesseract 跑** — 不需要额外依赖
 - **Tesseract 漏报多时**:`--engine paddleocr`(预期 +10-15% recall on 电力图纸)
-- **两种都跑**:开 2 个输出目录,各跑一次,`merge_4stage_matches.py` 合并
+- **两种都跑**:开 2 个输出目录,各跑一次,`merge_5stage_matches.py` 合并
 
 ### 关于 OMP_THREAD_LIMIT（v2 不再需要）
 
@@ -335,7 +335,7 @@ Tesseract 在密集端子图上有两类典型毛病：
 **应对策略**（按推荐顺序）：
 1. **先用默认 pipeline 跑完**——大多数页 5/6 已足够，剩下的少量漏字可以人工补
 2. **对高优先级电缆号，单独验证**——在 PDF viewer 里肉眼找，确认 OCR 是否漏
-3. **4 阶段 union 并行**（推荐，16 核机器约 1 小时搞定 1882 PDF）——见下节
+3. **6 阶段 union 并行**（推荐，Win11 16 核 + GPU ~1.5h 跑 1882 PDF）——见下节
 4. **局部重 OCR 优化**：
    - 把目标 CSV 拆成两批：
      - 批 1（中文相关电缆号）`--lang chi_sim --preprocess gauss_otsu`
@@ -349,31 +349,62 @@ Tesseract 在密集端子图上有两类典型毛病：
 - 副作用：会把 `F` 这种细笔画字符也平均掉，所以"1F-151"被破坏
 - 缓存键已包含 preprocess 标签，切换 recipe 不会污染旧 cache
 
-## 十一之2、4 阶段 union 并行（高召回完整跑法）
+## 十一之2、6 阶段 union 并行（高召回完整跑法 — 2 engines）
 
-既然没有任何单一 recipe 在所有页都达到 100%，干脆把 4 种组合（2 lang × 2 preprocess）都跑一遍取并集。脚本一次性启动 4 个后台进程：
+既然没有任何单一 OCR 配置在所有页都达到 100%，而且 **Tesseract 和 PaddleOCR 的失败模式互补**，干脆把 6 种组合（**2 OCR engines × 2 langs × 3 recipes**）都跑一遍取并集。脚本一次性启动 6 个后台进程。
 
-### 4 个 stage
+### 为什么 6 个 stage
 
-| Stage | 命令 | 找什么 |
-|-------|------|--------|
-| `chieng+none` | `chi_sim+eng + --preprocess none` | 1F-151 之类纯英文（基线，v1 同等质量）|
-| `chieng+gauss` | `chi_sim+eng + --preprocess gauss_otsu` | 字符级误读修复（部分页有增益）|
-| `chisim+none` | `chi_sim + --preprocess none` | 中文密集页更准 |
-| **`chisim+gauss`** | `chi_sim + --preprocess gauss_otsu` | **3B-463 这类必须这个组合** |
+| 失败类型 | Tesseract 表现 | PaddleOCR 表现 | 互补? |
+|----------|---------------|---------------|-------|
+| 拉丁字符+数字（1F-151） | ✅ 强 | ❌ 弱（ch 模型当噪声） | 是 |
+| 中文字符密集 | ⚠️ 一般 | ✅ 强 | 是 |
+| 小字密集（3B-4xx） | ⚠️ gauss 能修 | ✅ 识别更准 | 是 |
+| 端子排错位（3B-463） | ❌ Type A 漏字 | ⚠️ 试一下可能救 | 试一下 |
+| 扫描模糊 | ⚠️ LSTM 撑住 | ✅ 视觉模型更鲁棒 | 是 |
 
-每个 stage 写到自己独立的 `.stage_*` 子目录（cache + state + _matches.csv 都分开），互不干扰。OCR 完成后用 `merge_4stage_matches.py` 按 (cable, content_hash[:16]) 复合键去重并集。
+**实测 (3 PDF A/B, Mac CPU)**:
+- Tesseract chieng+none: **13** unique cables
+- PaddleOCR chieng+none: **11** unique cables
+- 2 路 union: **18** unique cables (+38-64% vs 单引擎)
+- 详细:Tesseract 独有 7 个（1F-151, GPS-1F, GPST-1F 等）;PaddleOCR 独有 5 个（3B-437, 3B-503, 3B-508, 5071-142, 3B-136）
+
+### 6 个 stage
+
+| # | Stage | 命令 | 找什么 |
+|---|-------|------|--------|
+| 1 | `chieng_tess` | `chi_sim+eng + tesseract + none` | 1F-151 / GPS-1F 类（基线，v1 同等质量）|
+| 2 | `chieng_tess_gauss` | `chi_sim+eng + tesseract + gauss_otsu` | 字符级误读修复（3B-414 类）|
+| 3 | `chisim_tess` | `chi_sim + tesseract + none` | 中文密集页 |
+| 4 | `chisim_tess_gauss` | `chi_sim + tesseract + gauss_otsu` | 3B-463 类尝试（Type A 边缘）|
+| 5 | **`chieng_paddle`** | `chi_sim+eng + paddleocr + none` | PaddleOCR 中文 + ASCII（PP-OCRv4 ch 模型）|
+| 6 | **`chisim_paddle`** | `chi_sim + paddleocr + none` | PaddleOCR 英文（PP-OCRv4 en 模型，与 stage 5 互补）|
+
+每个 stage 写到自己独立的 `.stage_*` 子目录（cache + state + _matches.csv 都分开），互不干扰。OCR 完成后用 `merge_5stage_matches.py` 按 (cable, content_hash[:16]) 复合键去重并集。
+
+**注意**:
+- Stage 5 和 6 的 PaddleOCR 用**不同的模型**:chieng_paddle 用 `ch`（中文+ASCII）,chisim_paddle 用 `en`（英文 only,可能抓到 1F/GPS 类字符,因为 ch 模型会当噪声丢)
+- Tesseract 失败页面（Type A: OCR 完全漏字）PaddleOCR 也救不了,但**字符错**（3B-463 → JB-463）和**布局漏**的场景 PaddleOCR 通常更准
+- 任何 stage 失败不影响其他 stage（独立目录 + 独立 cache）
 
 ### 一键启动
 
 **Mac / Linux / WSL**（bash）：
 ```bash
-bash scripts/run_4stage_union.sh 4    # 4 workers × 4 stages = 16 workers 总
+# 默认: 6 stages (4 Tesseract + 2 PaddleOCR)
+bash scripts/run_union.sh 4    # 4 workers × 6 stages = 24 workers 总
+
+# 只跑 4 个 Tesseract stage（不装 PaddleOCR 时）
+ENGINE=tesseract bash scripts/run_union.sh 4
 ```
 
 **Windows 原生**（PowerShell）：
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\run_4stage_union.ps1 -WorkersPerStage 4
+# 默认: 6 stages
+powershell -ExecutionPolicy Bypass -File scripts\run_union.ps1 -WorkersPerStage 4
+
+# 只跑 Tesseract 4 stages
+powershell -ExecutionPolicy Bypass -File scripts\run_union.ps1 -WorkersPerStage 4 -Engine tesseract
 ```
 
 ### 监控
@@ -390,22 +421,34 @@ powershell -ExecutionPolicy Bypass -File scripts\wuhan_status.ps1
 
 ### 合并结果
 
-4 个 stage 都完成后：
+6 个 stage 都完成后：
 ```bash
-python scripts/merge_4stage_matches.py /path/to/wuhan/pdf
+python scripts/merge_5stage_matches.py /path/to/wuhan/pdf
 # 写入 <wuhan/pdf>/_matches.csv (去重后的并集)
+# match_type 自动升级到 best tier: exact > normalized > confusion > levenshtein
 ```
 
 ### 实际时间估算
 
-| 机器 | engine | workers | 总时间(1882 PDF × 4 OCR) |
-|------|--------|---------|--------------------------|
-| Mac M-series 8 核 | tesseract | 16 (--workers 4 各 stage) | **45-50h**（二次图 拖慢）|
-| Mac M-series 8 核 | paddleocr CPU | 16 | **更长** (PaddleOCR CPU 慢,~1-2x tesseract) |
-| Win11 16 核 | tesseract | 16 (--workersPerStage 4 4 stage 并行) | **~1-1.5h** |
-| Win11 16 核 + GPU | paddleocr | 16 | **~30-60min**(GPU 加速) |
+| 机器 | engine 组合 | workers | 总时间(1882 PDF) |
+|------|------------|---------|------------------|
+| Mac M-series 8 核 | tesseract-only (4 stages) | 16 | **45-50h**（二次图 拖慢）|
+| Mac M-series 8 核 | tesseract + paddleocr CPU | 24 | **50-60h** (PaddleOCR CPU 慢) |
+| **Win11 16 核 + GPU** | **tesseract + paddleocr** (6 stages) | **24** | **~1.5-2h** ✨ |
+| Win11 16 核 | tesseract-only (4 stages) | 16 | **~1-1.5h** |
 
-差异主要在二次图 目录（多页 A1 加长图，渲染 5-10s/页）。Win11 16 核足够一锅端。
+**Win11 GPU 是关键**:PaddleOCR 在 GPU 上 ~5-10ms/page (CPU 上 ~50-100ms/page),5-10x 加速。所以 6 stages 整体只比 4 stages 多 30-50min,但召回率 +10-20pp(从 ~75% 估到 85-92%)。
+
+**内存估算 (Win11, 6 stages × 4 workers = 24 进程)**:
+- Tesseract 16 进程 × ~50MB = 800MB
+- PaddleOCR 8 进程 × ~250MB = 2GB
+- 总计 ~3GB,16GB+ 内存充裕
+
+**磁盘**:
+- 6 stage cache × ~700MB = ~4GB(分散在 `.stage_*/.cable_match_cache.db`)
+- 首次跑后,任何参数微调都秒过(命中 cache)
+
+差异主要在二次图 目录(多页 A1 加长图,渲染 5-10s/页)。Win11 16 核 + GPU 足够一锅端。
 
 ## 九之3、Windows 特定配置
 
@@ -439,7 +482,7 @@ myenv\Scripts\python -c "import pytesseract; print(pytesseract.get_tesseract_ver
 **Windows 路径注意**：
 - 路径有中文或空格：用双引号 `python scripts\cable_match.py --input "C:\Users\...\wuhan\pdf"`
 - 临时文件位置：Tesseract 用 `%TEMP%\tess_*`，长跑后定期清 `Remove-Item "$env:TEMP\tess_*"`
-- 大 PDF 内存：137MB 的 D0223-26 渲染 80MB/页 × 4 workers = 320MB 峰值 × 4 stage = 1.3GB
+- 大 PDF 内存：137MB 的 D0223-26 渲染 80MB/页 × 4 workers = 320MB 峰值 × 6 stage = 1.9GB(Tesseract)+ 8 workers × 250MB PaddleOCR = 2GB,总 ~4GB
 
 ### 6. OCR 失败是正常的
 

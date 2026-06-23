@@ -122,16 +122,33 @@ class TesseractEngine(OCREngine):
 def _map_tesseract_lang_to_paddle(lang: str) -> str:
     """Map Tesseract-style lang string to PaddleOCR's single lang code.
 
-    PaddleOCR PP-OCRv3/v4 supports one language per model. For Chinese
-    electrical drawings, `ch` (Simplified Chinese) handles ASCII digits and
-    most latin characters well; English-only text should use `en`.
+    PaddleOCR PP-OCRv3/v4 supports one language per model. The mapping is:
+      - `chi_sim+eng` (Tesseract chieng, mixed) → `ch` model: handles Chinese
+        characters + ASCII digits/letters well, which is what Chinese
+        power-drawing PDFs need.
+      - `chi_sim` (Tesseract chisim, Chinese only) → `en` model: deliberately
+        DIFFERENT from chieng. Used in the 6-stage union to give PaddleOCR
+        a second pass with an English-only OCR. May pick up Latin-only
+        cable IDs (1F-151, 2F-151, GPS-1F) that the `ch` model drops as
+        "noise". Will lose all Chinese text, so only useful as a complement,
+        not a replacement.
+      - `en` / `eng` → `en` model
+      - anything else → `ch` (safe default)
+
+    To opt OUT of this and force `ch` for both langs (e.g. when the en
+    model is known to hurt recall on a particular PDF set), pass
+    `engine_kwargs={'force_lang': 'ch'}` to `PaddleOCREngine`.
     """
     s = lang.lower()
-    if 'chi_sim' in s or 'chinese' in s or 'ch' in s.split('+'):
+    if 'chi_sim' in s and 'eng' in s:
         return 'ch'
+    if 'chi_sim' in s:
+        # chisim Tesseract = Chinese only; map PaddleOCR to en model
+        # so chisim_paddle gives a different text than chieng_paddle
+        return 'en'
     if 'en' in s.split('+') or 'eng' in s.split('+'):
         return 'en'
-    return 'ch'
+    return 'ch'  # safe default
 
 
 class PaddleOCREngine(OCREngine):

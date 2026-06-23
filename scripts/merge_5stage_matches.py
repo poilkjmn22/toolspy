@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""merge_4stage_matches.py — merge _matches.csv from all 4 union stages.
+"""merge_5stage_matches.py — merge _matches.csv from all 6 union stages.
 
 Stages (each writes to its own output dir under WUHAN_DIR):
-    .stage_chieng_none/_matches.csv
-    .stage_chieng_gauss/_matches.csv
-    .stage_chisim_none/_matches.csv
-    .stage_chisim_gauss/_matches.csv
+    .stage_chieng_tess/_matches.csv           (Tesseract chi_sim+eng, none)
+    .stage_chieng_tess_gauss/_matches.csv     (Tesseract chi_sim+eng, gauss_otsu)
+    .stage_chisim_tess/_matches.csv           (Tesseract chi_sim, none)
+    .stage_chisim_tess_gauss/_matches.csv     (Tesseract chi_sim, gauss_otsu)
+    .stage_chieng_paddle/_matches.csv         (PaddleOCR ch model, none)
+    .stage_chisim_paddle/_matches.csv         (PaddleOCR en model, none)
 
 Union by (cable, content_hash[:16]) key. When the same (cable, hash) appears
 in multiple stages, the match_type is upgraded to the best tier seen:
@@ -15,9 +17,9 @@ The final _matches.csv is written to WUHAN_DIR/ with header:
     电缆编号, PDF文件名, 源相对路径, 匹配时间, 内容hash前16, 匹配方式
 
 Usage:
-    python scripts/merge_4stage_matches.py <WUHAN_DIR>
+    python scripts/merge_5stage_matches.py <WUHAN_DIR>
     # e.g.
-    python scripts/merge_4stage_matches.py /Users/.../wuhan/pdf
+    python scripts/merge_5stage_matches.py /Users/.../wuhan/pdf
 """
 import csv
 import sys
@@ -25,12 +27,21 @@ from pathlib import Path
 
 FIELDNAMES = ['电缆编号', 'PDF文件名', '源相对路径', '匹配时间', '内容hash前16', '匹配方式']
 STAGE_DIRS = [
-    '.stage_chieng_none',
-    '.stage_chieng_gauss',
-    '.stage_chisim_none',
-    '.stage_chisim_gauss',
+    '.stage_chieng_tess',
+    '.stage_chieng_tess_gauss',
+    '.stage_chisim_tess',
+    '.stage_chisim_tess_gauss',
+    '.stage_chieng_paddle',
+    '.stage_chisim_paddle',
 ]
-STAGE_LABELS = ['chieng+none', 'chieng+gauss', 'chisim+none', 'chisim+gauss']
+STAGE_LABELS = [
+    'chieng+tess',       # chi_sim+eng, no preprocess
+    'chieng+tess+gauss',  # chi_sim+eng, gauss_otsu
+    'chisim+tess',       # chi_sim, no preprocess
+    'chisim+tess+gauss',  # chi_sim, gauss_otsu
+    'chieng+paddle',     # PaddleOCR ch model
+    'chisim+paddle',     # PaddleOCR en model
+]
 
 # Tier ranking: lower is better. Used to keep the best match_type across stages.
 TIER_RANK = {'exact': 0, 'normalized': 1, 'confusion': 2, 'levenshtein': 3, '': 4}
@@ -79,7 +90,7 @@ def main():
 
     print(f'stage row counts:')
     for label, n in stats.items():
-        print(f'  {label:<14} {n} rows')
+        print(f'  {label:<20} {n} rows')
     print(f'unique (cable, content_hash) pairs: {len(seen)}')
 
     rows_merged = [row for _, row in seen.values()]
