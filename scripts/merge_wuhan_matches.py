@@ -6,6 +6,9 @@ independent. This script merges them by (cable, content_hash[:16]) key, with
 the chieng result taking precedence on duplicates (both runs likely found the
 same PDFs for the same cable IDs).
 
+When the same (cable, hash) appears in both runs, the match_type is upgraded
+to the better tier (exact > normalized > confusion > levenshtein).
+
 Usage:
     python scripts/merge_wuhan_matches.py
 """
@@ -16,6 +19,9 @@ from pathlib import Path
 CHIENG_CSV = Path('/Users/fangqi-apple/Documents/work/nengzhong/wuhan/pdf/_matches.csv')
 CHISIM_CSV = Path('/Users/fangqi-apple/Documents/work/nengzhong/wuhan_chisim/_matches.csv')
 OUTPUT_CSV = Path('/Users/fangqi-apple/Documents/work/nengzhong/wuhan/pdf/_matches.csv')
+
+# Tier ranking: lower is better.
+TIER_RANK = {'exact': 0, 'normalized': 1, 'confusion': 2, 'levenshtein': 3, '': 4}
 
 
 def load_csv(path):
@@ -39,13 +45,20 @@ def main():
     print(f'chieng rows: {len(chieng)}')
     print(f'chisim rows: {len(chisim)}')
 
-    # Union by (cable, content_hash[:16])
+    # Union by (cable, content_hash[:16]) with best-tier upgrade
     seen = {}
     for src_label, rows in [('chieng', chieng), ('chisim', chisim)]:
         for cable, h, row in rows:
             key = (cable, h)
             if key not in seen:
                 seen[key] = (src_label, row)
+            else:
+                # Keep the better match_type (exact > normalized > confusion > levenshtein)
+                prev_label, prev_row = seen[key]
+                prev_mt = (prev_row.get('匹配方式') or '').strip()
+                new_mt = (row.get('匹配方式') or '').strip()
+                if TIER_RANK.get(new_mt, 99) < TIER_RANK.get(prev_mt, 99):
+                    seen[key] = (src_label, row)
 
     print(f'unique (cable, content_hash) pairs: {len(seen)}')
     by_source = {}
@@ -59,8 +72,14 @@ def main():
     print(f'unique cable IDs: {len(unique_cables)}')
     print(f'unique PDFs: {len(unique_hashes)}')
 
+    by_match_type = {}
+    for _, row in seen.values():
+        mt = (row.get('匹配方式') or '').strip() or '(empty)'
+        by_match_type[mt] = by_match_type.get(mt, 0) + 1
+    print(f'rows by 匹配方式: {by_match_type}')
+
     # Write merged
-    fieldnames = ['电缆编号', 'PDF文件名', '源相对路径', '匹配时间', '内容hash前16']
+    fieldnames = ['电缆编号', 'PDF文件名', '源相对路径', '匹配时间', '内容hash前16', '匹配方式']
     OUTPUT_CSV.parent.mkdir(parents=True, exist_ok=True)
     with open(OUTPUT_CSV, 'w', encoding='utf-8', newline='') as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)

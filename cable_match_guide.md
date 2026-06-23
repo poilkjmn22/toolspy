@@ -86,7 +86,10 @@ myenv/bin/python scripts/cable_match.py \
 | `--list` | off | 只看匹配，不复制 |
 | `--lang` | `chi_sim+eng` | Tesseract 语言包 |
 | `--rotation` | auto | 强制 PDF 页面旋转（0/90/180/270，CW=正）|
-| `--preprocess` | `none` | 图像预处理：`none`（原图）/`gauss_otsu`（灰度+高斯+Otsu）。见下方"已知 OCR 漏字"权衡 |
+| `--preprocess` | `none` | 图像预处理：`none`（原图）/`gauss_otsu`（灰度+高斯+Otsu）/ `both`（两者并集）。见下方"已知 OCR 漏字"权衡 |
+| `--psm` | default | Tesseract PSM。**实测 psm=6 对电缆图纸是负优化（-30% recall），不要用** |
+| `--oem` | default | Tesseract OEM（默认 3 即可）|
+| `--levenshtein` | off | **实验性**：启用第 4 级 Levenshtein 距离匹配。D0202 实测产生 ~58 误报，**默认关闭** |
 | `--resume` | off | 续跑：`--resume auto`（默认 state.json）或 `--resume <path>` |
 | `--no-cache` | off | 禁用 SQLite 缓存 |
 | `--no-state` | off | 不写 state.json（无法 resume）|
@@ -125,12 +128,38 @@ myenv/bin/python scripts/cable_match.py --csv ... --input ... --workers 6
 `_matches.csv` 格式：
 
 ```csv
-电缆编号,PDF文件名,源相对路径,匹配时间,内容hash前16
-T2-R139,10-W978-B768ⅡZ-D0201-11.pdf,电气二次1/D0201_电气二次总的部分/PDF/10-W978-B768ⅡZ-D0201-11.pdf,2026-06-18 19:30:15,26e06b0e443a9213
-DK1-103,10-W978-B768ⅡZ-D0203-42.pdf,电气二次1/D0203_1000kV第1串二次线/PDF/10-W978-B768ⅡZ-D0203-42.pdf,2026-06-18 19:31:02,a8b3c9d4e5f6a7b8
+电缆编号,PDF文件名,源相对路径,匹配时间,内容hash前16,匹配方式
+T2-R139,10-W978-B768ⅡZ-D0201-11.pdf,电气二次1/D0201_电气二次总的部分/PDF/10-W978-B768ⅡZ-D0201-11.pdf,2026-06-18 19:30:15,26e06b0e443a9213,exact
+DK1-103,10-W978-B768ⅡZ-D0203-42.pdf,电气二次1/D0203_1000kV第1串二次线/PDF/10-W978-B768ⅡZ-D0203-42.pdf,2026-06-18 19:31:02,a8b3c9d4e5f6a7b8,confusion
 ```
 
 每行包含**内容 hash**（前 16 字符），用于在重跑时去重。同一个 (电缆号, content_hash) 组合只写一次。
+
+`匹配方式` 列说明（v3 新增，4 级递进式召回）：
+
+| 匹配方式 | 含义 | 例子 |
+|----------|------|------|
+| `exact` | 目标字符串在 OCR 文本中原样出现 | `3B-463` 文本里有 `3B-463` |
+| `normalized` | 归一化后匹配（大写、统一分隔符） | OCR 文本 `3B_463` / `3B 463` / `3B.463` / `3B—463` 都能匹配 `3B-463` |
+| `confusion` | OCR 混淆表 + 1 字符替换 | OCR 文本 `38-463` / `JB-463` 匹配 `3B-463`（3↔8、3↔J、B↔8 混淆） |
+| `levenshtein` | 编辑距离 ≤ 1（**实验性，默认关闭**） | OCR 文本 `3B-46S` 匹配 `3B-463` |
+
+**混淆表**（`CONFUSION` dict in `cable_match.py`）:
+```python
+{
+    "3": ["8", "J"], "8": ["3", "B"],
+    "0": ["O", "Q"], "O": ["0"],
+    "1": ["I", "L", "7"], "I": ["1"],
+    "5": ["S"], "S": ["5"],
+    "G": ["6"], "B": ["8"],
+    "-": ["_", ".", " ", ""],
+}
+```
+
+D0202 baseline 实测（75 PDF）：
+- 老 exact-only：140 unique cables
+- 加 normalized + confusion：**167 unique cables（+27，+19% recall）**
+- 加 Levenshtein（实验）：225 unique cables，**但 58 个是误报**（如 `3B-B41` 在 `3B-B4111` 端子排 ref 里匹配到 `3B-241`）→ 默认关闭
 
 跑的过程中可以 `tail -f <output>/_matches.csv` 实时看进度。
 

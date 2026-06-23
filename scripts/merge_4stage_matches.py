@@ -7,10 +7,12 @@ Stages (each writes to its own output dir under WUHAN_DIR):
     .stage_chisim_none/_matches.csv
     .stage_chisim_gauss/_matches.csv
 
-Union by (cable, content_hash[:16]) key. The first stage that reports a match
-wins; the rest are skipped. The final _matches.csv is written to WUHAN_DIR/
-with header:
-    电缆编号, PDF文件名, 源相对路径, 匹配时间, 内容hash前16
+Union by (cable, content_hash[:16]) key. When the same (cable, hash) appears
+in multiple stages, the match_type is upgraded to the best tier seen:
+    exact > normalized > confusion > levenshtein
+
+The final _matches.csv is written to WUHAN_DIR/ with header:
+    电缆编号, PDF文件名, 源相对路径, 匹配时间, 内容hash前16, 匹配方式
 
 Usage:
     python scripts/merge_4stage_matches.py <WUHAN_DIR>
@@ -21,7 +23,7 @@ import csv
 import sys
 from pathlib import Path
 
-FIELDNAMES = ['电缆编号', 'PDF文件名', '源相对路径', '匹配时间', '内容hash前16']
+FIELDNAMES = ['电缆编号', 'PDF文件名', '源相对路径', '匹配时间', '内容hash前16', '匹配方式']
 STAGE_DIRS = [
     '.stage_chieng_none',
     '.stage_chieng_gauss',
@@ -29,6 +31,9 @@ STAGE_DIRS = [
     '.stage_chisim_gauss',
 ]
 STAGE_LABELS = ['chieng+none', 'chieng+gauss', 'chisim+none', 'chisim+gauss']
+
+# Tier ranking: lower is better. Used to keep the best match_type across stages.
+TIER_RANK = {'exact': 0, 'normalized': 1, 'confusion': 2, 'levenshtein': 3, '': 4}
 
 
 def load_csv(path):
@@ -63,6 +68,14 @@ def main():
             key = (cable, h)
             if key not in seen:
                 seen[key] = (label, row)
+            else:
+                # Same (cable, hash) found in multiple stages — keep the better
+                # match_type (exact > normalized > confusion > levenshtein).
+                prev_label, prev_row = seen[key]
+                prev_mt = (prev_row.get('匹配方式') or '').strip()
+                new_mt = (row.get('匹配方式') or '').strip()
+                if TIER_RANK.get(new_mt, 99) < TIER_RANK.get(prev_mt, 99):
+                    seen[key] = (label, row)
 
     print(f'stage row counts:')
     for label, n in stats.items():
@@ -79,6 +92,12 @@ def main():
     for src_label, _ in seen.values():
         by_source[src_label] = by_source.get(src_label, 0) + 1
     print(f'unique rows by winning stage: {by_source}')
+
+    by_match_type = {}
+    for r in rows_merged:
+        mt = (r.get('匹配方式') or '').strip() or '(empty)'
+        by_match_type[mt] = by_match_type.get(mt, 0) + 1
+    print(f'rows by 匹配方式: {by_match_type}')
 
     # Write merged
     out_csv = wuhan_dir / '_matches.csv'
