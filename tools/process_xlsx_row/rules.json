@@ -1,0 +1,18 @@
+{
+  "r_yellow1": {"column": "G,J", "match": {
+    "type": "regex",
+    "value": "3号主变"
+  }},
+  "r_yellow2": {"column": "G,J", "match": {
+    "type": "regex",
+    "value": "(胜家1线|张北1线)"
+  }},
+  "r_green1": {"column": "G,J", "match": {
+    "type": "regex",
+    "value": "(主变测控|公用测控|保护|录波|转接|110kV|T061|T062)"
+  }},
+  "r_green2": {"column": "G,J", "match": {
+    "type": "regex",
+    "value": "(测控屏|保护屏)"
+  }}
+}
