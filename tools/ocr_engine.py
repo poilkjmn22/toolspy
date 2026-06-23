@@ -179,21 +179,19 @@ class PaddleOCREngine(OCREngine):
         os.environ.setdefault('GLOG_v', '3')
         try:
             from paddleocr import PaddleOCR
+            # PaddleOCR 3.x API: only `lang` + `use_angle_cls` accepted.
+            # 2.x also accepted `use_gpu` / `show_log` (no longer supported).
             self._ocr = PaddleOCR(
                 use_angle_cls=self.use_angle_cls,
-                use_gpu=self.use_gpu,
                 lang=self.paddle_lang,
-                show_log=False,
             )
         except Exception as e:
-            # PaddleOCR init can fail with cryptic errors on first run
-            # (model download, MKL issues, etc.). Surface a clean message.
             raise EngineNotAvailable(
                 f"PaddleOCR failed to initialize: {e}\n"
                 "Common causes:\n"
                 "  - First run downloads models (~100MB). Check network.\n"
-                "  - paddlepaddle wheel mismatch. Try `pip install paddlepaddle==2.6.1`.\n"
-                "  - On macOS Apple Silicon, use `pip install paddlepaddle==2.6.1` (no GPU)."
+                "  - paddlepaddle wheel mismatch. Try `pip install paddlepaddle==2.6.2`.\n"
+                "  - On macOS Apple Silicon, use CPU only (PaddleOCR auto-detects)."
             )
 
     def shutdown(self) -> None:
