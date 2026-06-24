@@ -151,6 +151,73 @@ def _map_tesseract_lang_to_paddle(lang: str) -> str:
     return 'ch'  # safe default
 
 
+def _parse_paddleocr_major_version(version_str: str) -> str:
+    """Return 'v2' or 'v3' based on paddleocr package version.
+
+    PaddleOCR 2.x (last release 2.10.0, pinned at 2.7.3) uses
+    `PaddleOCR(use_gpu=, show_log=)` and `result[0][1][0]` text extraction.
+    PaddleOCR 3.x (first release 3.0.0, current 3.7.0) uses PaddleX
+    pipelines; `PaddleOCR(use_textline_orientation=, ...)` and
+    `result['rec_texts']` text extraction.
+    """
+    try:
+        major = int(version_str.split('.')[0])
+    except (ValueError, IndexError):
+        return 'unknown'
+    if major >= 3:
+        return 'v3'
+    if major == 2:
+        return 'v2'
+    return 'unknown'
+
+
+def _extract_text_v2(result) -> str:
+    """Extract text from PaddleOCR 2.x result.
+
+    Result shape: list with one entry per page; entry is list of line results;
+    each line result is `[[box_points], (text, conf)]`.
+    """
+    lines = []
+    if not result:
+        return ""
+    page_result = result[0] if isinstance(result[0], list) else result
+    if not page_result:
+        return ""
+    for line_result in page_result:
+        if not line_result or len(line_result) < 2:
+            continue
+        text_conf = line_result[1]
+        if not text_conf or not isinstance(text_conf, (tuple, list)):
+            continue
+        text = text_conf[0]
+        if text:
+            lines.append(text)
+    return '\n'.join(lines)
+
+
+def _extract_text_v3(result) -> str:
+    """Extract text from PaddleOCR 3.x result.
+
+    Result shape: list of OCRResult objects (one per input page); each has
+    `result['rec_texts']` returning a list of recognized line strings.
+    """
+    lines = []
+    if not result:
+        return ""
+    for page_result in result:
+        # page_result may be an OCRResult dataclass or dict-like
+        rec_texts = None
+        try:
+            # dict access works on PaddleX BaseCVResult
+            rec_texts = page_result['rec_texts']
+        except (KeyError, TypeError):
+            # Fallback: attribute access
+            rec_texts = getattr(page_result, 'rec_texts', None)
+        if rec_texts:
+            lines.extend(t for t in rec_texts if t)
+    return '\n'.join(lines)
+
+
 class PaddleOCREngine(OCREngine):
     """PaddleOCR (PP-OCRv3 default). Optional engine — install with
     `pip install -r requirements-paddleocr.txt`.
@@ -180,23 +247,31 @@ class PaddleOCREngine(OCREngine):
         self.use_angle_cls = use_angle_cls
         self.use_gpu = use_gpu
         self._ocr = None
+        # Detected at init() time: 'v2' (paddleocr 2.x with PaddleOCR(use_gpu=...))
+        # or 'v3' (paddleocr 3.x via PaddleX — no use_gpu/show_log kwargs).
+        self._paddleocr_version = None
 
     def init(self) -> None:
         if self._ocr is not None:
             return
         try:
-            from paddleocr import PaddleOCR  # noqa: F401
+            import paddleocr as _paddleocr_pkg
         except ImportError:
             raise EngineNotAvailable(
                 "PaddleOCR is not installed. To enable it, run:\n"
                 "  pip install -r requirements-paddleocr.txt\n"
                 "then `python -c \"from paddleocr import PaddleOCR\"` to download models on first use."
             )
+        # Detect major version from the package's __version__ string.
+        # 2.x → 2.7.3 (PP-OCRv3/v4, accepts use_gpu/show_log).
+        # 3.x → 3.0+   (PP-OCRv5/v6, PaddleX-based, NO use_gpu/show_log;
+        #                GPU via paddlepaddle-gpu + PaddleX device autodetect).
+        self._paddleocr_version = _parse_paddleocr_major_version(_paddleocr_pkg.__version__)
         # If user explicitly asked for GPU, verify paddlepaddle was built
-        # with CUDA before constructing PaddleOCR. PaddleOCR 2.x silently
-        # falls back to CPU if use_gpu=True but paddlepaddle has no CUDA,
-        # which would mask misconfiguration. HARD-FAIL here so the user
-        # sees a clear error instead of an 8h CPU job.
+        # with CUDA before constructing PaddleOCR. Both 2.x and 3.x would
+        # otherwise silently fall back to CPU (2.x) or autodetect-to-CPU
+        # (3.x). HARD-FAIL here so the user sees a clear error instead of
+        # an 8h CPU job.
         if self.use_gpu:
             try:
                 import paddle
@@ -221,20 +296,40 @@ class PaddleOCREngine(OCREngine):
         os.environ.setdefault('GLOG_v', '3')
         try:
             from paddleocr import PaddleOCR
-            # Pinned to paddleocr==2.7.3 which still accepts `use_gpu` /
-            # `show_log`. (3.x dropped those kwargs.)
-            self._ocr = PaddleOCR(
-                use_angle_cls=self.use_angle_cls,
-                lang=self.paddle_lang,
-                use_gpu=self.use_gpu,
-                show_log=False,
-            )
+            if self._paddleocr_version == 'v2':
+                # 2.x path: PaddleOCR(use_angle_cls, lang, use_gpu, show_log).
+                self._ocr = PaddleOCR(
+                    use_angle_cls=self.use_angle_cls,
+                    lang=self.paddle_lang,
+                    use_gpu=self.use_gpu,
+                    show_log=False,
+                )
+            elif self._paddleocr_version == 'v3':
+                # 3.x path: PaddleX-based. NO use_gpu / show_log kwargs
+                # (3.x removed them; GPU comes from paddlepaddle-gpu +
+                # PaddleX device autodetect). `use_angle_cls` is replaced
+                # by `use_textline_orientation`. doc-orientation/unwarping
+                # are off by default — we don't need them for cable labels.
+                self._ocr = PaddleOCR(
+                    lang=self.paddle_lang,
+                    use_textline_orientation=self.use_angle_cls,
+                    use_doc_orientation_classify=False,
+                    use_doc_unwarping=False,
+                )
+            else:
+                raise EngineNotAvailable(
+                    f"Unrecognized paddleocr version: {_paddleocr_pkg.__version__!r}. "
+                    "Expected 2.x or 3.x. Please reinstall requirements-paddleocr.txt."
+                )
         except Exception as e:
             raise EngineNotAvailable(
-                f"PaddleOCR failed to initialize: {e}\n"
+                f"PaddleOCR failed to initialize ({self._paddleocr_version}, "
+                f"paddleocr=={_paddleocr_pkg.__version__}): {e}\n"
                 "Common causes:\n"
-                "  - First run downloads models (~100MB). Check network.\n"
-                "  - paddlepaddle wheel mismatch. Try `pip install paddlepaddle==2.6.2`.\n"
+                "  - First run downloads models (~100MB to ~/.paddlex/). Check network.\n"
+                "  - paddlepaddle wheel mismatch.\n"
+                "      2.x: pip install paddlepaddle==2.6.2\n"
+                "      3.x: pip install paddlepaddle==3.0+\n"
                 "  - On macOS Apple Silicon, use CPU only (PaddleOCR auto-detects)."
             )
 
@@ -246,34 +341,20 @@ class PaddleOCREngine(OCREngine):
     def ocr(self, pil_image) -> str:
         if self._ocr is None:
             self.init()
-        # PaddleOCR takes a numpy array (BGR). PIL is RGB; paddleocr handles
-        # both but the convention is to convert explicitly.
-        import numpy as np
-        img_array = np.array(pil_image)
+        # PaddleOCR takes a numpy array (RGB) on 2.x, or a path/PIL/numpy
+        # on 3.x. Passing the PIL Image directly works on both.
         try:
-            result = self._ocr.ocr(img_array, cls=self.use_angle_cls)
+            if self._paddleocr_version == 'v2':
+                import numpy as np
+                img_array = np.array(pil_image)
+                result = self._ocr.ocr(img_array, cls=self.use_angle_cls)
+                return _extract_text_v2(result)
+            else:  # v3
+                result = self._ocr.predict(pil_image)
+                return _extract_text_v3(result)
         except Exception as e:
-            print(f'PaddleOCR ocr failed: {e}', file=sys.stderr)
+            print(f'PaddleOCR ocr failed ({self._paddleocr_version}): {e}', file=sys.stderr)
             return ""
-        # Result format (v3): list with one entry per page; entry is a list
-        # of line results; each line result is [[box_points], (text, conf)].
-        # We extract just the text, joined by newlines.
-        lines = []
-        if not result:
-            return ""
-        page_result = result[0] if isinstance(result[0], list) else result
-        if not page_result:
-            return ""
-        for line_result in page_result:
-            if not line_result or len(line_result) < 2:
-                continue
-            text_conf = line_result[1]
-            if not text_conf or not isinstance(text_conf, (tuple, list)):
-                continue
-            text = text_conf[0]
-            if text:
-                lines.append(text)
-        return '\n'.join(lines)
 
     def detect_rotation(self, pil_image) -> Tuple[float, int]:
         # PaddleOCR with use_angle_cls=True handles rotation internally

@@ -196,10 +196,41 @@ def _render_and_ocr(pdf_path, dpi, lang, rotation, preprocess,
     )]
     pdf = pdfium.PdfDocument(str(pdf_path))
     try:
+        # Some large scanned D0202 二次接线图 PDFs blow up Pillow at 300 DPI
+        # (the multiprocessing pool surfaces this as `错误: (4294967295, '')` =
+        #  unsigned -1 = Win32 ERROR_INVALID_PARAMETER after pickle roundtrip).
+        # If the first page render fails with MemoryError or PIL.DecompressionBomb,
+        # retry at 200 DPI; if that also fails, retry at 150.
         scale = dpi / 72.0
+        first_render_attempt = True
         for i, page in enumerate(pdf, 1):
             parts.append(f"\n=== Page {i} ===\n\n")
-            pil = page.render(scale=scale).to_pil()
+            pil = None
+            for retry_dpi in (dpi, int(dpi * 0.66), int(dpi * 0.5)):
+                try:
+                    pil = page.render(scale=retry_dpi / 72.0).to_pil()
+                    if retry_dpi != dpi:
+                        sys.stderr.write(
+                            f'WARNING: {pdf_path.name} page {i} rendered at '
+                            f'{retry_dpi} DPI (OOM at {dpi}); OCR will be lower quality.\n'
+                        )
+                    break
+                except (MemoryError, Image.DecompressionBombError, ValueError) as e:
+                    sys.stderr.write(
+                        f'WARNING: {pdf_path.name} page {i} render failed at '
+                        f'{retry_dpi} DPI: {type(e).__name__}: {e}; '
+                        f'retrying lower DPI.\n'
+                    )
+                    pil = None
+                    continue
+            if pil is None:
+                # All retries failed — record reason and skip this page.
+                sys.stderr.write(
+                    f'ERROR: {pdf_path.name} page {i}: cannot render even at '
+                    f'{int(dpi*0.5)} DPI; skipping page.\n'
+                )
+                parts.append(f"# Page {i} skipped: render failure\n")
+                continue
             try:
                 if rotation is not None:
                     if rotation != 0:
@@ -467,6 +498,12 @@ def init_db(db_path: Path):
             conn.execute('ALTER TABLE ocr_cache ADD COLUMN ocr_oem INTEGER')
         if 'ocr_engine' not in cols:
             conn.execute("ALTER TABLE ocr_cache ADD COLUMN ocr_engine TEXT DEFAULT 'tesseract'")
+        # `actual_engine` records which engine really ran. Normally == ocr_engine,
+        # but if init() falls back to Tesseract (e.g. paddleocr 3.x on a box with
+        # paddlepaddle 2.6.2), this column will be 'tesseract_fallback' and the
+        # caller knows the OCR text is actually from Tesseract.
+        if 'actual_engine' not in cols:
+            conn.execute("ALTER TABLE ocr_cache ADD COLUMN actual_engine TEXT")
         # WAL mode for concurrent reads/writes
         conn.execute('PRAGMA journal_mode=WAL')
         conn.commit()
@@ -499,22 +536,30 @@ def put_cached_text(db_path: Path, content_hash: str, text: str,
                     dpi: int, lang: str, rotation,
                     preprocess: str, psm=None, oem=None,
                     engine: str = 'tesseract',
+                    actual_engine: str = None,
                     pdf_size: int = 0, pdf_mtime: float = 0.0):
     """Store OCR text in cache. Key is (content_hash, preprocess, psm, oem, engine) — a PDF
     cached with one param set does not serve as cache for a different param set.
     Uses a derived key so the same PDF can have multiple cache rows when run with
-    different param combinations (e.g. tesseract + psm=6 vs paddleocr vs gauss_otsu)."""
+    different param combinations (e.g. tesseract + psm=6 vs paddleocr vs gauss_otsu).
+
+    `engine` is what the caller REQUESTED (used in cache key + ocr_engine column).
+    `actual_engine` is what really ran (normally == engine; differs when init()
+    fell back to Tesseract). Pass actual_engine=None to default to engine.
+    """
+    actual_engine = actual_engine or engine
     try:
         conn = sqlite3.connect(str(db_path), timeout=10)
         try:
             conn.execute('''
                 INSERT OR REPLACE INTO ocr_cache
                 (content_hash, ocr_text, ocr_dpi, ocr_lang, ocr_rotation,
-                 ocr_preprocess, ocr_psm, ocr_oem, ocr_engine, ocr_at, pdf_size, pdf_mtime)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ocr_preprocess, ocr_psm, ocr_oem, ocr_engine, actual_engine,
+                 ocr_at, pdf_size, pdf_mtime)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (_cache_key(content_hash, preprocess, psm, oem, engine),
                   text, dpi, lang, rotation,
-                  preprocess, psm, oem, engine,
+                  preprocess, psm, oem, engine, actual_engine,
                   datetime.datetime.now().isoformat(),
                   pdf_size, pdf_mtime))
             conn.commit()
@@ -589,11 +634,20 @@ def _worker_init(targets, dpi, lang, rotation, preprocess,
                                      use_gpu=use_gpu)
         _WORKER_ENGINE.init()
     except EngineNotAvailable as e:
-        print(f'Worker: engine {engine_name!r} not available: {e}', file=sys.stderr)
-        print(f'Worker: falling back to tesseract', file=sys.stderr)
+        # Loud fallback: print a single ERROR line per worker so the
+        # main process can grep it (each worker prints to its own
+        # stderr, which we redirect via cable_match --workers via
+        # `_print_worker_fallback` only on the first occurrence).
+        sys.stderr.write(
+            f'ERROR: worker init: engine {engine_name!r} not available: {e}\n'
+            f'ERROR: worker init: falling back to Tesseract. '
+            f'This stage will produce IDENTICAL OCR text to a Tesseract-only stage; '
+            f'check `pip show paddleocr paddlepaddle` versions.\n'
+        )
+        sys.stderr.flush()
         _WORKER_ENGINE = TesseractEngine(lang=lang, psm=psm, oem=oem)
         _WORKER_ENGINE.init()
-        _WORKER_ENGINE_NAME = 'tesseract'
+        _WORKER_ENGINE_NAME = 'tesseract_fallback'
 
 
 def _process_pdf(item):
@@ -661,7 +715,8 @@ def _process_pdf(item):
                                 db_path, content_hash, t,
                                 _WORKER_DPI, _WORKER_LANG, _WORKER_ROTATION,
                                 prep, _WORKER_PSM, _WORKER_OEM, _WORKER_ENGINE_NAME,
-                                pdf_stat.st_size, pdf_stat.st_mtime)
+                                actual_engine=_WORKER_ENGINE_NAME,
+                                pdf_size=pdf_stat.st_size, pdf_mtime=pdf_stat.st_mtime)
                 except Exception:
                     pass
         except Exception as e:
@@ -693,11 +748,11 @@ def _process_pdf(item):
 # === State I/O ===
 
 def write_state(state: dict, state_path: Path):
-    """Atomically write state.json."""
+    """Atomically write state.json. Always UTF-8 (Windows defaults to cp936 otherwise)."""
     state['last_updated'] = datetime.datetime.now().isoformat()
     tmp_path = state_path.with_suffix('.tmp')
     try:
-        with open(tmp_path, 'w') as f:
+        with open(tmp_path, 'w', encoding='utf-8') as f:
             json.dump(state, f, indent=2, ensure_ascii=False)
         os.replace(tmp_path, state_path)
     except Exception as e:
@@ -705,14 +760,25 @@ def write_state(state: dict, state_path: Path):
 
 
 def load_state(state_path: Path) -> dict:
-    """Load state.json if it exists."""
+    """Load state.json if it exists. Tries UTF-8 first, then falls back to cp936
+    (Win11 default before the encoding fix; old state.json files were saved that
+    way and we want to keep resumes working)."""
     if not state_path.exists():
         return None
+    for enc in ('utf-8', 'cp936', 'gb18030'):
+        try:
+            with open(state_path, encoding=enc) as f:
+                return json.load(f)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+    # Last resort: binary + lenient
     try:
-        with open(state_path) as f:
-            return json.load(f)
+        with open(state_path, 'rb') as f:
+            raw = f.read()
+        text = raw.decode('utf-8', errors='replace')
+        return json.loads(text)
     except Exception as e:
-        print(f"Warning: failed to load state.json: {e}", file=sys.stderr)
+        print(f"Warning: failed to load state: {e}", file=sys.stderr)
         return None
 
 
@@ -819,7 +885,8 @@ def main():
         'lang': args.lang,
         'rotation': args.rotation,
         'preprocess': args.preprocess,
-        'engine': args.engine,
+        'engine': args.engine,        # REQUESTED engine
+        'engine_used': args.engine,  # ACTUAL engine — updated below if fallback happens
         'use_gpu': args.use_gpu,
         'psm': args.psm,
         'oem': args.oem,
@@ -1024,6 +1091,24 @@ def main():
             try:
                 n_cached = conn.execute('SELECT COUNT(*) FROM ocr_cache').fetchone()[0]
                 print(f"OCR cache: {n_cached} entries in {db_path.name}")
+                # Engine distribution: how many rows came from each actual engine?
+                # `tesseract_fallback` indicates a paddleocr/tesseract stage whose
+                # worker init fell back to Tesseract (e.g. paddleocr 3.x + paddle 2.x
+                # incompatible). If non-zero, that stage produced identical OCR text
+                # to a Tesseract stage — you should re-run with the matching venv.
+                cols = {row[1] for row in conn.execute('PRAGMA table_info(ocr_cache)').fetchall()}
+                if 'actual_engine' in cols:
+                    dist = conn.execute(
+                        'SELECT COALESCE(actual_engine, ocr_engine, "(unknown)") AS eng, COUNT(*) '
+                        'FROM ocr_cache GROUP BY eng ORDER BY COUNT(*) DESC'
+                    ).fetchall()
+                    if dist:
+                        print(f"OCR engine distribution:")
+                        for eng, n in dist:
+                            tag = ''
+                            if eng == 'tesseract_fallback':
+                                tag = '  ← WARNING: stage silently fell back to Tesseract'
+                            print(f"  {eng:<25} {n}{tag}")
             finally:
                 conn.close()
         except Exception:

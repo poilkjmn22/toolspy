@@ -511,6 +511,41 @@ nvidia-smi -l 2
   ```
   (Tesseract 4 stages 的缓存不用动)
 
+**6. PaddleOCR 2.x vs 3.x 兼容**:`PaddleOCREngine.init()` 自适应 paddleocr 主版本号,从 `paddleocr.__version__` 推断。`requirements-paddleocr.txt` 锁的是 **2.7.3**(Win/Linux + paddlepaddle 2.6.2);但用户机器上可能装了 3.x(最新 3.7.0,走 PaddleX 框架)。两种都支持:
+- **2.x 路径**: `PaddleOCR(use_angle_cls, lang, use_gpu, show_log)`(Win 用户碰到 `Unknown argument: use_gpu` 就是这个原因)
+- **3.x 路径**: `PaddleOCR(lang, use_textline_orientation, use_doc_orientation_classify, use_doc_unwarping)`(3.x 移除了 use_gpu/show_log,GPU 通过 paddlepaddle-gpu 自动检测)
+- **混合不行**(paddleocr 3.x + paddlepaddle 2.6.2 会因 PIR strides 失败;paddleocr 2.x + paddlepaddle 3.0+ 会因 set_optimization_level API 缺失失败)
+- **验证安装**:
+  ```powershell
+  myenv\Scripts\python.exe -c "from paddleocr import PaddleOCR; import paddle; print('paddleocr', __import__('paddleocr').__version__, 'paddle', paddle.__version__)"
+  # 期望: paddleocr 2.7.3 paddle 2.6.2  或  paddleocr 3.x paddle 3.x
+  ```
+
+**7. Silent-fallback detection**(关键!):如果 PaddleOCR init 失败(mismatch 版本,GPU 检测失败,模型下载失败,etc.),worker 会**fallback 到 Tesseract** 但**整个 PaddleOCR stage 都会变成 Tesseract 跑出来** — 等于 stage 5/6 跟 stage 1/3 没区别,**召回率原地踏步**。
+
+完成时 main 会打印:
+```
+=== 完成 ===
+扫描: 1947 (skip 0 already done)
+总匹配 (含历史): 390
+匹配方式分布:
+  exact         120
+  confusion     270
+OCR cache: 1947 entries in .cable_match_cache.db
+OCR engine distribution:
+  paddleocr              1845     ← 真的 PaddleOCR 跑的
+  tesseract_fallback     102      ← WARNING: 这一阶段其实跑的是 Tesseract!
+```
+
+**任何 `tesseract_fallback` 行 = 那个 stage 实际跑了 Tesseract**。常见原因:
+- paddleocr 3.x + paddlepaddle 2.x 不兼容(`Type of attribute: strides is not right`)
+- paddleocr 2.x + paddlepaddle 3.x 不兼容(`set_optimization_level` missing)
+- 第一次跑没下完模型 + 网络断(从断点续跑就行)
+
+**修复**:装匹配的 paddlepaddle + paddleocr 对:
+- 2.x: `pip install paddlepaddle==2.6.2 paddleocr==2.7.3`
+- 3.x: `pip install paddlepaddle==3.0+ paddleocr==3.0+` 然后清掉那个 stage 的 cache 重跑
+
 **STAGES_FILTER / -Stages 语法**(1-based,索引见上表):
 - `all` — 默认,跑所有可用 stage
 - `1-4` — 范围(含两端)
