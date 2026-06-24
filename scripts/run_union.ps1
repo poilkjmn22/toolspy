@@ -103,7 +103,34 @@ $paddleNeeded = ($Engine -eq 'mixed')
 if ($paddleNeeded) {
     $paddleCheck = & $pythonExe -c "import paddleocr" 2>&1
     if ($LASTEXITCODE -ne 0) {
-        Write-Error "paddleocr not installed. Run: myenv\Scripts\pip install -r requirements-paddleocr.txt"
+        $paddleCheckStr = ($paddleCheck | Out-String)
+        $hint = ""
+        if ($paddleCheckStr -match 'ABI version|compiled against ABI|numpy is 0x|numpy\.core\.multiarray failed to import') {
+            # Most common Win11 + PaddleOCR install failure: numpy 2.x broke ABI.
+            $hint = @"
+
+Looks like a NumPy ABI mismatch. paddlepaddle 2.6.2 / paddleocr 2.7.3
+ship C extensions compiled against NumPy 1.x ABI. If `numpy>=2.0` got
+pulled in (e.g. via pdfplumber or pillow's transitive deps), the .pyd
+files refuse to load. Symptoms include:
+
+    ImportError: numpy.core.multiarray failed to import
+    RuntimeError: module compiled against ABI version 0x1000009 but
+                  this version of numpy is 0x2000000
+
+Fix:
+
+    myenv\Scripts\pip install 'numpy<2.0'
+
+(requirements.txt already pins `numpy<2.0`, but if you installed
+paddleocr before that pin, the cached wheel may still be numpy 2.x.
+A `pip install --force-reinstall --no-deps paddlepaddle==2.6.2` then
+`pip install -r requirements.txt` is the nuclear option.)
+"@
+        } elseif ($paddleCheckStr -match 'No module named') {
+            $hint = "`nRun: myenv\Scripts\pip install -r requirements-paddleocr.txt"
+        }
+        Write-Error "paddleocr import failed. Output:`n$paddleCheckStr$hint"
     }
 }
 

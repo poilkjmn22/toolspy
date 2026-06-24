@@ -7,4 +7,5 @@ openpyxl==3.1.5
 xlrd==2.0.2
 pytesseract==0.3.13
 aiohttp==3.13.5
+numpy<2.0  # paddlepaddle 2.6.2 / paddleocr 2.7.3 用的 C 扩展是 NumPy 1.x ABI 编译的;NumPy 2.x ABI 改了主版本号(0x2000000),加载这些 .pyd 直接 RuntimeError
 python-Levenshtein==0.25.1  # 0.21.x 之前的 wheel 在 Py 3.12 下引用了 PyUnicode_FromUnicode / PyUnicode_AS_UNICODE 等已移除的 C API(无法链接),0.25+ 修了 ABI

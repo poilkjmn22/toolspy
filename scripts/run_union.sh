@@ -120,17 +120,46 @@ if [ "$SKIP_PADDLE" = "0" ]; then
     # (Py3.12). On Win11, paddleocr is typically in the same myenv as
     # Tesseract. We try a list of common locations.
     PADDLE_PY=""
+    PADDLE_ERR=""
     for candidate in \
         "$REPO/myenv/bin/python" \
         "$REPO/myenv312/bin/python"; do
-        if [ -f "$candidate" ] && "$candidate" -c "import paddleocr" 2>/dev/null; then
-            PADDLE_PY="$candidate"
-            break
+        if [ -f "$candidate" ]; then
+            err_file="$(mktemp)"
+            if "$candidate" -c "import paddleocr" >"$err_file" 2>&1; then
+                rm -f "$err_file"
+                PADDLE_PY="$candidate"
+                break
+            else
+                # Save the LAST error so we can show it on hard-fail below.
+                PADDLE_ERR="$(tail -3 "$err_file")"
+                rm -f "$err_file"
+            fi
         fi
     done
     if [ -z "$PADDLE_PY" ]; then
-        echo "ERROR: paddleocr not installed in any venv (tried myenv/ and myenv312/)." >&2
-        echo "       Run: <myenv>/bin/pip install -r requirements-paddleocr.txt" >&2
+        echo "ERROR: paddleocr import failed (tried myenv/ and myenv312/)." >&2
+        echo "       Last error: $PADDLE_ERR" >&2
+        echo "" >&2
+        if echo "$PADDLE_ERR" | grep -qE 'ABI version|compiled against ABI|numpy is 0x|numpy.core.multiarray failed to import'; then
+            echo "Looks like a NumPy ABI mismatch. paddlepaddle 2.6.2 / paddleocr 2.7.3" >&2
+            echo "ship C extensions compiled against NumPy 1.x ABI. If numpy>=2.0 got" >&2
+            echo "pulled in (e.g. via pdfplumber or pillow transitive deps), .so/.pyd" >&2
+            echo "files refuse to load. Symptoms include:" >&2
+            echo "    ImportError: numpy.core.multiarray failed to import" >&2
+            echo "    RuntimeError: module compiled against ABI version 0x1000009 but" >&2
+            echo "                  this version of numpy is 0x2000000" >&2
+            echo "" >&2
+            echo "Fix:" >&2
+            echo "    <myenv>/bin/pip install 'numpy<2.0'" >&2
+            echo "" >&2
+            echo "(requirements.txt already pins numpy<2.0, but if you installed" >&2
+            echo " paddleocr before that pin, the cached wheel may still be numpy 2.x." >&2
+            echo " A 'pip install --force-reinstall --no-deps paddlepaddle==2.6.2'" >&2
+            echo " then 'pip install -r requirements.txt' is the nuclear option.)" >&2
+        else
+            echo "Run: <myenv>/bin/pip install -r requirements-paddleocr.txt" >&2
+        fi
         exit 1
     fi
     PADDLE_VENV_DIR=$(dirname "$PADDLE_PY")
