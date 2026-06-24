@@ -396,6 +396,12 @@ bash scripts/run_union.sh 4    # 4 workers × 6 stages = 24 workers 总
 
 # 只跑 4 个 Tesseract stage（不装 PaddleOCR 时）
 ENGINE=tesseract bash scripts/run_union.sh 4
+
+# 选 stage 子集（用 STAGES_FILTER 环境变量）
+STAGES_FILTER="1-4" bash scripts/run_union.sh 4              # 只跑 Tesseract 4 stages
+STAGES_FILTER="5,6" bash scripts/run_union.sh 4              # 只跑 PaddleOCR 2 stages
+STAGES_FILTER="1-3,6" bash scripts/run_union.sh 4            # Tesseract 1-3 + PaddleOCR chisim
+STAGES_FILTER="all" bash scripts/run_union.sh 4              # 等同默认
 ```
 
 **Windows 原生**（PowerShell）：
@@ -405,7 +411,52 @@ powershell -ExecutionPolicy Bypass -File scripts\run_union.ps1 -WorkersPerStage 
 
 # 只跑 Tesseract 4 stages
 powershell -ExecutionPolicy Bypass -File scripts\run_union.ps1 -WorkersPerStage 4 -Engine tesseract
+
+# 选 stage 子集（用 -Stages 参数）
+powershell -ExecutionPolicy Bypass -File scripts\run_union.ps1 -WorkersPerStage 4 -Stages "1-4"   # Tesseract
+powershell -ExecutionPolicy Bypass -File scripts\run_union.ps1 -WorkersPerStage 4 -Stages "5,6"   # PaddleOCR
+powershell -ExecutionPolicy Bypass -File scripts\run_union.ps1 -WorkersPerStage 4 -Stages "1-3,6" # 混合
+powershell -ExecutionPolicy Bypass -File scripts\run_union.ps1 -WorkersPerStage 4 -Stages "all"   # 默认
 ```
+
+### 分批跑（先跑 Tesseract,GPU 准备好再跑 PaddleOCR）
+
+**适用场景**:Mac 上先把 Tesseract 4 stages 跑完确认召回,等 Win11 GPU ready 再跑 PaddleOCR 2 stages。设计完全支持分批跑,6 stages **cache/state/_matches.csv 全部独立**:
+
+```bash
+# batch 1: Win11/Mac 上跑 Tesseract 4 stages
+STAGES_FILTER="1-4" bash scripts/run_union.sh 4
+# ... 等跑完 ...
+
+# batch 2 (Win11 GPU ready):跑 PaddleOCR 2 stages
+STAGES_FILTER="5-6" bash scripts/run_union.sh 4
+# ... 等跑完 ...
+
+# 合并:跑一次就够,自动读全部 6 stage CSVs,缺失的 skip
+python scripts/merge_5stage_matches.py /path/to/wuhan/pdf
+```
+
+或 PowerShell:
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\run_union.ps1 -WorkersPerStage 4 -Stages "1-4"
+# 跑完后
+powershell -ExecutionPolicy Bypass -File scripts\run_union.ps1 -WorkersPerStage 4 -Stages "5,6"
+# 合并
+python scripts\merge_5stage_matches.py "$env:USERPROFILE\Documents\work\nengzhong\wuhan\pdf"
+```
+
+**STAGES_FILTER / -Stages 语法**(1-based,索引见上表):
+- `all` — 默认,跑所有可用 stage
+- `1-4` — 范围(含两端)
+- `1,3,5` — 列表
+- `1-3,6` — 混合范围 + 列表
+- 无效值报错退出(不会启动任何 stage)
+
+**注意**:
+- 所有 batch 用**相同的 `--dpi`(默认 300)**、**相同的 `--csv`**、**相同的 `--input`**
+- 同一 stage 不会被重复启动(`cable_match.py` 会加载已有 `_matches.csv` 去重 + `--resume auto` 接续)
+- 跑期间**不要修改源 PDF**(否则 content_hash 变化,产生重复文件)
+- `merge_5stage_matches.py` 是幂等的,跑多少次都行——会读取当前的 CSVs 重建 union
 
 ### 监控
 

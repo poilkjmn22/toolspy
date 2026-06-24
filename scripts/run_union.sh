@@ -1,15 +1,15 @@
 #!/bin/bash
-# run_union.sh — launch all 6 OCR stages in parallel for the wuhan project
+# run_union.sh — launch selected OCR stages in parallel for the wuhan project
 #
-# Stages (2 lang × 3 OCR recipes — total 6):
+# Stages (2 lang × 3 OCR recipes — total 6, indexed 1-6):
 #   Tesseract (default engine, no extra deps):
-#     1. chieng+none      — chi_sim+eng, no preprocess (baseline, matches v1)
-#     2. chieng+gauss      — chi_sim+eng, gauss_otsu (recovers char errors)
-#     3. chisim+none       — chi_sim only, no preprocess
-#     4. chisim+gauss      — chi_sim only, gauss_otsu (3B-463 attempt)
+#     1. chieng_tess         — chi_sim+eng, no preprocess (baseline, matches v1)
+#     2. chieng_tess_gauss   — chi_sim+eng, gauss_otsu (recovers char errors)
+#     3. chisim_tess         — chi_sim only, no preprocess
+#     4. chisim_tess_gauss   — chi_sim only, gauss_otsu (3B-463 attempt)
 #   PaddleOCR (optional, needs `pip install -r requirements-paddleocr.txt`):
-#     5. chieng+paddle     — chieng → PaddleOCR ch model, no preprocess
-#     6. chisim+paddle     — chisim → PaddleOCR en model, no preprocess
+#     5. chieng_paddle       — chieng → PaddleOCR ch model, no preprocess
+#     6. chisim_paddle       — chisim → PaddleOCR en model, no preprocess
 #                            (per Q1=B: deliberately different from chieng)
 #
 # Output dirs (under <WUHAN>/):
@@ -19,13 +19,28 @@
 #
 # Usage:
 #   bash scripts/run_union.sh [workers_per_stage]
+#   bash scripts/run_union.sh 4                                  # all 6 stages
+#   STAGES_FILTER="1-4" bash scripts/run_union.sh 4              # only Tesseract 4 stages
+#   STAGES_FILTER="5,6" bash scripts/run_union.sh 4              # only PaddleOCR 2 stages
+#   STAGES_FILTER="1-3,6" bash scripts/run_union.sh 4            # mixed subset
 #
-# Default workers_per_stage = 4 → 24 total when running on 16-core machines
-# (PaddleOCR stages hold ~250MB model each, so 16GB+ RAM recommended).
+# STAGES_FILTER syntax:
+#   "all"        — run all available stages (default)
+#   "1-4"        — range, inclusive
+#   "1,3,5"      — comma list
+#   "1-3,6"      — mixed range + list
+#
+# Default workers_per_stage = 4 → 24 total when running all 6 on 16-core
+# machines (PaddleOCR stages hold ~250MB model each, so 16GB+ RAM recommended).
 # Set to 2 on 8-core machines (12 total).
 #
 # After all stages finish:
 #   python scripts/merge_5stage_matches.py <WUHAN_DIR>
+# Run merge_5stage_matches.py MULTIPLE times safely:
+#   - First run before all stages finish: produces partial union of stages
+#     that have a _matches.csv
+#   - Second run after all stages finish: produces full union
+#   - The merge is idempotent — re-running always reads the current CSVs.
 #
 # Mac notes:
 #   - Tesseract stages use myenv/ (Py3.9).
@@ -46,6 +61,7 @@ WUHAN_DIR="${WUHAN_DIR:-/Users/fangqi-apple/Documents/work/nengzhong/wuhan/pdf}"
 CSV="${CSV:-$WUHAN_DIR/filter_result_3hzb_ff.csv}"
 REPO="${REPO:-/Users/fangqi-apple/Documents/WebDev/toolspy}"
 WORKERS_PER_STAGE="${1:-4}"
+STAGES_FILTER="${STAGES_FILTER:-all}"  # "all" | "1-4" | "1,3,5" | "1-3,6"
 LOG_DIR="$WUHAN_DIR/../logs"
 mkdir -p "$LOG_DIR"
 
@@ -116,8 +132,73 @@ if [ ! -f "$TESS_PY" ]; then
     exit 1
 fi
 
+# === Build the full stage list (before STAGES_FILTER applies) ===
+# Each entry is "name|python|extra_args|output_dir"
+declare -a ALL_STAGES=(
+    "chieng_tess|$TESS_PY|--preprocess none|$STAGE_CHIENG_TESS"
+    "chieng_tess_gauss|$TESS_PY|--preprocess gauss_otsu|$STAGE_CHIENG_TESS_GAUSS"
+    "chisim_tess|$TESS_PY|--lang chi_sim --preprocess none|$STAGE_CHISIM_TESS"
+    "chisim_tess_gauss|$TESS_PY|--lang chi_sim --preprocess gauss_otsu|$STAGE_CHISIM_TESS_GAUSS"
+)
+
+if [ "$SKIP_PADDLE" = "0" ]; then
+    ALL_STAGES+=(
+        "chieng_paddle|$PADDLE_PY|--engine paddleocr --preprocess none|$STAGE_CHIENG_PADDLE"
+        "chisim_paddle|$PADDLE_PY|--engine paddleocr --lang chi_sim --preprocess none|$STAGE_CHISIM_PADDLE"
+    )
+fi
+
+N_ALL_STAGES=${#ALL_STAGES[@]}
+
+# === Parse STAGES_FILTER into FILTERED_STAGES array (1-based indices) ===
+FILTERED_STAGES=()
+parse_stage_filter() {
+    local filter="$1"
+    local max="$2"
+    FILTERED_STAGES=()
+    if [ "$filter" = "all" ] || [ -z "$filter" ]; then
+        FILTERED_STAGES=( $(seq 1 "$max") )
+        return 0
+    fi
+    local IFS=','
+    local tokens=( $filter )
+    for token in "${tokens[@]}"; do
+        # Trim whitespace
+        token="${token// /}"
+        if [[ "$token" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            local s="${BASH_REMATCH[1]}"
+            local e="${BASH_REMATCH[2]}"
+            if [ "$s" -gt "$e" ]; then
+                echo "ERROR: invalid range '$token' (start > end)" >&2
+                return 1
+            fi
+            for ((i=s; i<=e; i++)); do
+                if [ "$i" -lt 1 ] || [ "$i" -gt "$max" ]; then
+                    echo "ERROR: stage index $i out of range (1-$max)" >&2
+                    return 1
+                fi
+                FILTERED_STAGES+=( "$i" )
+            done
+        elif [[ "$token" =~ ^[0-9]+$ ]]; then
+            if [ "$token" -lt 1 ] || [ "$token" -gt "$max" ]; then
+                echo "ERROR: stage index $token out of range (1-$max)" >&2
+                return 1
+            fi
+            FILTERED_STAGES+=( "$token" )
+        else
+            echo "ERROR: invalid stage token: '$token' (expected integer or N-M range)" >&2
+            return 1
+        fi
+    done
+    return 0
+}
+
+parse_stage_filter "$STAGES_FILTER" "$N_ALL_STAGES" || exit 1
+N_FILTERED=${#FILTERED_STAGES[@]}
+TOTAL_WORKERS=$((WORKERS_PER_STAGE * N_FILTERED))
+
 cd "$REPO"
-echo "=== 6-stage union launcher ==="
+echo "=== 6-stage union launcher (filtered) ==="
 echo "  WUHAN_DIR:            $WUHAN_DIR"
 echo "  CSV:                  $CSV"
 echo "  engine:               $ENGINE  (override: ENGINE=tesseract bash ...)"
@@ -128,29 +209,26 @@ fi
 echo "  tess python:          $TESS_PY"
 echo "  logs:                 $LOG_DIR"
 echo ""
-
-# === Launch stages in parallel ===
-# Each stage: (stage_name, venv_python, extra_args, output_dir)
-declare -a STAGES=(
-    "chieng_tess|$TESS_PY|--preprocess none|$STAGE_CHIENG_TESS"
-    "chieng_tess_gauss|$TESS_PY|--preprocess gauss_otsu|$STAGE_CHIENG_TESS_GAUSS"
-    "chisim_tess|$TESS_PY|--lang chi_sim --preprocess none|$STAGE_CHISIM_TESS"
-    "chisim_tess_gauss|$TESS_PY|--lang chi_sim --preprocess gauss_otsu|$STAGE_CHISIM_TESS_GAUSS"
-)
-
-if [ "$SKIP_PADDLE" = "0" ]; then
-    STAGES+=(
-        "chieng_paddle|$PADDLE_PY|--engine paddleocr --preprocess none|$STAGE_CHIENG_PADDLE"
-        "chisim_paddle|$PADDLE_PY|--engine paddleocr --lang chi_sim --preprocess none|$STAGE_CHISIM_PADDLE"
-    )
-fi
-
-N_STAGES=${#STAGES[@]}
-TOTAL_WORKERS=$((WORKERS_PER_STAGE * N_STAGES))
-echo "  total stages:         $N_STAGES"
+echo "  stages filter:        $STAGES_FILTER  ($N_FILTERED / $N_ALL_STAGES stages)"
 echo "  total workers:        $TOTAL_WORKERS"
 echo ""
+echo "  all stages (index → name):"
+for ((i=0; i<N_ALL_STAGES; i++)); do
+    stage="${ALL_STAGES[$i]}"
+    IFS='|' read -r name _ <<< "$stage"
+    idx=$((i+1))
+    marker=""
+    for s in "${FILTERED_STAGES[@]}"; do
+        if [ "$s" = "$idx" ]; then
+            marker="  ← will run"
+            break
+        fi
+    done
+    echo "    $idx. $name$marker"
+done
+echo ""
 
+# === Launch selected stages in parallel ===
 launch() {
     local name="$1"
     local py="$2"
@@ -172,16 +250,18 @@ launch() {
     echo $pid > "$LOG_DIR/$name.pid"
 }
 
-for stage in "${STAGES[@]}"; do
+for idx in "${FILTERED_STAGES[@]}"; do
+    array_idx=$((idx-1))
+    stage="${ALL_STAGES[$array_idx]}"
     IFS='|' read -r name py args outdir <<< "$stage"
     launch "$name" "$py" "$args" "$outdir"
 done
 
 echo ""
-echo "=== all $N_STAGES stages running in background ==="
+echo "=== $N_FILTERED stage(s) running in background ==="
 echo "  status: bash $REPO/scripts/wuhan_status.sh"
 echo "  stop:   pkill -f 'cable_match.py'  (state.json auto-saved every 30s)"
-echo "  merge:  python $REPO/scripts/merge_5stage_matches.py $WUHAN_DIR  (after all finish)"
+echo "  merge:  python $REPO/scripts/merge_5stage_matches.py $WUHAN_DIR  (idempotent; run any time)"
 echo ""
 sleep 2
 ps -eo pid,etime,command | grep cable_match | grep -v grep | awk '{$1=$1; printf "  PID %s  up %s\n", $2, $3}'
