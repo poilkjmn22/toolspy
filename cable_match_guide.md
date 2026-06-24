@@ -445,6 +445,72 @@ powershell -ExecutionPolicy Bypass -File scripts\run_union.ps1 -WorkersPerStage 
 python scripts\merge_5stage_matches.py "$env:USERPROFILE\Documents\work\nengzhong\wuhan\pdf"
 ```
 
+### Win11 GPU 加速 PaddleOCR（`-UseGpu` / `USE_GPU=1`）
+
+**前提**:Win11 装了 NVIDIA 显卡 + CUDA 驱动,而且 venv 里装的是 **CUDA 版 paddlepaddle-gpu**(默认 `pip install -r requirements-paddleocr.txt` 装的是 CPU 版 paddlepaddle)。
+
+**1. 装 CUDA 版 paddlepaddle-gpu**(替换 venv 里的 CPU 版):
+
+```powershell
+# 查 NVIDIA 驱动支持的最高 CUDA 版本(nvidia-smi 右上角 "CUDA Version" 行)
+nvidia-smi
+
+# 卸载 CPU 版 paddlepaddle
+myenv\Scripts\pip uninstall -y paddlepaddle
+
+# 安装 paddlepaddle-gpu==2.6.2,挑对应 CUDA 版本的 wheel index
+#   CUDA 11.7(Win11 2022-2024 出厂的多半是这个):
+myenv\Scripts\pip install paddlepaddle-gpu==2.6.2 -f https://www.paddlepaddle.org.cn/whl/windows/cu117/noavx
+#   CUDA 11.8:
+#     .../whl/windows/cu118/noavx
+#   CUDA 12.x(新驱动):
+#     .../whl/windows/cu123/noavx
+# (/noavx 是给没有 AVX 指令集的 CPU 用的;有 AVX 的话去掉 /noavx 段)
+
+# 验证
+myenv\Scripts\python.exe -c "import paddle; print(paddle.device.is_compiled_with_cuda(), paddle.device.cuda.device_count())"
+# 期望: True 1  (True = CUDA 编译过; 数字 = 可见 GPU 数)
+```
+
+**2. 启动时加 `-UseGpu`**(PowerShell)/ `USE_GPU=1`(bash):
+
+```powershell
+# 全部 6 stages + GPU
+powershell -ExecutionPolicy Bypass -File scripts\run_union.ps1 -WorkersPerStage 4 -UseGpu
+
+# 只跑 PaddleOCR 2 stages + GPU(分批跑工作流,先在 CPU 上跑完 Tesseract 4 stages)
+powershell -ExecutionPolicy Bypass -File scripts\run_union.ps1 -WorkersPerStage 4 -Stages "5,6" -UseGpu
+```
+
+```bash
+# bash 等价(WSL/Linux/Mac,但 Mac 上 USE_GPU=1 会 hard-fail 见下)
+USE_GPU=1 STAGES_FILTER="5-6" bash scripts/run_union.sh 4
+```
+
+**3. `-UseGpu` / `USE_GPU=1` 的行为**:
+- **HARD-FAIL**:如果 paddlepaddle 没 CUDA 支持、CUDA 驱动版本对不上、或 GPU 不可见,**直接报错退出**(不会静默回退到 CPU 浪费 6 小时才发现)
+- 错误信息会**打印具体的 paddlepaddle-gpu 装包指令**(cu117/cu118/cu123 三选一)
+- Tesseract stages(1-4)**忽略** `-UseGpu`(Tesseract 没有 GPU 加速)
+- macOS 上 `USE_GPU=1` **永远 hard-fail**(paddlepaddle macOS wheel 没有 CUDA)
+
+**4. 跑起来后监控**:
+
+```powershell
+# 另开一个终端看 GPU 占用
+nvidia-smi -l 2
+# 期望:PaddleOCR stages 启动后,python.exe 进程在 "C" 列下有 ~1-3GB 显存占用,"GPU-Util" 应该有波动
+```
+
+**5. 不加 `-UseGpu` 跑 PaddleOCR**(CPU 模式):
+- 仍然 work,只是慢(Win11 16 核 + 1882 PDF 估计 8-12h)
+- cache schema 不变,后续切到 GPU 重跑会**直接读 CPU 跑过的缓存**(use_gpu 不在 cache key 里,输出文本一致)
+- 所以建议:**先 CPU 跑一遍验证 pipeline 通**,再 GPU 重跑前清掉 PaddleOCR 阶段的缓存:
+  ```powershell
+  Remove-Item "$env:USERPROFILE\Documents\work\nengzhong\wuhan\pdf\.stage_chieng_paddle\ocr_cache.db"
+  Remove-Item "$env:USERPROFILE\Documents\work\nengzhong\wuhan\pdf\.stage_chisim_paddle\ocr_cache.db"
+  ```
+  (Tesseract 4 stages 的缓存不用动)
+
 **STAGES_FILTER / -Stages 语法**(1-based,索引见上表):
 - `all` — 默认,跑所有可用 stage
 - `1-4` — 范围(含两端)

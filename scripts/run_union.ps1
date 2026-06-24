@@ -34,11 +34,33 @@ Usage (from repo root):
     # Range + list (stages 2-4 and 6)
     powershell -ExecutionPolicy Bypass -File scripts\run_union.ps1 -WorkersPerStage 4 -Stages "2-4,6"
 
+    # Run only PaddleOCR 2 stages on Win11 GPU
+    powershell -ExecutionPolicy Bypass -File scripts\run_union.ps1 -WorkersPerStage 4 -Stages "5-6" -UseGpu
+
 -Stages syntax:
     "all"        run all available stages (default)
     "1-4"        range, inclusive
     "1,3,5"      comma list
     "1-3,6"      mixed range + list
+
+-UseGpu:
+    Enables GPU for PaddleOCR stages (5, 6). HARD-FAIL if paddlepaddle was
+    installed without CUDA support or no CUDA driver is reachable. Tesseract
+    stages (1-4) ignore -UseGpu. On Win11 NVIDIA boxes, install the
+    CUDA-enabled paddlepaddle first:
+
+        # Replace your CPU paddlepaddle with the GPU wheel that matches
+        # your CUDA toolkit version. Pick the right URL from
+        # https://www.paddlepaddle.org.cn/install/quick
+        #
+        # CUDA 11.7 (most Win11 boxes shipped 2022-2024):
+        myenv\Scripts\pip install paddlepaddle-gpu==2.6.2 -f https://www.paddlepaddle.org.cn/whl/windows/cu117/noavx
+        # CUDA 11.8:
+        #   .../whl/windows/cu118/noavx
+        # CUDA 12.x (newer drivers):
+        #   .../whl/windows/cu123/noavx
+
+    On macOS, -UseGpu will hard-fail (paddlepaddle macOS wheel has no CUDA).
 
 After each batch finishes:
     python scripts\merge_5stage_matches.py "$env:USERPROFILE\Documents\work\nengzhong\wuhan\pdf"
@@ -54,7 +76,8 @@ param(
     [string]$WuhanDir = "$env:USERPROFILE\Documents\work\nengzhong\wuhan\pdf",
     [ValidateSet('mixed','tesseract')]
     [string]$Engine = 'mixed',
-    [string]$Stages = 'all'
+    [string]$Stages = 'all',
+    [switch]$UseGpu = $false
 )
 
 $ErrorActionPreference = 'Stop'
@@ -82,6 +105,75 @@ if ($paddleNeeded) {
     if ($LASTEXITCODE -ne 0) {
         Write-Error "paddleocr not installed. Run: myenv\Scripts\pip install -r requirements-paddleocr.txt"
     }
+}
+
+# === GPU precheck (only when -UseGpu is set and at least one PaddleOCR stage runs) ===
+# HARD-FAIL: user explicitly asked for GPU; if paddlepaddle isn't CUDA-enabled
+# or no CUDA driver is reachable, we refuse to silently fall back to CPU.
+if ($UseGpu) {
+    if (-not $paddleNeeded) {
+        Write-Error "-UseGpu requested but -Engine tesseract skips all PaddleOCR stages. Nothing to accelerate; remove -UseGpu."
+    }
+    Write-Host '  GPU precheck: running paddle.utils.run_check() ...'
+    $gpuCheck = & $pythonExe - @'
+import sys
+try:
+    import paddle
+    paddle.utils.run_check()
+    if not paddle.device.is_compiled_with_cuda():
+        print('PADDLE_NOT_COMPILED_WITH_CUDA')
+        sys.exit(2)
+    n = paddle.device.cuda.device_count()
+    if n < 1:
+        print('NO_CUDA_DEVICE_VISIBLE')
+        sys.exit(4)
+    print(f'CUDA_OK n={n}')
+except SystemExit:
+    raise
+except Exception as e:
+    print(f'GPU_CHECK_FAILED: {type(e).__name__}: {e}')
+    sys.exit(3)
+'@ 2>&1
+    $gpuExit = $LASTEXITCODE
+    if ($gpuExit -ne 0) {
+        $hint = @"
+
+GPU precheck failed (exit code $gpuExit). Output:
+$gpuCheck
+
+This usually means paddlepaddle was installed without CUDA support, or your
+CUDA driver / toolkit version doesn't match the wheel you grabbed.
+
+Fix on Win11 NVIDIA box:
+
+  1. Check your CUDA driver version:
+       nvidia-smi
+     (top-right "CUDA Version" line is the *driver*-supported max; the
+      *toolkit* version installed on the box is what the wheel must match.)
+
+  2. Uninstall the CPU-only paddlepaddle:
+       myenv\Scripts\pip uninstall -y paddlepaddle
+
+  3. Install paddlepaddle-gpu==2.6.2 from the matching wheel index:
+       # CUDA 11.7 (most Win11 boxes shipped 2022-2024):
+       myenv\Scripts\pip install paddlepaddle-gpu==2.6.2 -f https://www.paddlepaddle.org.cn/whl/windows/cu117/noavx
+       # CUDA 11.8:
+       #   .../whl/windows/cu118/noavx
+       # CUDA 12.x:
+       #   .../whl/windows/cu123/noavx
+       (pick the noavx flavor for CPUs without AVX; drop /noavx if you have AVX)
+
+  4. Verify:
+       myenv\Scripts\python.exe -c "import paddle; print(paddle.device.is_compiled_with_cuda(), paddle.device.cuda.device_count())"
+
+  5. Re-run with -UseGpu.
+
+If you can't install CUDA-enabled paddlepaddle on this machine, drop -UseGpu
+and PaddleOCR stages will run on CPU (still works, ~5-10x slower than GPU).
+"@
+        Write-Error $hint
+    }
+    Write-Host "  GPU precheck: OK ($gpuCheck)"
 }
 
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
@@ -150,6 +242,7 @@ Write-Host "  Engine:            $Engine  (override: -Engine tesseract)"
 Write-Host "  WorkersPerStage:   $WorkersPerStage"
 Write-Host "  Stages filter:     $Stages  ($nSelected / $nAllStages stages)"
 Write-Host "  Total workers:     $totalWorkers"
+Write-Host "  GPU:               $(if ($UseGpu) {'enabled (PaddleOCR stages 5-6 only; Tesseract stages ignore)'} else {'disabled (PaddleOCR stages will run on CPU)'})"
 Write-Host "  Logs:              $logDir"
 Write-Host ''
 Write-Host '  all stages (index -> name):'
@@ -167,13 +260,18 @@ foreach ($idx in $selectedIdx) {
     $log = Join-Path $logDir ("stage_{0}.log" -f $stage.Name)
     New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 
+    $stageArgs = $stage.Args
+    if ($UseGpu -and $stage.Name -match '_paddle$') {
+        $stageArgs = $stageArgs + @('--use-gpu')
+    }
+
     $argList = @(
         'scripts\cable_match.py',
         '--csv', $csv,
         '--input', $WuhanDir,
         '--output', $outDir,
         '--workers', "$WorkersPerStage"
-    ) + $stage.Args
+    ) + $stageArgs
 
     Write-Host ("  launching: {0,-22}  ->  {1}" -f $stage.Name, $outDir)
     Write-Host ("    log: {0}" -f $log)
@@ -190,6 +288,9 @@ Write-Host '  status: powershell -ExecutionPolicy Bypass -File scripts\wuhan_sta
 Write-Host '  stop:   Get-Process python | Where-Object {$_.CommandLine -like "*cable_match*"} | Stop-Process'
 Write-Host '          (state.json auto-saved every 30s; safe to interrupt)'
 Write-Host "  merge:  python scripts\merge_5stage_matches.py '$WuhanDir'  (idempotent; run any time)"
+if ($UseGpu) {
+    Write-Host '  gpu:    nvidia-smi  (check PaddleOCR stages are actually using GPU; util should be >0%)'
+}
 Write-Host ''
 Write-Host '=== running processes ==='
 Get-Process python -ErrorAction SilentlyContinue | ForEach-Object {

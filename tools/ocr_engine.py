@@ -192,15 +192,42 @@ class PaddleOCREngine(OCREngine):
                 "  pip install -r requirements-paddleocr.txt\n"
                 "then `python -c \"from paddleocr import PaddleOCR\"` to download models on first use."
             )
+        # If user explicitly asked for GPU, verify paddlepaddle was built
+        # with CUDA before constructing PaddleOCR. PaddleOCR 2.x silently
+        # falls back to CPU if use_gpu=True but paddlepaddle has no CUDA,
+        # which would mask misconfiguration. HARD-FAIL here so the user
+        # sees a clear error instead of an 8h CPU job.
+        if self.use_gpu:
+            try:
+                import paddle
+                if not paddle.device.is_compiled_with_cuda():
+                    raise EngineNotAvailable(
+                        "--use-gpu requested but paddlepaddle was installed WITHOUT CUDA support. "
+                        "Install paddlepaddle-gpu instead:\n"
+                        "  pip uninstall -y paddlepaddle\n"
+                        "  pip install paddlepaddle-gpu==2.6.2 -f https://www.paddlepaddle.org.cn/whl/<linux|windows>/<cu117|cu118|cu123>[/noavx]\n"
+                        "On macOS, paddlepaddle has no CUDA wheel; remove --use-gpu to run on CPU."
+                    )
+                if paddle.device.cuda.device_count() < 1:
+                    raise EngineNotAvailable(
+                        "--use-gpu requested but no CUDA device is visible. "
+                        "Check `nvidia-smi` and CUDA_VISIBLE_DEVICES."
+                    )
+            except ImportError:
+                raise EngineNotAvailable(
+                    "--use-gpu requested but paddle is not importable."
+                )
         # Suppress Paddle's chatty INFO logs.
         os.environ.setdefault('GLOG_v', '3')
         try:
             from paddleocr import PaddleOCR
-            # PaddleOCR 3.x API: only `lang` + `use_angle_cls` accepted.
-            # 2.x also accepted `use_gpu` / `show_log` (no longer supported).
+            # Pinned to paddleocr==2.7.3 which still accepts `use_gpu` /
+            # `show_log`. (3.x dropped those kwargs.)
             self._ocr = PaddleOCR(
                 use_angle_cls=self.use_angle_cls,
                 lang=self.paddle_lang,
+                use_gpu=self.use_gpu,
+                show_log=False,
             )
         except Exception as e:
             raise EngineNotAvailable(

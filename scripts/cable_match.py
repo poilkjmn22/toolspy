@@ -566,7 +566,7 @@ def discover_pdfs(input_path: Path, target_set: set) -> list:
 
 def _worker_init(targets, dpi, lang, rotation, preprocess,
                   psm=None, oem=None, use_levenshtein=False,
-                  engine_name='tesseract'):
+                  engine_name='tesseract', use_gpu=False):
     """Initialize worker globals. Called once per worker process.
 
     Also builds the OCREngine instance and runs `engine.init()` to load any
@@ -585,7 +585,8 @@ def _worker_init(targets, dpi, lang, rotation, preprocess,
     _WORKER_USE_LEVENSHTEIN = use_levenshtein
     _WORKER_ENGINE_NAME = engine_name
     try:
-        _WORKER_ENGINE = get_engine(engine_name, lang=lang, psm=psm, oem=oem)
+        _WORKER_ENGINE = get_engine(engine_name, lang=lang, psm=psm, oem=oem,
+                                     use_gpu=use_gpu)
         _WORKER_ENGINE.init()
     except EngineNotAvailable as e:
         print(f'Worker: engine {engine_name!r} not available: {e}', file=sys.stderr)
@@ -793,7 +794,8 @@ def main():
           f"rotation={args.rotation or 'auto'}, preprocess={args.preprocess}, "
           f"psm={args.psm if args.psm is not None else 'default'}, "
           f"oem={args.oem if args.oem is not None else 'default'}, "
-          f"fuzzy={'lev+conf' if args.levenshtein else 'conf'})", flush=True)
+          f"fuzzy={'lev+conf' if args.levenshtein else 'conf'}, "
+          f"gpu={'on' if args.use_gpu and args.engine == 'paddleocr' else 'off'})", flush=True)
     if db_path:
         print(f"Cache DB: {db_path}", flush=True)
     if not args.no_state:
@@ -917,7 +919,7 @@ def main():
     total = len(todo)
 
     initargs = (targets, args.dpi, args.lang, args.rotation, args.preprocess,
-                args.psm, args.oem, args.levenshtein, args.engine)
+                args.psm, args.oem, args.levenshtein, args.engine, args.use_gpu)
 
     print(f"Processing {total} PDFs with {args.workers} workers (multiprocessing)...", flush=True)
 

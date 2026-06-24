@@ -7,4 +7,4 @@ openpyxl==3.1.5
 xlrd==2.0.2
 pytesseract==0.3.13
 aiohttp==3.13.5
-python-Levenshtein==0.12.2
+python-Levenshtein==0.25.1  # 0.21.x 之前的 wheel 在 Py 3.12 下引用了 PyUnicode_FromUnicode / PyUnicode_AS_UNICODE 等已移除的 C API(无法链接),0.25+ 修了 ABI

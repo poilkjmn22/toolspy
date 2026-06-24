@@ -54,6 +54,19 @@ A bash wrapper at the repo root `./toolspy` does the same as `python -m tools` b
 - **`text-extractor --ocr` and `pdf-organize` need Tesseract.** `text-extractor` on image-only PDFs yields empty `.txt` files unless you pass `--ocr`. `pdf-organize` on a scanned-PDF corpus will skip those PDFs unless Tesseract is on PATH. Install with `brew install tesseract tesseract-lang` (macOS) or `apt install tesseract-ocr tesseract-ocr-chi-sim` (Linux). The `chi_sim` (Simplified Chinese) language pack comes with `tesseract-lang`. The tools print a clear install hint if Tesseract is missing.
 
 - **OCR engine is pluggable.** All three tools (`text-extractor`, `pdf-organize`, `cable_match`) accept `--engine {tesseract|paddleocr}` (default `tesseract`). PaddleOCR (PP-OCRv3) typically reaches ~85-95% recall on Chinese small-text + dense terminal-block layouts vs Tesseract's ~70-80% on the same. To enable: `pip install -r requirements-paddleocr.txt` (~250 MB pip deps + ~100 MB model files downloaded on first use). On macOS Apple Silicon paddlepaddle runs CPU only — Win/Linux + CUDA recommended for speed. The `cable_match.py` cache schema stores an `ocr_engine` column so Tesseract and PaddleOCR caches coexist without collision.
+- **Win11 GPU acceleration for PaddleOCR (`-UseGpu` / `USE_GPU=1`).** Default `pip install -r requirements-paddleocr.txt` installs the **CPU-only** paddlepaddle. To enable GPU on Win/Linux + NVIDIA boxes, swap to `paddlepaddle-gpu==2.6.2` from the matching CUDA wheel index:
+  ```bash
+  # 1. nvidia-smi  → note "CUDA Version" line (driver-supported max)
+  # 2. pip uninstall -y paddlepaddle
+  # 3. CUDA 11.7 (most Win11 boxes shipped 2022-2024):
+  pip install paddlepaddle-gpu==2.6.2 -f https://www.paddlepaddle.org.cn/whl/windows/cu117/noavx
+  #    CUDA 11.8: .../whl/windows/cu118/noavx
+  #    CUDA 12.x:  .../whl/windows/cu123/noavx
+  #    Linux: replace /windows/ with /linux/, drop /noavx
+  # 4. python -c "import paddle; print(paddle.device.is_compiled_with_cuda(), paddle.device.cuda.device_count())"
+  # 5. Relaunch with -UseGpu (PowerShell) or USE_GPU=1 (bash).
+  ```
+  The launcher **hard-fails** if `-UseGpu` is set without CUDA support — no silent CPU fallback. The error message prints the exact pip install line for cu117/cu118/cu123. Tesseract stages ignore `-UseGpu`. macOS `-UseGpu` always hard-fails (no CUDA wheel). See `cable_match_guide.md` § "Win11 GPU 加速 PaddleOCR" for the full workflow including the cache-invalidation gotcha when upgrading from CPU→GPU.
 
 ## Things to ignore at the repo root
 
