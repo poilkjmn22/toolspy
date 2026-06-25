@@ -1,5 +1,21 @@
+# Core deps for tools/cable_match.py + tools/text_extractor + tools/pdf_organize.
+# PaddleOCR deps are in requirements-paddleocr.txt (optional, see that file).
+#
+# === Python version support ===
+# Validated on Python 3.10 / 3.11 / 3.12. Py 3.13+ may have package-compat
+# issues (especially for paddlepaddle 2.x); use Python 3.12 if you can.
+#
+# === NumPy ABI ===
+# Both Pillow<11 and numpy<2.0 below exist for ONE reason: the optional
+# PaddleOCR stack (requirements-paddleocr.txt) ships C extensions compiled
+# against NumPy 1.x ABI. If pip resolver accidentally picks numpy>=2 or
+# Pillow>=12 (both of which require numpy>=2), paddlepaddle 2.6.2 will
+# fail at runtime with `RuntimeError: module compiled against ABI version
+# 0x1000009 but this version of numpy is 0x2000000`. If you don't need
+# PaddleOCR, these pins are harmless — no tool in this repo uses numpy>=2.
+
 lxml==6.0.2
-pillow==11.3.0
+pillow<11
 python-docx==1.2.0
 typing_extensions==4.15.0
 pdfplumber==0.11.8
@@ -7,5 +23,10 @@ openpyxl==3.1.5
 xlrd==2.0.2
 pytesseract==0.3.13
 aiohttp==3.13.5
-numpy<2.0  # paddlepaddle 2.6.2 / paddleocr 2.7.3 用的 C 扩展是 NumPy 1.x ABI 编译的;NumPy 2.x ABI 改了主版本号(0x2000000),加载这些 .pyd 直接 RuntimeError
-python-Levenshtein==0.25.1  # 0.21.x 之前的 wheel 在 Py 3.12 下引用了 PyUnicode_FromUnicode / PyUnicode_AS_UNICODE 等已移除的 C API(无法链接),0.25+ 修了 ABI
+numpy<2.0
+
+# python-Levenshtein pinned to >=0.25.1 because 0.21.x (and earlier) still
+# link against the PyUnicode_FromUnicode / PyUnicode_AS_UNICODE C APIs
+# which were removed in Python 3.3. On Python 3.10+ they no longer link.
+# 0.25+ switched to a rapidfuzz-backed pure-Python wheel.
+python-Levenshtein==0.25.1

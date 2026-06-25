@@ -87,6 +87,57 @@ myenv/bin/pip install -r requirements.txt
 myenv/bin/pip install -r requirements-paddleocr.txt
 ```
 
+### NumPy ABI 注意事项(Win11 + PaddleOCR 必读)
+
+`paddlepaddle 2.6.2` + `paddleocr 2.7.3` 的 C 扩展是用 **NumPy 1.x ABI** 编译的。NumPy 2.0 改了 ABI 主版本号(0x2000000),所以**必须用 numpy<2.0**。
+
+**问题**:`requirements-paddleocr.txt` 钉了 `paddleocr==2.7.3` 和 `paddlepaddle==2.6.2`,但**没有钉它们的传递依赖**(scipy / scikit-image / matplotlib / Pillow / shapely / pdf2docx / imgaug)。pip 解析时如果发现更老的 `requirements.txt` 已经钉了 numpy 但没钉这些包,pip 会拉它们的最新版(2026 年的版本),而**这些最新版全都硬要求 `numpy>=2.0`** — pip 静默升级 numpy,paddlepaddle 加载时崩。
+
+**修复**:`requirements-paddleocr.txt` 已经把所有会触发 numpy 2.x 的传递依赖都钉到 last-numpy-1.x-compatible 版本:
+
+| 包 | cap |
+|----|-----|
+| `scipy` | `<1.15` |
+| `scikit-image` | `<0.25` |
+| `matplotlib` | `<3.10` |
+| `shapely` | `<2.1` |
+| `Pillow` | `<11` |
+| `pdf2docx` | `<0.5.10` |
+| `imgaug` | `==0.4.0` |
+
+**Win11 上推荐 install 流程**(clean venv):
+
+```powershell
+# 1. 干净 venv
+Remove-Item -Recurse -Force .\venv -ErrorAction SilentlyContinue
+python -m venv venv
+.\venv\Scripts\pip install --upgrade pip
+
+# 2. 装 core deps(numpy<2.0 在 requirements.txt 里)
+.\venv\Scripts\pip install -r requirements.txt
+
+# 3. 装 paddleocr + transitive pins(requirements-paddleocr.txt 钉了所有 numpy-2-only 包)
+.\venv\Scripts\pip install -r requirements-paddleocr.txt
+
+# 4. 验证 numpy 版本 + paddleocr 能 import
+.\venv\Scripts\python.exe -c "import numpy, paddleocr, paddle; print('numpy', numpy.__version__, 'paddleocr', paddleocr.__version__, 'paddle', paddle.__version__)"
+# 期望: numpy 1.26.x  paddleocr 2.7.3  paddle 2.6.2
+```
+
+**症状 → 修复速查**:
+
+| 症状 | 原因 | 修复 |
+|------|------|------|
+| `RuntimeError: module compiled against ABI version 0x1000009 but this version of numpy is 0x2000000` | numpy 2.x,paddlepaddle 2.x 不兼容 | `pip install 'numpy<2.0'` + `pip install --force-reinstall --no-deps paddlepaddle==2.6.2 paddleocr==2.7.3` |
+| `run_union.ps1 -UseGpu` precheck OK 但 worker 起来就崩 | 同上 | 同上 |
+| `requirements-paddleocr.txt` install 拉了一堆 2026 年版本的 scipy / Pillow / shapely | 没钉传递依赖 | 已经在 requirements-paddleocr.txt 里钉好,只需 `git pull` 后重装 |
+| venv 已经存在,半新半旧 | 老 pin 还在,新 pin 没生效 | 删 venv 重建(最干净) |
+| Win11 上 `numpy` 已经 2.x,**但你装了 paddlepaddle-gpu** | numpy 2.x 的 wheel 跟 paddlepaddle-gpu 2.6.2 也不兼容 | 同上,降 numpy 后还要重装 paddlepaddle-gpu |
+
+**为什么不在 `requirements.txt` 也钉?** 只有 `paddleocr` 这一条依赖链会拉 numpy>=2 包的传递依赖(具体是 `imgaug -> scipy`)。core 工具(`text_extractor` / `pdf_organize`)完全不用 paddleocr,不需要传递 pin。在 `requirements-paddleocr.txt` 里钉就够了。
+
+## 五、CSV 准备
+
 ## 五、CSV 准备
 
 CSV 必须有一列叫 `电缆编号`（含表头），UTF-8 或 UTF-8-BOM 编码。例：

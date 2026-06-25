@@ -153,13 +153,41 @@ if [ "$SKIP_PADDLE" = "0" ]; then
             echo "Fix:" >&2
             echo "    <myenv>/bin/pip install 'numpy<2.0'" >&2
             echo "" >&2
-            echo "(requirements.txt already pins numpy<2.0, but if you installed" >&2
-            echo " paddleocr before that pin, the cached wheel may still be numpy 2.x." >&2
-            echo " A 'pip install --force-reinstall --no-deps paddlepaddle==2.6.2'" >&2
-            echo " then 'pip install -r requirements.txt' is the nuclear option.)" >&2
+            echo "(requirements-paddleocr.txt now pins numpy<2.0 + scipy<1.15 +" >&2
+            echo " scikit-image<0.25 + matplotlib<3.10 + shapely<2.1 + Pillow<11 +" >&2
+            echo " pdf2docx<0.5.10 + imgaug==0.4.0 to block all the numpy>=2.0-only" >&2
+            echo " transitive deps. If you installed paddleocr before these pins," >&2
+            echo " the cached wheel may still be numpy 2.x. Nuclear option:" >&2
+            echo "    pip install --force-reinstall 'numpy<2.0'" >&2
+            echo "    pip install --force-reinstall --no-deps paddlepaddle==2.6.2 paddleocr==2.7.3)" >&2
         else
             echo "Run: <myenv>/bin/pip install -r requirements-paddleocr.txt" >&2
         fi
+        exit 1
+    fi
+    # NumPy precheck: paddlepaddle 2.6.2 requires numpy<2.0 (1.x ABI).
+    # Even if paddleocr import succeeded above, the precheck at runtime
+    # in cable_match.py will also catch this. We warn here so users see
+    # the issue BEFORE launching 1000s of PDFs only to fail at first OCR.
+    PADDLE_NUMPY_VER="$("$PADDLE_PY" -c "import numpy; print(numpy.__version__)" 2>&1)"
+    if echo "$PADDLE_NUMPY_VER" | grep -qE '^(2\.|3\.)'; then
+        echo "ERROR: paddleocr venv has numpy $PADDLE_NUMPY_VER, but paddlepaddle 2.6.2" >&2
+        echo "       requires numpy<2.0 (1.x C ABI). This will fail at the first OCR" >&2
+        echo "       call with:" >&2
+        echo "         RuntimeError: module compiled against ABI version 0x1000009 but" >&2
+        echo "                       this version of numpy is 0x2000000" >&2
+        echo "" >&2
+        echo "Fix:" >&2
+        echo "    $(dirname "$PADDLE_PY")/pip install --force-reinstall 'numpy<2.0'" >&2
+        echo "" >&2
+        echo "Then also reinstall the paddle stack to rebuild its C extensions against" >&2
+        echo "the downgraded numpy:" >&2
+        echo "    $(dirname "$PADDLE_PY")/pip install --force-reinstall --no-deps paddlepaddle==2.6.2 paddleocr==2.7.3" >&2
+        echo "" >&2
+        echo "If you upgraded to paddlepaddle-gpu for GPU, also reinstall that:" >&2
+        echo "    pip uninstall -y paddlepaddle" >&2
+        echo "    pip install paddlepaddle-gpu==2.6.2 -f https://www.paddlepaddle.org.cn/whl/<linux|windows>/<cu117|cu118|cu123>[/noavx]" >&2
+        echo "    pip install --force-reinstall --no-deps paddlepaddle-gpu paddleocr==2.7.3" >&2
         exit 1
     fi
     PADDLE_VENV_DIR=$(dirname "$PADDLE_PY")

@@ -132,6 +132,40 @@ A `pip install --force-reinstall --no-deps paddlepaddle==2.6.2` then
         }
         Write-Error "paddleocr import failed. Output:`n$paddleCheckStr$hint"
     }
+
+    # NumPy precheck: paddlepaddle 2.6.2 requires numpy<2.0 (1.x ABI).
+    # Even if paddleocr import succeeded above, the precheck at runtime
+    # in cable_match.py will also catch this. We warn here so users see
+    # the issue BEFORE launching 1000s of PDFs only to fail at first OCR.
+    $numpyVer = & $pythonExe -c "import numpy; print(numpy.__version__)" 2>&1
+    $numpyVerStr = ($numpyVer | Out-String).Trim()
+    if ($numpyVerStr -match '^[23]\.') {
+        $numpyHint = @"
+
+ERROR: paddleocr venv has numpy $numpyVerStr, but paddlepaddle 2.6.2
+       requires numpy<2.0 (1.x C ABI). This will fail at the first OCR
+       call with:
+
+         RuntimeError: module compiled against ABI version 0x1000009 but
+                       this version of numpy is 0x2000000
+
+Fix:
+
+    myenv\Scripts\pip install --force-reinstall 'numpy<2.0'
+
+Then also reinstall the paddle stack to rebuild its C extensions against
+the downgraded numpy:
+
+    myenv\Scripts\pip install --force-reinstall --no-deps paddlepaddle==2.6.2 paddleocr==2.7.3
+
+If you upgraded to paddlepaddle-gpu for GPU, also reinstall that:
+
+    myenv\Scripts\pip uninstall -y paddlepaddle
+    myenv\Scripts\pip install paddlepaddle-gpu==2.6.2 -f https://www.paddlepaddle.org.cn/whl/windows/cu117/noavx
+    myenv\Scripts\pip install --force-reinstall --no-deps paddlepaddle-gpu paddleocr==2.7.3
+"@
+        Write-Error $numpyHint
+    }
 }
 
 # === GPU precheck (only when -UseGpu is set and at least one PaddleOCR stage runs) ===

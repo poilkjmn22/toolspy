@@ -51,6 +51,19 @@ A bash wrapper at the repo root `./toolspy` does the same as `python -m tools` b
   ```
 - **`requirements.txt` is now complete.** As of the latest update it includes all pip deps the tools need: `lxml`, `pillow`, `python-docx`, `typing_extensions`, `pdfplumber`, `openpyxl`, `xlrd`, `pytesseract`, `aiohttp`, `numpy<2.0`, `python-Levenshtein==0.25.1`. `pypdfium2` is a transitive dep of `pdfplumber` (>=4.18.0) so it installs automatically. **System-level**: Tesseract must be on PATH for `text-extractor --ocr` and `pdf-organize` on scanned PDFs (see Tesseract note below). `python-Levenshtein` is used by `cable_match.py` for the experimental Levenshtein fuzzy tier (off by default).
 - **NumPy must stay < 2.0** for the paddleocr 2.x stack (`paddlepaddle 2.6.2` + `paddleocr 2.7.3`). Those C extensions are compiled against NumPy 1.x ABI; NumPy 2.0 changed the C ABI (now `0x2000000` instead of `0x1000009`) and these extensions refuse to load. Symptoms: `ImportError: numpy.core.multiarray failed to import` or `RuntimeError: module compiled against ABI version 0x1000009 but this version of numpy is 0x2000000`. `requirements.txt` pins `numpy<2.0` to prevent this. If you hit it, `pip install 'numpy<2.0'` then `pip install --force-reinstall --no-deps paddlepaddle==2.6.2 paddleocr==2.7.3`. **The paddleocr 3.x stack (paddleocr 3.0+ + paddlepaddle 3.0+) does NOT have this restriction** — it runs fine on NumPy 2.x.
+- **Transitive-dep pins in `requirements-paddleocr.txt` to block numpy-2-only versions.** `paddleocr 2.7.3` doesn't pin `scipy`/`matplotlib`/`shapely`/`scikit-image`/`Pillow`/`pdf2docx`/`imgaug`, so pip may resolve them to 2026-versions that hard-require `numpy>=2.0` and silently upgrade numpy to 2.x — breaking paddlepaddle. `requirements-paddleocr.txt` pins all the offenders to their last numpy-1.x-compatible major:
+
+  | package | cap | first numpy-2-only version | cap reason |
+  |---------|-----|-----------------------------|-----------|
+  | `scipy` | `<1.15` | `1.15+` requires `numpy>=2.0` | pulled by `imgaug -> scipy` |
+  | `scikit-image` | `<0.25` | `0.25+` requires `numpy>=2.0` | pulled by `paddleocr` |
+  | `matplotlib` | `<3.10` | `3.10+` requires `numpy>=2.0` | pulled by `scikit-image` |
+  | `shapely` | `<2.1` | `2.1+` requires `numpy>=2.0` | pulled by `paddleocr` |
+  | `Pillow` | `<11` | `12+` requires `numpy>=2.0` | pulled by `paddleocr` |
+  | `pdf2docx` | `<0.5.10` | `0.5.10+` requires `Py3.10+` AND pulls newer scipy | pulled by `paddleocr` |
+  | `imgaug` | `==0.4.0` | (last release) | pulls `scipy`; cap above covers |
+
+  Removing any of these caps is fine IF you also upgrade to the paddleocr 3.x + paddlepaddle 3.x stack. The 2.x stack is permanently tied to NumPy 1.x because paddlepaddle 2.6.2 is the last release with the 2.x-compatible PaddlePaddle C extensions.
 - **`setup.py` `entry_points` is wrong.** It points at `tools:cli` (a package, not a module); would need `tools.cli:main`. Don't rely on `pip install -e .` for a working `toolspy` console command — use the bash wrapper or `python -m tools`.
 - **`text-extractor --ocr` and `pdf-organize` need Tesseract.** `text-extractor` on image-only PDFs yields empty `.txt` files unless you pass `--ocr`. `pdf-organize` on a scanned-PDF corpus will skip those PDFs unless Tesseract is on PATH. Install with `brew install tesseract tesseract-lang` (macOS) or `apt install tesseract-ocr tesseract-chi-sim` (Linux). The `chi_sim` (Simplified Chinese) language pack comes with `tesseract-lang`. The tools print a clear install hint if Tesseract is missing.
 

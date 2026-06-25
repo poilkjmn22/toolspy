@@ -31,6 +31,34 @@
 # macOS Apple Silicon note: paddlepaddle 2.6.2 has no GPU wheel for M-series;
 # use `--use_gpu` flag only on Linux/Windows with CUDA. CPU mode on Mac is
 # ~50-100ms/page, ~2-3x slower than Tesseract CPU. Win11 GPU ~5-10ms/page.
+#
+# === NumPy 1.x ABI pinning (CRITICAL for paddlepaddle 2.6.2) ===
+# paddlepaddle 2.6.2 / paddleocr 2.7.3 ship C extensions compiled against
+# NumPy 1.x ABI (0x1000009). NumPy 2.0 changed the C ABI's major version
+# (now 0x2000000) so these .pyd/.so files refuse to load:
+#     ImportError: numpy.core.multiarray failed to import
+#     RuntimeError: module compiled against ABI version 0x1000009 but
+#                   this version of numpy is 0x2000000
+#
+# When you `pip install -r requirements-paddleocr.txt` without pins, pip
+# resolver may pick the LATEST versions of transitive deps (scipy 1.18+,
+# scikit-image 0.25+, matplotlib 3.10+, Pillow 12+, shapely 2.1+, etc.)
+# which ALL hard-require numpy>=2.0. That contradicts paddlepaddle 2.6.2's
+# numpy<2.0 requirement, and pip will silently install numpy 2.x and
+# paddlepaddle will fail to load at runtime.
+#
+# The pins below block those numpy-2-only versions so pip keeps numpy 1.26.x.
+# If you want to upgrade to paddleocr 3.x + paddlepaddle 3.x, you can
+# remove these pins (the 3.x stack is numpy-2 compatible by design).
+
+numpy<2.0                  # paddlepaddle 2.x ABI compat (MUST be first)
+scipy<1.15                 # 1.15+ hard-requires numpy>=2.0
+scikit-image<0.25          # 0.25+ hard-requires numpy>=2.0
+matplotlib<3.10            # 3.10+ hard-requires numpy>=2.0
+shapely<2.1                # 2.1+ hard-requires numpy>=2.0
+Pillow<11                  # 12+ hard-requires numpy>=2.0
+pdf2docx<0.5.10            # 0.5.10+ requires Py3.10+ AND pulls scipy 1.15+
+imgaug==0.4.0              # only this release; pulls scipy but is OK with <1.15
 
 paddleocr==2.7.3
 paddlepaddle==2.6.2
