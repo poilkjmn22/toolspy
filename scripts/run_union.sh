@@ -52,19 +52,103 @@
 #   - Second run after all stages finish: produces full union
 #   - The merge is idempotent — re-running always reads the current CSVs.
 #
-# Mac notes:
-#   - Tesseract stages use myenv/ (Py3.9).
-#   - PaddleOCR stages use myenv312/ (Py3.12 + paddleocr).
-#   This script auto-switches venvs. Skip the PaddleOCR stages by passing
-#   ENGINE=tesseract.
+# Mac / Linux notes:
+#   - If you used `uv venv --python 3.12 .venv` (recommended), there is one
+#     venv with both Tesseract + PaddleOCR. This script auto-discovers it.
+#   - Legacy layout: Tesseract in myenv/ (Py3.9) + PaddleOCR in myenv312/
+#     (Py3.12 + paddleocr). The script auto-switches venvs per stage.
+#   - Both venv layouts are supported. Skip the PaddleOCR stages by passing
+#     ENGINE=tesseract.
+#   - Set TOOLSPY_VENV=/path/to/venv to point at a custom venv location.
 #
 # Win11 notes:
-#   - Both engines can live in the same venv (`pip install -r requirements.txt`
-#     + `pip install -r requirements-paddleocr.txt`).
+#   - Both engines typically live in the same venv (`pip install -r
+#     requirements.txt` + `pip install -r requirements-paddleocr.txt`).
 #   - Set ENGINE=mixed (default) on Win11 to run all 6 stages.
 #   - Set ENGINE=tesseract to skip PaddleOCR stages.
+#   - The same venv-discovery logic works on Windows: it tries both
+#     `bin/python` (Unix) and `Scripts/python.exe` (Windows).
 
 set -e
+# === venv discovery helpers (defined up front; $REPO is read lazily) ===
+# Venv locations to probe, in priority order. We test each in turn:
+#   1. .venv/         — uv default (uv venv --python 3.12 .venv)
+#   2. venv/          — python -m venv default
+#   3. myenv312/      — Mac legacy (PaddleOCR stack, Py3.12)
+#   4. myenv/         — Mac legacy (Tesseract stack, Py3.9)
+
+# Pick the venv's python binary (handles Unix vs Windows layouts).
+venv_python() {
+    local venv_dir="$1"
+    if [ -x "$venv_dir/bin/python" ]; then
+        echo "$venv_dir/bin/python"
+    elif [ -x "$venv_dir/Scripts/python.exe" ]; then
+        echo "$venv_dir/Scripts/python.exe"
+    elif [ -x "$venv_dir/Scripts/python" ]; then
+        echo "$venv_dir/Scripts/python"
+    fi
+}
+
+# find_venv_for <want_engine> — return the absolute path of the python
+# binary inside the first venv that can `import <want_engine>`. The
+# `want` arg is a Python module name (e.g. "pytesseract" or "paddleocr").
+find_venv_for() {
+    local want="$1"
+    local py=""
+    local probed=()
+    local found_dir=""
+    local found_err=""
+    for d in \
+        "$REPO/.venv" \
+        "$REPO/venv" \
+        "$REPO/myenv312" \
+        "$REPO/myenv" \
+        "${TOOLSPY_VENV:-}"; do
+        [ -z "$d" ] && continue
+        probed+=("$d")
+        py="$(venv_python "$d")"
+        [ -z "$py" ] && continue
+        if "$py" -c "import $want" >/dev/null 2>&1; then
+            echo "$py"
+            return 0
+        else
+            # Save the LAST error in case we fail to find any venv.
+            found_err=$("$py" -c "import $want" 2>&1 | tail -1)
+            found_dir="$d"
+        fi
+    done
+    # None found — give a clear hint.
+    {
+        echo "ERROR: no venv found that has \"$want\" installed."
+        echo ""
+        echo "  Probed (in order):"
+        for d in "${probed[@]}"; do
+            echo "    - $d"
+        done
+        echo ""
+        if [ -n "$found_dir" ]; then
+            echo "  Last probe ($found_dir) error: $found_err"
+        fi
+        echo ""
+        echo "  To create one quickly with uv (recommended on Mac M-series or Linux):"
+        echo "    cd $REPO"
+        echo "    uv venv --python 3.12 .venv --seed"
+        echo "    source .venv/bin/activate"
+        echo "    pip install -r requirements.txt"
+        echo "    pip install -r requirements-paddleocr.txt"
+        echo ""
+        echo "  Or with python -m venv (no uv required):"
+        echo "    cd $REPO"
+        echo "    python3.12 -m venv .venv"
+        echo "    source .venv/bin/activate"
+        echo "    pip install -r requirements.txt"
+        echo "    pip install -r requirements-paddleocr.txt"
+        echo ""
+        echo "  The script auto-detects venvs named: .venv, venv, myenv312, myenv."
+        echo "  Set TOOLSPY_VENV=/path/to/venv to point at a custom location."
+    } >&2
+    return 1
+}
 
 # === Config ===
 WUHAN_DIR="${WUHAN_DIR:-/Users/fangqi-apple/Documents/work/nengzhong/wuhan/pdf}"
@@ -117,28 +201,38 @@ fi
 # PaddleOCR: required unless SKIP_PADDLE
 if [ "$SKIP_PADDLE" = "0" ]; then
     # Find a venv with paddleocr installed. On Mac, this is usually myenv312
-    # (Py3.12). On Win11, paddleocr is typically in the same myenv as
-    # Tesseract. We try a list of common locations.
+    # Find a venv with paddleocr installed. On Mac (uv venv), there's
+    # typically a single .venv/ that has both Tesseract and PaddleOCR.
+    # On Mac legacy (this script's earlier form), there were two venvs:
+    # myenv/ (Tesseract, Py3.9) + myenv312/ (PaddleOCR, Py3.12). On Win11,
+    # both engines typically share one venv. find_venv_for probes all
+    # common locations in priority order and returns the first match.
     PADDLE_PY=""
     PADDLE_ERR=""
-    for candidate in \
-        "$REPO/myenv/bin/python" \
-        "$REPO/myenv312/bin/python"; do
-        if [ -f "$candidate" ]; then
-            err_file="$(mktemp)"
-            if "$candidate" -c "import paddleocr" >"$err_file" 2>&1; then
-                rm -f "$err_file"
-                PADDLE_PY="$candidate"
-                break
-            else
-                # Save the LAST error so we can show it on hard-fail below.
-                PADDLE_ERR="$(tail -3 "$err_file")"
-                rm -f "$err_file"
-            fi
+    # Try to find a venv where paddleocr imports cleanly. If not, capture
+    # the most informative error from the last probe for the diagnostic.
+    for d in \
+        "$REPO/.venv" \
+        "$REPO/venv" \
+        "$REPO/myenv312" \
+        "$REPO/myenv" \
+        "${TOOLSPY_VENV:-}"; do
+        [ -z "$d" ] && continue
+        py="$(venv_python "$d")"
+        [ -z "$py" ] && continue
+        err_file="$(mktemp)"
+        if "$py" -c "import paddleocr" >"$err_file" 2>&1; then
+            rm -f "$err_file"
+            PADDLE_PY="$py"
+            break
+        else
+            # Save the LAST error so we can show it on hard-fail below.
+            PADDLE_ERR="$(tail -3 "$err_file")"
+            rm -f "$err_file"
         fi
     done
     if [ -z "$PADDLE_PY" ]; then
-        echo "ERROR: paddleocr import failed (tried myenv/ and myenv312/)." >&2
+        echo "ERROR: paddleocr import failed (tried .venv/, venv/, myenv312/, myenv/, $TOOLSPY_VENV)." >&2
         echo "       Last error: $PADDLE_ERR" >&2
         echo "" >&2
         if echo "$PADDLE_ERR" | grep -qE 'ABI version|compiled against ABI|numpy is 0x|numpy.core.multiarray failed to import'; then
@@ -151,7 +245,7 @@ if [ "$SKIP_PADDLE" = "0" ]; then
             echo "                  this version of numpy is 0x2000000" >&2
             echo "" >&2
             echo "Fix:" >&2
-            echo "    <myenv>/bin/pip install 'numpy<2.0'" >&2
+            echo "    <myenv-or-uv-venv>/bin/pip install 'numpy<2.0'" >&2
             echo "" >&2
             echo "(requirements-paddleocr.txt now pins numpy<2.0 + scipy<1.15 +" >&2
             echo " scikit-image<0.25 + matplotlib<3.10 + shapely<2.1 + Pillow<11 +" >&2
@@ -161,7 +255,12 @@ if [ "$SKIP_PADDLE" = "0" ]; then
             echo "    pip install --force-reinstall 'numpy<2.0'" >&2
             echo "    pip install --force-reinstall --no-deps paddlepaddle==2.6.2 paddleocr==2.7.3)" >&2
         else
-            echo "Run: <myenv>/bin/pip install -r requirements-paddleocr.txt" >&2
+            echo "Run: <myenv-or-uv-venv>/bin/pip install -r requirements-paddleocr.txt" >&2
+            echo "Or create a fresh venv with uv:" >&2
+            echo "    cd $REPO" >&2
+            echo "    uv venv --python 3.12 .venv --seed" >&2
+            echo "    source .venv/bin/activate" >&2
+            echo "    pip install -r requirements.txt -r requirements-paddleocr.txt" >&2
         fi
         exit 1
     fi
@@ -193,10 +292,45 @@ if [ "$SKIP_PADDLE" = "0" ]; then
     PADDLE_VENV_DIR=$(dirname "$PADDLE_PY")
 fi
 
-# Tesseract venv: myenv/ on Mac, same on Win11
-TESS_PY="$REPO/myenv/bin/python"
-if [ ! -f "$TESS_PY" ]; then
-    echo "ERROR: Tesseract venv not found at myenv/" >&2
+# Tesseract venv: same discovery logic as PaddleOCR. We try .venv/,
+# venv/, myenv312/, myenv/, and TOOLSPY_VENV in order — first one that
+# has pytesseract importable wins. On a fresh Mac with `uv venv .venv`
+# (single venv with both engines), this is the same path PADDLE_PY uses.
+TESS_PY=""
+for d in \
+    "$REPO/.venv" \
+    "$REPO/venv" \
+    "$REPO/myenv312" \
+    "$REPO/myenv" \
+    "${TOOLSPY_VENV:-}"; do
+    [ -z "$d" ] && continue
+    py="$(venv_python "$d")"
+    [ -z "$py" ] && continue
+    # Use pytesseract (the python wrapper) as the marker for "tesseract
+    # stack installed". pytesseract imports even when tesseract binary
+    # is missing, so we additionally check the binary on PATH below.
+    if "$py" -c "import pytesseract" >/dev/null 2>&1; then
+        TESS_PY="$py"
+        break
+    fi
+done
+if [ -z "$TESS_PY" ]; then
+    {
+        echo "ERROR: no venv found with pytesseract (Tesseract wrapper) installed."
+        echo "  Probed: .venv/, venv/, myenv312/, myenv/, $TOOLSPY_VENV"
+        echo ""
+        echo "  Quick setup with uv (Py3.12):"
+        echo "    cd $REPO"
+        echo "    uv venv --python 3.12 .venv --seed"
+        echo "    source .venv/bin/activate"
+        echo "    pip install -r requirements.txt"
+        echo "    pip install -r requirements-paddleocr.txt"
+        echo ""
+        echo "  Or with python -m venv:"
+        echo "    python3.12 -m venv .venv"
+        echo "    source .venv/bin/activate"
+        echo "    pip install -r requirements.txt -r requirements-paddleocr.txt"
+    } >&2
     exit 1
 fi
 
@@ -303,7 +437,8 @@ except Exception as e:
     sys.exit(3)
 PYEOF
         gpu_exit=$?
-        set -e
+set -e
+
         # Filter paddle's verbose GLOG noise; keep last 5 lines (real status).
         gpu_out="$(tail -5 "$gpu_out_file")"
         rm -f "$gpu_out_file"
