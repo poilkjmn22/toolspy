@@ -99,24 +99,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
   /* PDF list (middle pane) */
   #mid h2 { padding: 12px 16px; font-size: 13px; background: #f7f7f7; border-bottom: 1px solid #e0e0e0; }
   #mid h2 .count { color: #888; font-weight: normal; font-size: 12px; margin-left: 6px; }
-  .pdf-item { padding: 10px 16px; border-bottom: 1px solid #f0f0f0; cursor: pointer; }
+  .pdf-item { padding: 10px 16px; border-bottom: 1px solid #f0f0f0; cursor: pointer; display: flex; align-items: center; gap: 8px; }
   .pdf-item:hover { background: #f0f7ff; }
   .pdf-item.selected { background: #d0e8ff; }
+  .pdf-item .body { flex: 1; min-width: 0; }
   .pdf-item .name { font-weight: 500; word-break: break-all; }
   .pdf-item .cables { margin-top: 4px; font-size: 11px; color: #4dabf7; }
   .pdf-item .cables span { display: inline-block; background: #e7f3ff; padding: 1px 6px; border-radius: 3px; margin-right: 4px; }
   .pdf-item .meta { margin-top: 3px; font-size: 11px; color: #888; }
+  .pdf-item .preview-btn { flex-shrink: 0; padding: 5px 9px; background: #f0f7ff; border: 1px solid #4dabf7; border-radius: 4px; color: #1971c2; cursor: pointer; font-size: 14px; line-height: 1; }
+  .pdf-item .preview-btn:hover { background: #4dabf7; color: white; }
   .empty { padding: 40px 16px; text-align: center; color: #999; font-size: 13px; }
-  /* Right pane: PDF preview + OCR text */
-  #preview { flex: 1; background: #2a2a2a; display: flex; flex-direction: column; min-height: 0; }
-  #preview-toolbar { padding: 8px 12px; background: #1a1a2e; color: white; display: flex; align-items: center; gap: 12px; flex-shrink: 0; }
-  #preview-toolbar .filename { flex: 1; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  #preview-toolbar a { color: #4dabf7; text-decoration: none; font-size: 12px; }
-  #preview-toolbar a:hover { text-decoration: underline; }
-  #pdf-container { flex: 1; overflow: auto; text-align: center; padding: 12px; min-height: 0; background: #2a2a2a; }
-  #pdf-container canvas { box-shadow: 0 2px 12px rgba(0,0,0,0.5); margin: 0 auto; display: block; max-width: 100%; }
-  #pdf-fallback { width: 100%; height: 100%; border: none; background: white; display: none; }
-  #ocr-pane { height: 280px; background: white; border-top: 1px solid #ddd; display: flex; flex-direction: column; flex-shrink: 0; }
+  /* Right pane: now OCR-only (PDF preview is in the fullscreen modal below) */
+  #ocr-pane { flex: 1; background: white; display: flex; flex-direction: column; min-height: 0; }
   #ocr-tabs { display: flex; background: #f7f7f7; border-bottom: 1px solid #e0e0e0; flex-shrink: 0; }
   #ocr-tab { padding: 8px 16px; cursor: pointer; border-right: 1px solid #e0e0e0; font-size: 12px; }
   #ocr-tab.active { background: white; font-weight: 600; }
@@ -129,6 +124,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
   #right .placeholder { flex: 1; display: flex; align-items: center; justify-content: center; color: #999; font-size: 14px; }
   /* Loading */
   .loading { padding: 16px; text-align: center; color: #999; font-size: 12px; }
+  /* Fullscreen PDF preview modal */
+  #fs-modal { position: fixed; inset: 0; background: rgba(0,0,0,0.92); display: none; flex-direction: column; z-index: 1000; }
+  #fs-modal.show { display: flex; }
+  #fs-toolbar { padding: 8px 14px; background: #1a1a2e; color: white; display: flex; align-items: center; gap: 12px; flex-shrink: 0; }
+  #fs-toolbar .filename { flex: 1; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #fs-toolbar a { color: #4dabf7; text-decoration: none; font-size: 12px; }
+  #fs-toolbar a:hover { text-decoration: underline; }
+  #fs-toolbar button { background: #444; color: white; border: none; padding: 5px 12px; border-radius: 4px; cursor: pointer; font-size: 14px; }
+  #fs-toolbar button:hover { background: #666; }
+  #fs-canvas-wrap { flex: 1; overflow: auto; text-align: center; padding: 16px; background: #2a2a2a; min-height: 0; }
+  #fs-canvas { box-shadow: 0 2px 12px rgba(0,0,0,0.5); margin: 0 auto; display: block; max-width: 100%; }
+  #fs-fallback { width: 100%; height: 100%; border: none; background: white; display: none; }
+  #fs-page-nav { display: flex; align-items: center; gap: 8px; }
+  #fs-page-info { font-size: 12px; min-width: 60px; text-align: center; }
 </style>
 </head>
 <body>
@@ -145,7 +154,26 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div class="placeholder">← 从左侧选 cable 或 PDF</div>
   </div>
   <div id="right">
-    <div class="placeholder">← 选 PDF 看预览 + OCR 文本</div>
+    <div class="placeholder">← 选 PDF 看 OCR 文本</div>
+  </div>
+</div>
+
+<!-- Fullscreen PDF preview modal (only opened by the ⛶ button on each PDF row) -->
+<div id="fs-modal" role="dialog" aria-modal="true">
+  <div id="fs-toolbar">
+    <span class="filename" id="fs-filename">…</span>
+    <div id="fs-page-nav">
+      <button id="fs-prev" type="button">←</button>
+      <span id="fs-page-info">1 / ?</span>
+      <button id="fs-next" type="button">→</button>
+    </div>
+    <a id="fs-open" href="#" target="_blank">↗ 新窗口</a>
+    <a id="fs-download" href="#" download>⬇ 下载</a>
+    <button id="fs-close" type="button">✕ 关闭</button>
+  </div>
+  <div id="fs-canvas-wrap">
+    <canvas id="fs-canvas"></canvas>
+    <iframe id="fs-fallback" src="about:blank"></iframe>
   </div>
 </div>
 
@@ -259,34 +287,49 @@ function renderMidPane() {
     html += visible.map(p => {
       const cables = (p.cables || []).filter(c => c !== cable);
       const otherCables = cables.length ? `<div class="cables">${cables.map(c => `<span>${c}</span>`).join('')}</div>` : '';
-      return `<div class="pdf-item${state.selectedPath === p.pdf_rel_path ? ' selected' : ''}" data-path="${encodeURIComponent(p.pdf_rel_path)}">
-        <div class="name">${p.pdf_rel_path}</div>
-        ${otherCables}
-        <div class="meta">${fmtSize(p.pdf_size)} · ${p.content_hash.slice(0, 12)}</div>
+      const encPath = encodeURIComponent(p.pdf_rel_path);
+      return `<div class="pdf-item${state.selectedPath === p.pdf_rel_path ? ' selected' : ''}" data-path="${encPath}">
+        <div class="body">
+          <div class="name">${p.pdf_rel_path}</div>
+          ${otherCables}
+          <div class="meta">${fmtSize(p.pdf_size)} · ${p.content_hash.slice(0, 12)}</div>
+        </div>
+        <button class="preview-btn" type="button" data-fs-path="${encPath}" title="全屏预览 PDF">⛶</button>
       </div>`;
     }).join('');
   }
   $('mid').innerHTML = html;
+  // Whole-row click → load OCR; fullscreen button → open modal preview
   $('mid').querySelectorAll('.pdf-item').forEach(el => {
-    el.onclick = () => selectPdf(decodeURIComponent(el.dataset.path));
+    el.onclick = (ev) => {
+      // Ignore clicks that originated on the preview button (button handler
+      // stops propagation; this is a defensive double-check).
+      if (ev.target.closest('.preview-btn')) return;
+      selectPdf(decodeURIComponent(el.dataset.path));
+    };
+  });
+  $('mid').querySelectorAll('.preview-btn').forEach(btn => {
+    btn.onclick = (ev) => {
+      ev.stopPropagation();
+      openFullscreenPreview(decodeURIComponent(btn.dataset.fsPath));
+    };
   });
 }
 
-// ====== right pane: PDF preview + OCR text ======
+// ====== right pane: OCR-only (PDF preview moved to fullscreen modal) ======
 async function selectPdf(pdfRelPath) {
   state.selectedPath = pdfRelPath;
   renderMidPane(); // refresh highlight
-  // Highlight in tree too (find which cable owns this PDF)
   await renderRightPane();
 }
 
 async function renderRightPane() {
   const path = state.selectedPath;
   if (!path) {
-    $('right').innerHTML = '<div class="placeholder">← 选 PDF 看预览 + OCR 文本</div>';
+    $('right').innerHTML = '<div class="placeholder">← 选 PDF 看 OCR 文本</div>';
     return;
   }
-  $('right').innerHTML = '<div class="loading">加载 PDF…</div>';
+  $('right').innerHTML = '<div class="loading">加载 OCR…</div>';
   let detail;
   try {
     detail = await api(`/api/pdf?path=${encodeURIComponent(path)}`);
@@ -296,41 +339,25 @@ async function renderRightPane() {
   }
   state.pdfDetail = detail;
   const ocrText = detail.ocr_text || '';
-  const ocrHeader = ocrText.split('\n', 1)[0] || '';
   const engine = (detail.ocr_rows && detail.ocr_rows[0] && detail.ocr_rows[0].ocr_engine) || 'tesseract';
   const lang = (detail.ocr_rows && detail.ocr_rows[0] && detail.ocr_rows[0].ocr_lang) || '';
   const dpi = (detail.ocr_rows && detail.ocr_rows[0] && detail.ocr_rows[0].ocr_dpi) || '';
   const allCables = detail.cables || [];
-  // Build PDF.js preview URL
-  const pdfUrl = `/file?path=${encodeURIComponent(path)}`;
-  // Highlight OCR text with cables
   const highlighted = highlightCables(ocrText, allCables);
   $('right').innerHTML = `
-    <div id="preview">
-      <div id="preview-toolbar">
-        <span class="filename">${path}</span>
-        <a href="${pdfUrl}" target="_blank">↗ 新窗口</a>
-        <a href="${pdfUrl}" download>⬇ 下载</a>
-      </div>
-      <div id="pdf-container">
-        <canvas id="pdf-canvas"></canvas>
-        <iframe id="pdf-fallback" src="${pdfUrl}#toolbar=0"></iframe>
-      </div>
-    </div>
     <div id="ocr-pane">
       <div id="ocr-meta">
         <b>${path}</b> · ${fmtSize(detail.pdf_size)} · hash ${detail.content_hash.slice(0, 12)} ·
         OCR via ${engine} ${lang ? `(${lang})` : ''} ${dpi ? `@ ${dpi} dpi` : ''} ·
         cables: ${allCables.map(c => `<mark class="cable-exact">${c}</mark>`).join(' ')}
-      </div>
-      <div id="ocr-tabs">
-        <div id="ocr-tab" class="active">📝 OCR 文本</div>
+        <button type="button" class="preview-btn" data-fs-path="${encodeURIComponent(path)}" style="float:right;margin-left:8px;" title="全屏预览 PDF">⛶ PDF</button>
       </div>
       <div id="ocr-text">${highlighted}</div>
     </div>
   `;
-  // Render PDF.js (or fall back to <iframe>)
-  renderPdf(pdfUrl);
+  // Hook the inline OCR-pane preview button (same handler as the row button).
+  const btn = $('right').querySelector('.preview-btn');
+  if (btn) btn.onclick = () => openFullscreenPreview(decodeURIComponent(btn.dataset.fsPath));
 }
 
 function highlightCables(text, cables) {
@@ -356,15 +383,51 @@ function escapeRegex(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-// ====== PDF.js render ======
-async function renderPdf(url) {
-  const container = $('pdf-container');
-  const canvas = $('pdf-canvas');
-  const iframe = $('pdf-fallback');
+// ====== Fullscreen PDF preview modal ======
+// Opened by the ⛶ button on each PDF row (or the inline button in the
+// OCR-pane header). Closes on Esc / ✕ button / backdrop click.
+function openFullscreenPreview(pdfRelPath) {
+  const url = `/file?path=${encodeURIComponent(pdfRelPath)}`;
+  $('fs-filename').textContent = pdfRelPath;
+  $('fs-open').href = url;
+  $('fs-download').href = url;
+  $('fs-page-info').textContent = '加载…';
+  $('fs-canvas').style.display = 'block';
+  $('fs-fallback').style.display = 'none';
+  $('fs-fallback').src = 'about:blank';
+  $('fs-modal').classList.add('show');
+  state._fsCurrentPath = pdfRelPath;
+  renderPdfInModal(url);
+}
+
+function closeFullscreenPreview() {
+  $('fs-modal').classList.remove('show');
+  // Drop the page 1 canvas so the next open starts clean.
+  const canvas = $('fs-canvas');
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  state._pdfjsDoc = null;
+  state._fsCurrentPath = null;
+}
+
+// Close on Esc / backdrop click
+$('fs-modal').addEventListener('click', (ev) => {
+  if (ev.target.id === 'fs-modal') closeFullscreenPreview();
+});
+$('fs-close').addEventListener('click', closeFullscreenPreview);
+document.addEventListener('keydown', (ev) => {
+  if (ev.key === 'Escape' && $('fs-modal').classList.contains('show')) {
+    closeFullscreenPreview();
+  }
+});
+
+// ====== PDF.js render (in modal canvas) ======
+async function renderPdfInModal(url) {
+  const canvas = $('fs-canvas');
+  const iframe = $('fs-fallback');
   // Try PDF.js from CDN
   if (!window.pdfjsLib) {
     try {
-      // pdfjs-dist 4.x ESM
       const pdfjs = await import('https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.min.mjs');
       pdfjs.GlobalWorkerOptions.workerSrc = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.worker.min.mjs';
       window.pdfjsLib = pdfjs;
@@ -372,6 +435,9 @@ async function renderPdf(url) {
       // Fallback to <iframe>
       canvas.style.display = 'none';
       iframe.style.display = 'block';
+      iframe.src = url + '#toolbar=0';
+      $('fs-page-info').textContent = 'iframe';
+      $('fs-prev').disabled = $('fs-next').disabled = true;
       return;
     }
   }
@@ -380,47 +446,57 @@ async function renderPdf(url) {
     const loadingTask = pdfjs.getDocument(url);
     const pdf = await loadingTask.promise;
     state._pdfjsDoc = pdf;
-    await renderPage(1);
-    // page navigation
-    const tb = $('preview-toolbar');
-    if (!document.getElementById('pdf-page-nav')) {
-      const nav = document.createElement('div');
-      nav.id = 'pdf-page-nav';
-      nav.style.cssText = 'display:flex;align-items:center;gap:6px;';
-      nav.innerHTML = `
-        <button id="pdf-prev" style="background:#444;color:white;border:none;padding:4px 10px;border-radius:3px;cursor:pointer;">←</button>
-        <span id="pdf-page-info" style="font-size:12px;">1 / ${pdf.numPages}</span>
-        <button id="pdf-next" style="background:#444;color:white;border:none;padding:4px 10px;border-radius:3px;cursor:pointer;">→</button>
-      `;
-      tb.appendChild(nav);
-      $('pdf-prev').onclick = () => renderPage(state._currentPage - 1);
-      $('pdf-next').onclick = () => renderPage(state._currentPage + 1);
-    }
-    $('pdf-page-info').textContent = `1 / ${pdf.numPages}`;
+    $('fs-prev').disabled = $('fs-next').disabled = (pdf.numPages <= 1);
+    await renderFsPage(1);
   } catch (e) {
     canvas.style.display = 'none';
     iframe.style.display = 'block';
+    iframe.src = url + '#toolbar=0';
+    $('fs-page-info').textContent = 'iframe (PDF.js 失败)';
+    $('fs-prev').disabled = $('fs-next').disabled = true;
   }
 }
 
-async function renderPage(n) {
+async function renderFsPage(n) {
   const pdf = state._pdfjsDoc;
   if (!pdf) return;
   n = Math.max(1, Math.min(n, pdf.numPages));
   state._currentPage = n;
   const page = await pdf.getPage(n);
-  const container = $('pdf-container');
-  const containerWidth = container.clientWidth - 24;
+  const wrap = $('fs-canvas-wrap');
+  const wrapWidth = wrap.clientWidth - 32;        // padding
   const baseViewport = page.getViewport({ scale: 1 });
-  const scale = Math.min(2.0, containerWidth / baseViewport.width);
+  // Cap scale at 2x so big PDFs don't render > 2x screen width
+  const scale = Math.min(2.0, Math.max(0.5, wrapWidth / baseViewport.width));
   const viewport = page.getViewport({ scale });
-  const canvas = $('pdf-canvas');
+  const canvas = $('fs-canvas');
   const ctx = canvas.getContext('2d');
   canvas.width = viewport.width;
   canvas.height = viewport.height;
   await page.render({ canvasContext: ctx, viewport }).promise;
-  $('pdf-page-info').textContent = `${n} / ${pdf.numPages}`;
+  $('fs-page-info').textContent = `${n} / ${pdf.numPages}`;
 }
+
+$('fs-prev').addEventListener('click', () => renderFsPage(state._currentPage - 1));
+$('fs-next').addEventListener('click', () => renderFsPage(state._currentPage + 1));
+
+// ====== search filter ======
+$('search').addEventListener('input', (e) => {
+  state.filter = e.target.value.trim();
+  renderTree();
+  if (state.selectedCable) renderMidPane();
+});
+
+// ====== init ======
+(async function init() {
+  try {
+    await loadSummary();
+    await loadCables();
+    $('tree-status').remove();
+  } catch (e) {
+    $('tree-status').textContent = '加载失败: ' + e.message;
+  }
+})();
 
 // ====== search filter ======
 $('search').addEventListener('input', (e) => {
