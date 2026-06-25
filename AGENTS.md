@@ -36,6 +36,7 @@ A bash wrapper at the repo root `./toolspy` does the same as `python -m tools` b
 | `text-extractor` | `tools.text_extractor`    | PDF/XLS/XLSX → .txt extraction; originals untouched; per-file default, `--combine` for single .txt; `--ocr` for scanned/image-only PDFs |
 | `pdf-organize`  | `tools.pdf_organize`      | Find PDFs containing a target string; copy/move matches to a new folder named after the target; recursive scan; OCR-aware |
 | `process-xlsx-row` | `tools.process_xlsx_row` | Highlight xlsx rows that match a boolean expression (`& \| ! ()`) of cell rules. Rules defined in JSON (`--rules-file`) and/or Python (`--rules-script`); built-in matchers: `equals`, `contains`, `startswith`, `endswith`, `regex`; color by name (`yellow`) or hex (`#FFFF00` / `AARRGGBB`). Default writes `<input>_colored.xlsx`; `--in-place` to overwrite |
+| `cable-match-viewer` | `tools.cable_match_viewer` | Web UI to browse a single stage's `cable_match_state.json` + `cable_match_cache.db`. 3-pane UI: cable tree (natural-sorted, matched first) → PDFs under cable → PDF.js preview + OCR text with cable-highlighted matches. Default port 8003. Path-traversal defense on `/file?path=` (must be in state.json processed list). See `cable_match_guide.md` for usage. |
 
 ## Add a new tool
 

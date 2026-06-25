@@ -32,6 +32,10 @@ TOOLS = {
         'module': 'tools.process_xlsx_row',
         'help': 'Highlight xlsx rows that match a boolean expression of cell rules',
     },
+    'cable-match-viewer': {
+        'module': 'tools.cable_match_viewer',
+        'help': 'Web UI to browse cable_match_state.json + cache.db: cable tree + OCR preview',
+    },
 }
 
 

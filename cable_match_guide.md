@@ -766,3 +766,54 @@ myenv/bin/python scripts/cable_match.py \
     --input ~/Documents/work/nengzhong/wuhan/pdf \
     --workers 6 --resume auto
 ```
+
+## 十二、用浏览器查看 OCR 缓存 (`cable-match-viewer`)
+
+跑完 cable_match pipeline 后,你会有一个 `.cable_match_state.json`(记录了哪个 PDF 匹配了哪个 cable)+ 一个 `.cable_match_cache.db`(记录了每个 PDF 的完整 OCR 文本)。如果想直观浏览、复查、对比 OCR 结果,可以启动内置的 `cable-match-viewer`:
+
+```bash
+# 启动 viewer(默认 127.0.0.1:8003)
+myenv/bin/python -m tools cable-match-viewer \
+    --state /path/to/.stage_chieng_tess/.cable_match_state.json \
+    --cache /path/to/.stage_chieng_tess/.cable_match_cache.db
+# 打开 http://localhost:8003
+```
+
+### 三个面板
+
+| 面板 | 内容 |
+|------|------|
+| 左侧 (cable 树) | 按 cable 分组的反向索引。✅ 已匹配(cable 编号 → 这个 cable 匹配的所有 PDF 列表);⬜ 未匹配(本 stage 没找到 PDF 的 cable,从 targets CSV 拉来,自然排序) |
+| 中间 (PDF 列表) | 当前选中的 cable 下所有 PDF。每个 PDF 显示:文件名 + 自身匹配的所有其他 cable(蓝色 chip)+ 大小 + hash 摘要 |
+| 右侧 (PDF 预览 + OCR) | 顶部:PDF.js 渲染原 PDF(上一页/下一页/在新窗口打开/下载)。底部:OCR 文本(已用 `<mark>` 高亮所有该 PDF 匹配的 cable 编号) |
+
+### 搜索框
+
+顶栏搜索框实时过滤左侧树(按 cable 编号)和中间 PDF 列表(按文件名)。例如输 `3B-50` 就只看 3B-500 ~ 3B-509 这几个 cable。
+
+### 文件流(已加安全防护)
+
+`/file?path=<rel_path>` 返回磁盘上的原始 PDF,供 PDF.js 加载。**`rel_path` 必须在 state.json 的 `processed` 列表里**,否则返回 404。具体的 `viewer.resolve_pdf_path()` 还会 resolve 绝对路径后校验必须落在 `input_root` 之下,防止 `../../../etc/passwd` 这类路径遍历。
+
+### 一行命令完成 state + cache 配套
+
+跑完 6 stages 后,所有 stage 各自有一个 cache.db + state.json。`merge_5stage_matches.py` 合并的 `_matches.csv` + `_matched_pdfs/` 是另一套,viewer 暂时**只支持单 stage**。要查 union 结果,直接看顶层的 `_matches.csv` 或者给任一 stage 启动 viewer。
+
+### 常用参数
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `-l / --listen` | `8003` | 端口(避开 text-sync=8000、file-share=8001、llm-chat=8002) |
+| `-b / --bind` | `127.0.0.1` | 监听地址。LAN 访问改为 `0.0.0.0` |
+| `--state` | (必填) | 哪个 stage 的 `.cable_match_state.json` |
+| `--cache` | (必填) | 哪个 stage 的 `.cable_match_cache.db` |
+| `--input-root` | state.json 里的 `input` 字段 | PDF 根目录(原 PDF 在磁盘上)。如果 state.json 的 `input` 路径对不上,显式覆盖 |
+
+### 已知限制
+
+- **只支持单 stage**:viewer 接受一个 state.json。如果要看 union 结果,目前需要手动 merge;后续会增加 `--stage-dir` 多 stage 联合模式。
+- **state.json 编码**:viewer 自动尝试 UTF-8 / cp936 / gb18030 读取(Win11 PowerShell 默认写 cp936),但**只读你给的那一个文件**。要把多 stage 合并后给 viewer 看,先跑 `merge_5stage_matches.py` 合并 `_matches.csv`,然后用任一 stage 的 cache.db + state.json 启动 viewer(state.json 提供 PDF ↔ cable 映射,cache.db 提供 OCR 文本,这两个关系在 stage 内是自洽的)。
+- **OCR 文本是 cache.db 里的 raw 输出**:`text-extractor` 输出的格式是 `# Extracted from <name> by text-extractor (OCR via <engine>, lang=..., dpi=..., preprocess=..., psm=..., oem=...)\n\n=== Page 1 ===\n\n<text>...`,viewer 不去掉这行 header,直接显示(还能顺便看 OCR 用了什么 engine + 什么 dpi)。如果你想跑实时重新匹配,在 viewer 里搜文本找 cable 编号就行,没有实时重新算。
+- **大 PDF 预览**:PDF.js 客户端流式渲染,server 端不占内存(用 `web.FileResponse` 分块送字节流)。但**首次加载 PDF.js + 渲染第一页** 在 Win11 Chrome 上要 1-2 秒。
+- **PDF.js CDN 离线**:viewer 在 `import('https://cdn.jsdelivr.net/...')` 失败时降级到 `<iframe src="/file?...">`,浏览器原生 PDF viewer 接管(Mac Chrome / Edge / Win Chrome / Edge 都内置)。
+- **路径遍历防护**:白名单 + 路径 resolve 后 `relative_to(input_root)`,双重保险。详见 `viewer.py::resolve_pdf_path()`。
