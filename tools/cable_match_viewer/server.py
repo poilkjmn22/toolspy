@@ -138,6 +138,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
   #fs-fallback { width: 100%; height: 100%; border: none; background: white; display: none; }
   #fs-page-nav { display: flex; align-items: center; gap: 8px; }
   #fs-page-info { font-size: 12px; min-width: 60px; text-align: center; }
+  #fs-zoom-nav { display: flex; align-items: center; gap: 4px; padding-left: 8px; border-left: 1px solid #444; margin-left: 4px; }
+  #fs-zoom-nav button { min-width: 32px; padding: 5px 8px; }
+  #fs-zoom-info { font-size: 12px; min-width: 48px; text-align: center; color: #ccc; }
+  /* Active-cable tag in the toolbar */
+  #fs-cable-tag { padding: 3px 10px; background: #ffd43b; color: #5c4400; border-radius: 12px; font-size: 12px; font-weight: 600; }
+  #fs-cable-tag #fs-cable-tag-name { font-family: 'SF Mono', Menlo, Consolas, monospace; }
+  /* Cable number floating overlay on the canvas (top-right) */
+  #fs-cable-overlay { position: absolute; top: 8px; right: 8px; max-width: 60%; padding: 4px 10px; background: rgba(255, 212, 59, 0.92); color: #5c4400; border-radius: 4px; font-size: 12px; font-weight: 600; font-family: 'SF Mono', Menlo, Consolas, monospace; pointer-events: none; box-shadow: 0 1px 4px rgba(0,0,0,0.4); }
 </style>
 </head>
 <body>
@@ -162,17 +170,28 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <div id="fs-modal" role="dialog" aria-modal="true">
   <div id="fs-toolbar">
     <span class="filename" id="fs-filename">…</span>
+    <span id="fs-cable-tag" style="display:none;">🔍 <span id="fs-cable-tag-name"></span></span>
     <div id="fs-page-nav">
       <button id="fs-prev" type="button">←</button>
       <span id="fs-page-info">1 / ?</span>
       <button id="fs-next" type="button">→</button>
+    </div>
+    <div id="fs-zoom-nav">
+      <button id="fs-zoom-out" type="button" title="缩小">−</button>
+      <button id="fs-zoom-fit" type="button" title="适合宽度">Fit</button>
+      <button id="fs-zoom-100" type="button" title="100%">100%</button>
+      <button id="fs-zoom-in" type="button" title="放大">+</button>
+      <span id="fs-zoom-info">100%</span>
     </div>
     <a id="fs-open" href="#" target="_blank">↗ 新窗口</a>
     <a id="fs-download" href="#" download>⬇ 下载</a>
     <button id="fs-close" type="button">✕ 关闭</button>
   </div>
   <div id="fs-canvas-wrap">
-    <canvas id="fs-canvas"></canvas>
+    <div id="fs-page-wrap" style="position:relative; display:inline-block;">
+      <canvas id="fs-canvas"></canvas>
+      <div id="fs-cable-overlay" style="display:none;"></div>
+    </div>
     <iframe id="fs-fallback" src="about:blank"></iframe>
   </div>
 </div>
@@ -186,6 +205,14 @@ const state = {
   selectedPath: null,
   filter: '',            // search text
   pdfjsReady: false,
+  // ===== Fullscreen preview state =====
+  _pdfjsDoc: null,       // currently open PDF.js document (or null)
+  _currentPage: 1,       // 1-indexed page in the modal
+  _fsCurrentPath: null,  // pdf_rel_path of the open modal
+  _fsFitScale: 1.0,      // computed fit-to-width scale for the open page
+  _fsZoom: null,         // user-set scale (number) or null = fit-to-width
+  _fsMatchPage: null,    // page number where the active cable was found (1-indexed), or null
+  _fsMatchBoxes: [],      // [{x, y, w, h}] on current page where active cable number appears
 };
 
 const $ = (id) => document.getElementById(id);
@@ -386,6 +413,128 @@ function escapeRegex(s) {
 // ====== Fullscreen PDF preview modal ======
 // Opened by the ⛶ button on each PDF row (or the inline button in the
 // OCR-pane header). Closes on Esc / ✕ button / backdrop click.
+//
+// Active-cable highlight: when the user opened the modal from a row that
+// belongs to state.selectedCable (and the cable number can be matched
+// in the PDF's text content), we (a) show a yellow chip in the toolbar,
+// (b) auto-jump to the first page where the cable number appears, and
+// (c) draw a red rectangle on that page around each occurrence.
+//
+// Zoom: state._fsZoom is the user-set scale; null means "fit to width".
+// Mouse wheel on the canvas zooms in/out. Toolbar buttons +/−/Fit/100%
+// are also wired.
+
+const ZOOM_MIN = 0.25;
+const ZOOM_MAX = 8.0;
+
+// Compute the active cable number we should look for in the PDF.
+// Returns {cable, regex} or null.
+function getActiveCableLookup() {
+  const cable = state.selectedCable;
+  if (!cable) return null;
+  // Escape special regex chars in the cable number.
+  const esc = cable.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return { cable, regex: new RegExp(esc, 'g') };
+}
+
+// Find bounding boxes of regex matches in a page's text content.
+// Returns [{x, y, w, h}] in PDF page coordinates (origin = top-left, y up).
+async function findMatchesInPage(page, regex) {
+  const tc = await page.getTextContent();
+  // PDF.js returns items with .str and .transform = [a,b,c,d,e,f].
+  // Position: (e, f) is the baseline origin; we approximate the glyph box
+  // by (e, f - height) -> (e + width, f), where height and width come
+  // from the font or fallback. For matching we just need a tight-enough
+  // rectangle on screen, so we use a fixed em-height per item.
+  const rects = [];
+  const items = tc.items || [];
+  for (const it of items) {
+    if (!it.str || !regex.test(it.str)) continue;
+    regex.lastIndex = 0;          // reset since we use .test+lastIndex above
+    const m = it.str.match(regex);
+    if (!m) continue;
+    const [a, , , d, e, f] = it.transform;
+    // width = str.length * font_width; font_width ≈ (e - e_of_next) or
+    // heuristic. Use a conservative approximation: characters are
+    // ~ 0.55 em wide, em-height ≈ 1 unit.
+    const fontHeight = Math.hypot(a, d) || 1;
+    const charWidth = fontHeight * 0.55;
+    const fullWidth = it.str.length * charWidth;
+    // origin (e, f) is the BASELINE at bottom-left. Top-left of text:
+    const x = e;
+    const yBaseline = f;
+    const yTop = yBaseline - fontHeight;
+    rects.push({
+      x,
+      y: yTop,                        // top-left in PDF coords (y up)
+      w: fullWidth,
+      h: fontHeight,
+      // Also keep raw text + indices for partial matches (we use whole-item
+      // for simplicity — visually fine since most cable IDs are short).
+      text: it.str,
+    });
+  }
+  regex.lastIndex = 0;
+  return rects;
+}
+
+// Scan all pages for the cable number; returns {pageNum, rects} or null.
+// Caller decides what to do with null (no matches → render normally).
+async function findFirstPageWithMatch(pdf, regex) {
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const page = await pdf.getPage(i);
+    const rects = await findMatchesInPage(page, regex);
+    if (rects.length > 0) {
+      return { pageNum: i, rects };
+    }
+  }
+  return null;
+}
+
+// Draw the active-cable highlight rectangles ON the canvas (PDF coords).
+// PDF.js renders pages with y-up coords; canvas uses y-down. We flip
+// the y when drawing so the rectangles look correct on screen.
+function drawCableHighlights(ctx, rects, viewport) {
+  ctx.save();
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = '#ff3838';
+  ctx.fillStyle = 'rgba(255, 212, 59, 0.35)';
+  for (const r of rects) {
+    // PDF coords: (x, y) is top-left with y-up.
+    // Canvas coords (post-viewport transform): same x, but y is flipped.
+    const [vx, vy] = viewport.convertToViewportPoint(r.x, r.y);
+    const [vx2, vy2] = viewport.convertToViewportPoint(r.x + r.w, r.y + r.h);
+    const x = Math.min(vx, vx2);
+    const y = Math.min(vy, vy2);
+    const w = Math.abs(vx2 - vx);
+    const h = Math.abs(vy2 - vy);
+    ctx.fillRect(x, y, w, h);
+    ctx.strokeRect(x, y, w, h);
+  }
+  ctx.restore();
+}
+
+// Compute fit-to-width scale (PDF user units per pixel; bigger = more zoom).
+function computeFitScale(page) {
+  const wrap = $('fs-canvas-wrap');
+  const wrapWidth = Math.max(100, wrap.clientWidth - 32);   // padding
+  const baseVp = page.getViewport({ scale: 1 });
+  return wrapWidth / baseVp.width;
+}
+
+// Compute the scale we'll actually use to render this page:
+// user-set zoom if set, else fit-to-width.
+function currentScale(page) {
+  if (state._fsZoom != null) return state._fsZoom;
+  return computeFitScale(page);
+}
+
+function updateZoomInfo() {
+  $('fs-zoom-info').textContent = state._fsZoom == null
+    ? '适合宽度'
+    : `${Math.round(state._fsZoom * 100)}%`;
+}
+
 function openFullscreenPreview(pdfRelPath) {
   const url = `/file?path=${encodeURIComponent(pdfRelPath)}`;
   $('fs-filename').textContent = pdfRelPath;
@@ -395,19 +544,36 @@ function openFullscreenPreview(pdfRelPath) {
   $('fs-canvas').style.display = 'block';
   $('fs-fallback').style.display = 'none';
   $('fs-fallback').src = 'about:blank';
-  $('fs-modal').classList.add('show');
+  // Reset per-modal state
   state._fsCurrentPath = pdfRelPath;
+  state._fsZoom = null;            // fit-to-width by default
+  state._fsMatchPage = null;
+  state._fsMatchBoxes = [];
+  state._pdfjsDoc = null;
+  // Show / hide the active-cable chip
+  const lookup = getActiveCableLookup();
+  if (lookup) {
+    $('fs-cable-tag').style.display = '';
+    $('fs-cable-tag-name').textContent = lookup.cable;
+  } else {
+    $('fs-cable-tag').style.display = 'none';
+  }
+  $('fs-cable-overlay').style.display = 'none';
+  $('fs-modal').classList.add('show');
+  updateZoomInfo();
   renderPdfInModal(url);
 }
 
 function closeFullscreenPreview() {
   $('fs-modal').classList.remove('show');
-  // Drop the page 1 canvas so the next open starts clean.
   const canvas = $('fs-canvas');
   const ctx = canvas.getContext('2d');
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   state._pdfjsDoc = null;
   state._fsCurrentPath = null;
+  state._fsZoom = null;
+  state._fsMatchPage = null;
+  state._fsMatchBoxes = [];
 }
 
 // Close on Esc / backdrop click
@@ -438,6 +604,7 @@ async function renderPdfInModal(url) {
       iframe.src = url + '#toolbar=0';
       $('fs-page-info').textContent = 'iframe';
       $('fs-prev').disabled = $('fs-next').disabled = true;
+      $('fs-zoom-out').disabled = $('fs-zoom-in').disabled = $('fs-zoom-fit').disabled = $('fs-zoom-100').disabled = true;
       return;
     }
   }
@@ -447,13 +614,24 @@ async function renderPdfInModal(url) {
     const pdf = await loadingTask.promise;
     state._pdfjsDoc = pdf;
     $('fs-prev').disabled = $('fs-next').disabled = (pdf.numPages <= 1);
-    await renderFsPage(1);
+    // Find the page that contains the active cable number (if any).
+    const lookup = getActiveCableLookup();
+    let startPage = 1;
+    let firstMatch = null;
+    if (lookup && pdf.numPages > 0) {
+      firstMatch = await findFirstPageWithMatch(pdf, lookup.regex);
+      if (firstMatch) startPage = firstMatch.pageNum;
+    }
+    state._fsMatchPage = firstMatch ? firstMatch.pageNum : null;
+    state._fsMatchBoxes = firstMatch ? firstMatch.rects : [];
+    await renderFsPage(startPage);
   } catch (e) {
     canvas.style.display = 'none';
     iframe.style.display = 'block';
     iframe.src = url + '#toolbar=0';
     $('fs-page-info').textContent = 'iframe (PDF.js 失败)';
     $('fs-prev').disabled = $('fs-next').disabled = true;
+    $('fs-zoom-out').disabled = $('fs-zoom-in').disabled = $('fs-zoom-fit').disabled = $('fs-zoom-100').disabled = true;
   }
 }
 
@@ -463,22 +641,114 @@ async function renderFsPage(n) {
   n = Math.max(1, Math.min(n, pdf.numPages));
   state._currentPage = n;
   const page = await pdf.getPage(n);
-  const wrap = $('fs-canvas-wrap');
-  const wrapWidth = wrap.clientWidth - 32;        // padding
-  const baseViewport = page.getViewport({ scale: 1 });
-  // Cap scale at 2x so big PDFs don't render > 2x screen width
-  const scale = Math.min(2.0, Math.max(0.5, wrapWidth / baseViewport.width));
-  const viewport = page.getViewport({ scale });
+  const scale = currentScale(page);
+  // Clamp scale (zoom can be set arbitrarily high by user via wheel)
+  const clamped = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, scale));
+  const viewport = page.getViewport({ scale: clamped });
   const canvas = $('fs-canvas');
   const ctx = canvas.getContext('2d');
+  // Clear previous content (setTransform resets any prior state)
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
   canvas.width = viewport.width;
   canvas.height = viewport.height;
   await page.render({ canvasContext: ctx, viewport }).promise;
+
+  // Active-cable highlight: redraw rects on the canvas for THIS page.
+  // We re-scan current page (cheap; ~50ms) so we have fresh matches
+  // matching the currently rendered page (don't trust stale _fsMatchBoxes
+  // from the first scan if user navigated).
+  const lookup = getActiveCableLookup();
+  if (lookup) {
+    const rects = await findMatchesInPage(page, lookup.regex);
+    state._fsMatchBoxes = rects;
+    if (rects.length > 0) {
+      drawCableHighlights(ctx, rects, viewport);
+      // Floating overlay (top-right of the page)
+      $('fs-cable-overlay').textContent = `${lookup.cable} (${rects.length})`;
+      $('fs-cable-overlay').style.display = '';
+    } else {
+      state._fsMatchBoxes = [];
+      $('fs-cable-overlay').style.display = 'none';
+    }
+  } else {
+    state._fsMatchBoxes = [];
+    $('fs-cable-overlay').style.display = 'none';
+  }
+
   $('fs-page-info').textContent = `${n} / ${pdf.numPages}`;
+  // Disable the "match page" indicator: scroll into view of the
+  // first highlight? Currently we just leave them visible — the canvas
+  // is centered in the wrap.
+}
+
+// Zoom math: log-scale so ± and Fit land on human-friendly percentages.
+function zoomBy(factor) {
+  if (!state._pdfjsDoc) return;
+  const cur = state._fsZoom != null ? state._fsZoom : computeFitScale(state._pdfjsDoc.getPage(state._currentPage));
+  let next = cur * factor;
+  next = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, next));
+  state._fsZoom = next;
+  updateZoomInfo();
+  renderFsPage(state._currentPage);
+}
+
+function zoomTo(target) {
+  if (!state._pdfjsDoc) return;
+  state._fsZoom = target;
+  updateZoomInfo();
+  renderFsPage(state._currentPage);
+}
+
+function zoomFit() {
+  if (!state._pdfjsDoc) return;
+  state._fsZoom = null;     // null = fit-to-width
+  updateZoomInfo();
+  renderFsPage(state._currentPage);
 }
 
 $('fs-prev').addEventListener('click', () => renderFsPage(state._currentPage - 1));
 $('fs-next').addEventListener('click', () => renderFsPage(state._currentPage + 1));
+$('fs-zoom-in').addEventListener('click', () => zoomBy(1.25));
+$('fs-zoom-out').addEventListener('click', () => zoomBy(1 / 1.25));
+$('fs-zoom-100').addEventListener('click', () => {
+  // 100% means: scale = 1.0 PDF user unit per CSS pixel. PDF pages default
+  // to 72 user units per inch, so scale=1 gives 72 DPI which is "100% on
+  // screen". Use computeFitScale's basis to convert: fit_scale / (wrapWidth / baseWidth)
+  // = baseWidth / baseWidth = 1.0. Just set zoom = 1.0 directly.
+  if (state._pdfjsDoc) zoomTo(1.0);
+});
+$('fs-zoom-fit').addEventListener('click', zoomFit);
+
+// Mouse wheel zoom on canvas (Ctrl+wheel for finer control without modifiers).
+$('fs-canvas').addEventListener('wheel', (ev) => {
+  if (!state._pdfjsDoc) return;
+  ev.preventDefault();
+  // Both directions supported. deltaY > 0 = scroll down = zoom out.
+  // Use exp() so constant delta gives consistent percentage change.
+  // (Step size: each notch ≈ 10% change.)
+  const factor = Math.exp(-ev.deltaY * 0.0015);
+  const cur = state._fsZoom != null ? state._fsZoom : computeFitScale(state._pdfjsDoc.getPage(state._currentPage));
+  let next = cur * factor;
+  next = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, next));
+  // Keep the mouse-anchored point stable: re-render, then re-scroll so the
+  // canvas pixel under the cursor stays in the same place. For simplicity
+  // (and because most users zoom then re-pan), we just re-render and let
+  // the wrap's center stay fixed.
+  state._fsZoom = next;
+  updateZoomInfo();
+  renderFsPage(state._currentPage);
+}, { passive: false });
+
+// Reset zoom when window resizes (so fit-to-width re-evaluates)
+let _fsResizeTimer = null;
+window.addEventListener('resize', () => {
+  if (!$('fs-modal').classList.contains('show')) return;
+  if (state._fsZoom != null) return;   // user-set zoom doesn't reflow
+  clearTimeout(_fsResizeTimer);
+  _fsResizeTimer = setTimeout(() => renderFsPage(state._currentPage), 150);
+});
 
 // ====== search filter ======
 $('search').addEventListener('input', (e) => {
