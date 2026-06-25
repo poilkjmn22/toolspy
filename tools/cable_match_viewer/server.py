@@ -721,25 +721,44 @@ $('fs-zoom-100').addEventListener('click', () => {
 });
 $('fs-zoom-fit').addEventListener('click', zoomFit);
 
-// Mouse wheel zoom on canvas (Ctrl+wheel for finer control without modifiers).
-$('fs-canvas').addEventListener('wheel', (ev) => {
+// Mouse wheel zoom.
+//
+// IMPORTANT: wheel events must be listened on the SCROLLABLE ancestor
+// (#fs-canvas-wrap, the element that actually receives wheel events from
+// the browser), not on the <canvas> itself. The canvas has no native
+// scroll behaviour, so browsers don't fire wheel on it directly — the
+// events go to the wrap. Without this, zoom does nothing.
+//
+// We register the listener on BOTH the wrap and the canvas for safety:
+// some browsers do fire wheel on the canvas too, and listen()ing on
+// both with `passive: false` lets us catch the first one and stop the
+// wrap from scrolling either way.
+function fsWheelHandler(ev) {
   if (!state._pdfjsDoc) return;
+  // Don't hijack the wheel when the user is over the toolbar (zoom buttons
+  // are still accessible via mouse) — let the modal scroll if needed.
+  if (ev.target.closest('#fs-toolbar')) return;
+  // Always preventDefault to keep the wrap from scrolling (regardless of
+  // whether we're going to actually zoom or not — the wrap has nothing to
+  // scroll anyway since the canvas fits).
   ev.preventDefault();
-  // Both directions supported. deltaY > 0 = scroll down = zoom out.
-  // Use exp() so constant delta gives consistent percentage change.
-  // (Step size: each notch ≈ 10% change.)
+  // Use exp() so constant wheel delta gives consistent percentage change.
+  // Each notch (deltaY ≈ 100) is ~14% zoom.
   const factor = Math.exp(-ev.deltaY * 0.0015);
-  const cur = state._fsZoom != null ? state._fsZoom : computeFitScale(state._pdfjsDoc.getPage(state._currentPage));
+  const cur = state._fsZoom != null
+    ? state._fsZoom
+    : computeFitScale(state._pdfjsDoc.getPage(state._currentPage));
   let next = cur * factor;
   next = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, next));
-  // Keep the mouse-anchored point stable: re-render, then re-scroll so the
-  // canvas pixel under the cursor stays in the same place. For simplicity
-  // (and because most users zoom then re-pan), we just re-render and let
-  // the wrap's center stay fixed.
+  // Don't bother re-rendering if the clamped scale didn't change
+  // (avoids wasted re-raster at ZOOM_MIN/MAX boundaries).
+  if (Math.abs(next - cur) < 1e-4) return;
   state._fsZoom = next;
   updateZoomInfo();
   renderFsPage(state._currentPage);
-}, { passive: false });
+}
+$('fs-canvas-wrap').addEventListener('wheel', fsWheelHandler, { passive: false });
+$('fs-canvas').addEventListener('wheel', fsWheelHandler, { passive: false });
 
 // Reset zoom when window resizes (so fit-to-width re-evaluates)
 let _fsResizeTimer = null;
