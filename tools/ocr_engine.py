@@ -25,6 +25,81 @@ import sys
 from typing import Tuple
 
 
+def _patch_pytesseract_stdout_decoding() -> None:
+    """Monkey-patch pytesseract's stdout/stderr decoding to use
+    errors='replace' instead of 'strict'. Without this, tesseract's stderr
+    is merged into stdout (pytesseract.stderr=subprocess.STDOUT) and any
+    non-UTF-8 byte in the combined output (e.g. locale warnings, OMP
+    messages, library version mismatch on macOS M-series) triggers
+    UnicodeDecodeError on the .decode('utf-8') call inside pytesseract,
+    which then propagates up to the worker as:
+        'utf-8' codec can't decode byte 0x89 in position 270: invalid start byte
+    and causes the entire PDF to be marked as failed (even though the
+    actual OCR text was successfully produced and was just hidden in
+    stderr).
+
+    Fix: wrap `image_to_string` (and the other image_to_* entry points
+    that decode stdout) so the .decode call passes errors='replace'.
+    Idempotent: bails out early on subsequent calls.
+    """
+    try:
+        import pytesseract as _pt
+        from pytesseract import pytesseract as _pt_inner
+    except ImportError:
+        return
+    if getattr(_pt, '_tooly_patched', False):
+        return
+
+    # DEFAULT_ENCODING is defined inside `pytesseract.pytesseract` (the
+    # submodule), not at the top-level `pytesseract` package. Try both.
+    _DEFAULT_ENCODING = getattr(_pt_inner, 'DEFAULT_ENCODING', None) or \
+                       getattr(_pt, 'DEFAULT_ENCODING', None) or \
+                       'utf-8'
+
+    def _safe_decode(b: bytes) -> str:
+        if isinstance(b, bytes):
+            return b.decode(_DEFAULT_ENCODING, errors='replace')
+        return b
+
+    # Wrap each image_to_* entry point. Each does roughly:
+    #   proc = subprocess.run(...)
+    #   return proc.stdout.decode(DEFAULT_ENCODING)  ← this can fail
+    # We monkey-patch by replacing the function with a thin wrapper
+    # that re-decodes any bytes attribute with errors='replace'.
+    _ENTRY_POINTS = (
+        'image_to_string', 'image_to_data', 'image_to_boxes',
+        'image_to_osd', 'image_to_alto_xml',
+    )
+
+    for _name in _ENTRY_POINTS:
+        if not hasattr(_pt, _name):
+            continue
+        _orig = getattr(_pt, _name)
+
+        def _make_wrapper(_orig, _name):
+            # We use a closure on `_name` + `_orig` so each iteration
+            # binds its own pair (Python late binding pitfall).
+            def _wrapper(*args, **kwargs):
+                # Some entry points (image_to_pdf_or_hocr) write
+                # to a file; image_to_string returns text. We handle
+                # both cases uniformly: if the result is bytes, decode.
+                result = _orig(*args, **kwargs)
+                if isinstance(result, bytes):
+                    return _safe_decode(result)
+                return result
+            _wrapper.__name__ = _orig.__name__
+            _wrapper.__doc__ = _orig.__doc__
+            return _wrapper
+
+        setattr(_pt, _name, _make_wrapper(_orig, _name))
+
+    _pt._tooly_patched = True
+
+
+# Apply the patch at import time. Idempotent (guarded by _tooly_patched).
+_patch_pytesseract_stdout_decoding()
+
+
 class EngineNotAvailable(Exception):
     """Raised when an engine's dependencies aren't installed."""
 
