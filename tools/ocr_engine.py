@@ -26,74 +26,77 @@ from typing import Tuple
 
 
 def _patch_pytesseract_stdout_decoding() -> None:
-    """Monkey-patch pytesseract's stdout/stderr decoding to use
-    errors='replace' instead of 'strict'. Without this, tesseract's stderr
-    is merged into stdout (pytesseract.stderr=subprocess.STDOUT) and any
-    non-UTF-8 byte in the combined output (e.g. locale warnings, OMP
-    messages, library version mismatch on macOS M-series) triggers
-    UnicodeDecodeError on the .decode('utf-8') call inside pytesseract,
-    which then propagates up to the worker as:
-        'utf-8' codec can't decode byte 0x89 in position 270: invalid start byte
-    and causes the entire PDF to be marked as failed (even though the
-    actual OCR text was successfully produced and was just hidden in
-    stderr).
+    """Monkey-patch pytesseract's internal `_read_output` function to use
+    errors='replace' instead of 'strict' when decoding tesseract output.
 
-    Fix: wrap `image_to_string` (and the other image_to_* entry points
-    that decode stdout) so the .decode call passes errors='replace'.
-    Idempotent: bails out early on subsequent calls.
+    Background
+    ----------
+    pytesseract's `image_to_string` flow (verified in pytesseract 0.3.13):
+      1. Save PIL image to temp file
+      2. subprocess.run('tesseract <input> <output> ...')  # writes tesseract
+         output to <output>.txt on disk
+      3. Call `_read_output(<filename>)` which does:
+             with open(filename, 'rb') as f:
+                 return f.read().decode(DEFAULT_ENCODING)  # ← STRICT UTF-8
+      4. Return the decoded string
+
+    pytesseract also calls tesseract with `stderr=subprocess.STDOUT` so any
+    tesseract stderr noise (locale warnings, OMP messages, library
+    version mismatch banners) ends up in the output file. On macOS M-series
+    (and some Linux builds), tesseract's stderr can contain non-UTF-8 bytes
+    (commonly 0x89 = PNG signature byte, or zh_CN.HKSCS locale bytes).
+    The strict UTF-8 decode raises:
+        UnicodeDecodeError: 'utf-8' codec can't decode byte 0x89 in position 270
+    and the worker marks the PDF as failed (line 723 of cable_match.py
+    catches it: `error_msg = str(e)`).
+
+    Why the previous wrapper-on-image_to_string patch was insufficient
+    -----------------------------------------------------------
+    image_to_string() returns a str, not bytes — the wrapper's
+    `if isinstance(result, bytes): _safe_decode(result)` branch never
+    fires. The UnicodeDecodeError RAISES *inside* the wrapped function
+    and propagates out before the wrapper sees the result. The patch was
+    effectively a no-op.
+
+    The actual fix
+    -------------
+    Patch `pytesseract.pytesseract._read_output` to use errors='replace'.
+    This is the function that does the .decode(DEFAULT_ENCODING) call.
+    We also patch pytesseract's `run_and_get_output` (used by direct
+    subprocess result.decode() patterns) for completeness.
+
+    Idempotent: guarded by `pytesseract.pytesseract._tooly_patched_v2`.
     """
     try:
-        import pytesseract as _pt
         from pytesseract import pytesseract as _pt_inner
     except ImportError:
         return
-    if getattr(_pt, '_tooly_patched', False):
+    if getattr(_pt_inner, '_tooly_patched_v2', False):
         return
 
-    # DEFAULT_ENCODING is defined inside `pytesseract.pytesseract` (the
-    # submodule), not at the top-level `pytesseract` package. Try both.
-    _DEFAULT_ENCODING = getattr(_pt_inner, 'DEFAULT_ENCODING', None) or \
-                       getattr(_pt, 'DEFAULT_ENCODING', None) or \
-                       'utf-8'
+    _DEFAULT_ENCODING = getattr(_pt_inner, 'DEFAULT_ENCODING', 'utf-8')
 
-    def _safe_decode(b: bytes) -> str:
-        if isinstance(b, bytes):
-            return b.decode(_DEFAULT_ENCODING, errors='replace')
-        return b
+    def _safe_read_output(filename, return_bytes=False):
+        with open(filename, 'rb') as output_file:
+            data = output_file.read()
+        if return_bytes:
+            return data
+        return data.decode(_DEFAULT_ENCODING, errors='replace')
 
-    # Wrap each image_to_* entry point. Each does roughly:
-    #   proc = subprocess.run(...)
-    #   return proc.stdout.decode(DEFAULT_ENCODING)  ← this can fail
-    # We monkey-patch by replacing the function with a thin wrapper
-    # that re-decodes any bytes attribute with errors='replace'.
-    _ENTRY_POINTS = (
-        'image_to_string', 'image_to_data', 'image_to_boxes',
-        'image_to_osd', 'image_to_alto_xml',
-    )
+    def _safe_run_and_get_output(*args, **kwargs):
+        # run_and_get_output is the other call site that does strict
+        # .decode() on subprocess output. Wrap so any bytes returned
+        # get re-decoded with errors='replace'.
+        result = _pt_inner.run_and_get_output_orig(*args, **kwargs)
+        if isinstance(result, bytes):
+            return result.decode(_DEFAULT_ENCODING, errors='replace')
+        return result
 
-    for _name in _ENTRY_POINTS:
-        if not hasattr(_pt, _name):
-            continue
-        _orig = getattr(_pt, _name)
-
-        def _make_wrapper(_orig, _name):
-            # We use a closure on `_name` + `_orig` so each iteration
-            # binds its own pair (Python late binding pitfall).
-            def _wrapper(*args, **kwargs):
-                # Some entry points (image_to_pdf_or_hocr) write
-                # to a file; image_to_string returns text. We handle
-                # both cases uniformly: if the result is bytes, decode.
-                result = _orig(*args, **kwargs)
-                if isinstance(result, bytes):
-                    return _safe_decode(result)
-                return result
-            _wrapper.__name__ = _orig.__name__
-            _wrapper.__doc__ = _orig.__doc__
-            return _wrapper
-
-        setattr(_pt, _name, _make_wrapper(_orig, _name))
-
-    _pt._tooly_patched = True
+    # Save original for the run_and_get_output wrapper
+    _pt_inner.run_and_get_output_orig = _pt_inner.run_and_get_output
+    _pt_inner.run_and_get_output = _safe_run_and_get_output
+    _pt_inner._read_output = _safe_read_output
+    _pt_inner._tooly_patched_v2 = True
 
 
 # Apply the patch at import time. Idempotent (guarded by _tooly_patched).
