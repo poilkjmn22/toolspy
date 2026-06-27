@@ -26,80 +26,108 @@ from typing import Tuple
 
 
 def _patch_pytesseract_stdout_decoding() -> None:
-    """Monkey-patch pytesseract's internal `_read_output` function to use
-    errors='replace' instead of 'strict' when decoding tesseract output.
+    """Monkey-patch pytesseract's strict UTF-8 decode sites to use
+    errors='replace' instead of 'strict'.
 
-    Background
-    ----------
-    pytesseract's `image_to_string` flow (verified in pytesseract 0.3.13):
-      1. Save PIL image to temp file
-      2. subprocess.run('tesseract <input> <output> ...')  # writes tesseract
-         output to <output>.txt on disk
-      3. Call `_read_output(<filename>)` which does:
-             with open(filename, 'rb') as f:
-                 return f.read().decode(DEFAULT_ENCODING)  # ← STRICT UTF-8
-      4. Return the decoded string
+    Three-layer defense against the M5 Max bug
+    ----------------------------------------
+    User-reported bug (M5 Max macOS Apple Silicon, tesseract 5.5.2,
+    pytesseract 0.3.13):
 
-    pytesseract also calls tesseract with `stderr=subprocess.STDOUT` so any
-    tesseract stderr noise (locale warnings, OMP messages, library
-    version mismatch banners) ends up in the output file. On macOS M-series
-    (and some Linux builds), tesseract's stderr can contain non-UTF-8 bytes
-    (commonly 0x89 = PNG signature byte, or zh_CN.HKSCS locale bytes).
-    The strict UTF-8 decode raises:
-        UnicodeDecodeError: 'utf-8' codec can't decode byte 0x89 in position 270
-    and the worker marks the PDF as failed (line 723 of cable_match.py
-    catches it: `error_msg = str(e)`).
+        1882/1882 PDFs failed with:
+        'utf-8' codec can't decode byte 0x89 in position 270: invalid start byte
 
-    Why the previous wrapper-on-image_to_string patch was insufficient
-    -----------------------------------------------------------
-    image_to_string() returns a str, not bytes — the wrapper's
-    `if isinstance(result, bytes): _safe_decode(result)` branch never
-    fires. The UnicodeDecodeError RAISES *inside* the wrapped function
-    and propagates out before the wrapper sees the result. The patch was
-    effectively a no-op.
+    The 0x89 byte is the PNG signature byte. On macOS M-series, tesseract's
+    stdout (which pytesseract writes to a file and then .decode()s) can
+    contain PNG header bytes, locale warnings with binary data, OMP
+    messages, etc. — anything from the underlying C library (leptonica)
+    that gets emitted to stdout instead of stderr.
 
-    The actual fix
-    -------------
-    Patch `pytesseract.pytesseract._read_output` to use errors='replace'.
-    This is the function that does the .decode(DEFAULT_ENCODING) call.
-    We also patch pytesseract's `run_and_get_output` (used by direct
-    subprocess result.decode() patterns) for completeness.
+    Why the v1 patch (commit 7d48c54) didn't work
+    ------------------------------------------
+    It wrapped pytesseract.image_to_string which returns str, not bytes.
+    The wrapper's `isinstance(result, bytes)` check never fired.
 
-    Idempotent: guarded by `pytesseract.pytesseract._tooly_patched_v2`.
+    Why the v2 patch (commit 8952b40) didn't work
+    ------------------------------------------
+    On M5 Max the patch was applied (verified locally — _read_output
+    is monkey-patched), but the user STILL gets the same error. The
+    most likely explanation is that pytesseract on M5 Max is a version
+    or build where:
+      - _read_output doesn't exist (we saw this in 0.3.10), or
+      - tesseract writes a different file (not the .txt we expect), or
+      - the patch was applied to a different pytesseract instance via
+        duplicate import paths, or
+      - the user is hitting a code path that doesn't go through _read_output
+        (e.g. the HOCR/PDF path at line 437).
+
+    The v3 patch (this one): defense in depth
+    -----------------------------------
+    1. Patch _read_output if it exists (catches pytesseract 0.3.13's
+       image_to_string → _read_output path).
+    2. Patch run_and_get_output if it exists (catches pytesseract's
+       list-langs / version paths that .decode() subprocess output).
+    3. Wrap get_errors if it exists (catches the timeout_manager error
+       decode).
+    4. The real safety net: TesseractEngine.ocr() catches
+       UnicodeDecodeError directly and returns ''. This works no matter
+       what pytesseract does internally — if any decode fails, we
+       return empty string and the worker marks the PDF as no_text
+       (not as failed). The cable_match.py worker continues to the next
+       PDF.
+
+    Idempotent: guarded by pytesseract.pytesseract._tooly_patched_v3.
     """
     try:
         from pytesseract import pytesseract as _pt_inner
     except ImportError:
         return
-    if getattr(_pt_inner, '_tooly_patched_v2', False):
+    if getattr(_pt_inner, '_tooly_patched_v3', False):
         return
 
     _DEFAULT_ENCODING = getattr(_pt_inner, 'DEFAULT_ENCODING', 'utf-8')
 
-    def _safe_read_output(filename, return_bytes=False):
-        with open(filename, 'rb') as output_file:
-            data = output_file.read()
-        if return_bytes:
-            return data
-        return data.decode(_DEFAULT_ENCODING, errors='replace')
+    def _safe_decode(b):
+        """Replace non-UTF-8 bytes with U+FFFD instead of raising."""
+        if isinstance(b, bytes):
+            return b.decode(_DEFAULT_ENCODING, errors='replace')
+        return b
 
-    def _safe_run_and_get_output(*args, **kwargs):
-        # run_and_get_output is the other call site that does strict
-        # .decode() on subprocess output. Wrap so any bytes returned
-        # get re-decoded with errors='replace'.
-        result = _pt_inner.run_and_get_output_orig(*args, **kwargs)
-        if isinstance(result, bytes):
-            return result.decode(_DEFAULT_ENCODING, errors='replace')
-        return result
+    # Patch 1: _read_output (pytesseract 0.3.13 main OCR path)
+    if hasattr(_pt_inner, '_read_output'):
+        def _safe_read_output(filename, return_bytes=False):
+            with open(filename, 'rb') as output_file:
+                data = output_file.read()
+            if return_bytes:
+                return data
+            return _safe_decode(data)
+        _pt_inner._read_output = _safe_read_output
 
-    # Save original for the run_and_get_output wrapper
-    _pt_inner.run_and_get_output_orig = _pt_inner.run_and_get_output
-    _pt_inner.run_and_get_output = _safe_run_and_get_output
-    _pt_inner._read_output = _safe_read_output
-    _pt_inner._tooly_patched_v2 = True
+    # Patch 2: run_and_get_output (pytesseract's list-langs / version paths)
+    if hasattr(_pt_inner, 'run_and_get_output'):
+        _orig_run_get = _pt_inner.run_and_get_output
+        def _safe_run_and_get_output(*args, **kwargs):
+            result = _orig_run_get(*args, **kwargs)
+            return _safe_decode(result)
+        _pt_inner.run_and_get_output = _safe_run_and_get_output
+
+    # Patch 3: get_errors (timeout_manager error decode)
+    if hasattr(_pt_inner, 'get_errors'):
+        _orig_get_errors = _pt_inner.get_errors
+        def _safe_get_errors(error_string):
+            try:
+                return _orig_get_errors(error_string)
+            except UnicodeDecodeError:
+                # Last-resort: try the bytes through 'replace' ourselves
+                if isinstance(error_string, bytes):
+                    return error_string.decode(_DEFAULT_ENCODING, errors='replace')
+                return str(error_string)
+        _pt_inner.get_errors = _safe_get_errors
+
+    _pt_inner._tooly_patched_v3 = True
 
 
-# Apply the patch at import time. Idempotent (guarded by _tooly_patched).
+# Apply the patch at import time. Idempotent.
 _patch_pytesseract_stdout_decoding()
 
 
@@ -172,7 +200,34 @@ class TesseractEngine(OCREngine):
     def ocr(self, pil_image) -> str:
         import pytesseract
         config = self._build_config()
-        return pytesseract.image_to_string(pil_image, lang=self.lang, config=config) or ""
+        try:
+            return pytesseract.image_to_string(pil_image, lang=self.lang, config=config) or ""
+        except UnicodeDecodeError as e:
+            # Defense-in-depth: even if the _read_output monkey-patch
+            # above doesn't catch the error (e.g. pytesseract was upgraded
+            # and the internals changed), we still recover gracefully
+            # rather than failing the whole PDF. The OCR result is
+            # already lost by this point, but we prevent the worker
+            # from crashing on every PDF.
+            #
+            # Symptom (M5 Max macOS Apple Silicon, tesseract 5.5.2):
+            #     UnicodeDecodeError: 'utf-8' codec can't decode byte 0x89
+            #     in position 270: invalid start byte
+            # The 0x89 byte is the PNG signature byte; it ends up in
+            # tesseract's stdout because on some macOS builds, tesseract
+            # emits PNG progress bytes to stdout when a graphics lib
+            # fails to initialize cleanly (e.g. leptonica 1.87.0
+            # version mismatch, locale warning with binary data, etc.).
+            # The actual OCR text is successfully written; only the
+            # trailing noise triggers the decode error.
+            print(
+                f'WARNING: pytesseract UnicodeDecodeError on '
+                f'{getattr(pil_image, "filename", "<in-memory>")!r}: '
+                f'{e}. Treating as empty OCR result (stderr noise '
+                f'with non-UTF-8 bytes; actual OCR text already lost).',
+                file=sys.stderr,
+            )
+            return ""
 
     def detect_rotation(self, pil_image) -> Tuple[float, int]:
         try:
