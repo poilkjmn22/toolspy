@@ -324,18 +324,58 @@ function renderRightPane(detail) {
   const fileUrl = `/file?hash=${hash}`;
   const sourceFile = detail.source_file || rel;
   const ext = sourceFile.split('.').pop().toLowerCase();
+  const docType = detail.document_type || '';
 
   $('right').innerHTML = `
-    <flyfish-file-viewer
-      id="preview"
-      src="${fileUrl}"
-      filename="${sourceFile}"
-      locale="zh-CN"
-      theme="light"
-      toolbar-position="bottom-right"
-      style="width:100%;height:100%"
-    ></flyfish-file-viewer>
+    <div id="preview-container" style="width:100%;height:100%;display:flex;flex-direction:column;">
+      <flyfish-file-viewer
+        id="preview"
+        src="${fileUrl}"
+        filename="${sourceFile}"
+        locale="zh-CN"
+        theme="light"
+        toolbar-position="bottom-right"
+        style="width:100%;height:100%"
+      ></flyfish-file-viewer>
+    </div>
   `;
+
+  // Error fallback: if flyfish fails, show entities
+  const viewer = document.getElementById('preview');
+  viewer.addEventListener('viewer-error', (e) => {
+    console.warn('Flyfish preview error, showing entity fallback', e.detail);
+    showEntityFallback(detail);
+  });
+
+  // Timeout fallback: if no ready event within 30s
+  let ready = false;
+  const timer = setTimeout(() => {
+    if (!ready) {
+      console.warn('Flyfish preview timeout, showing entity fallback');
+      showEntityFallback(detail);
+    }
+  }, 30000);
+  viewer.addEventListener('viewer-ready', () => { ready = true; clearTimeout(timer); });
+}
+
+function showEntityFallback(detail) {
+  const entities = detail.entities || [];
+  const textEntities = entities.filter(e => e.entity_type === 'text' && e.text && e.text.trim());
+  const matches = detail.matches || [];
+  const ocrPages = detail.ocr_pages || [];
+  let html = `<div class="placeholder" style="padding:16px;text-align:left;font-size:13px;color:#555;">
+    <p style="color:#e74c3c;margin-bottom:8px;">⚠ 文档预览不可用，显示提取的实体数据</p>`;
+  if (matches.length) {
+    html += `<p><b>匹配:</b> ${matches.map(m => m.cable).join(', ')}</p>`;
+  }
+  html += `<p><b>文本实体:</b> ${textEntities.length} 个</p>`;
+  html += `<div style="max-height:300px;overflow-y:auto;margin-top:8px;font-family:monospace;font-size:11px;background:#f9f9f9;padding:8px;border-radius:4px;">`;
+  textEntities.slice(0, 100).forEach(e => {
+    html += `<div>${escHtml((e.text || '').slice(0, 120))}</div>`;
+  });
+  if (textEntities.length > 100) html += `<div>…还有 ${textEntities.length - 100} 个</div>`;
+  html += `</div></div>`;
+  $('right').innerHTML = html;
 }
 
 function escHtml(s) {
@@ -431,12 +471,16 @@ async def flyfish_handler(request: web.Request) -> web.Response:
                 return web.json_response({'error': 'flyfish asset not found'}, status=404)
             body = await resp.read()
             ct = resp.headers.get('Content-Type', 'application/octet-stream').split(';')[0].strip()
+            if path.endswith('.wasm') and 'wasm' not in ct:
+                ct = 'application/wasm'
             return web.Response(
                 body=body,
                 content_type=ct,
                 headers={
                     'Cache-Control': 'public, max-age=86400',
                     'Access-Control-Allow-Origin': '*',
+                    'Cross-Origin-Opener-Policy': 'same-origin',
+                    'Cross-Origin-Embedder-Policy': 'require-corp',
                 },
             )
 
