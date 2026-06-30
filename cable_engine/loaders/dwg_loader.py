@@ -58,8 +58,7 @@ class DWGLoader(BaseLoader):
         except ImportError as e:
             doc.entities.append(TextEntity(
                 id='err-import', source='dwg', page=1, confidence=0.0,
-                text=f'<ezdxf not installed; install with: pip install ezdxf> '
-                     f'(underlying error: {e})',
+                text=f'<ezdxf import error: {e}. Install: pip install ezdxf fonttools>'
             ))
             return doc
 

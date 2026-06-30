@@ -30,3 +30,4 @@ numpy<2.0
 # which were removed in Python 3.3. On Python 3.10+ they no longer link.
 # 0.25+ switched to a rapidfuzz-backed pure-Python wheel.
 python-Levenshtein==0.25.1
+fonttools>=4.63.0

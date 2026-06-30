@@ -22,6 +22,7 @@ import socket
 from pathlib import Path
 
 from aiohttp import web
+import aiohttp
 
 from .viewer import CableDbViewer
 
@@ -61,7 +62,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Cable Match Viewer</title>
-<script src="https://cdn.jsdelivr.net/npm/@file-viewer/web-full@latest/dist/flyfish-file-viewer-web-full.iife.js"></script>
+<script src="/flyfish/flyfish-file-viewer-web-full.iife.js"></script>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   html, body { height: 100%; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 13px; color: #222; background: #fafafa; }
@@ -418,6 +419,27 @@ async def file_handler(request: web.Request) -> web.Response:
         'Cache-Control': 'no-cache',
     })
 
+
+_FLYFISH_CDN = 'https://cdn.jsdelivr.net/npm/@file-viewer/web-full@latest/dist'
+
+async def flyfish_handler(request: web.Request) -> web.Response:
+    path = request.match_info['path']
+    cdn_url = f'{_FLYFISH_CDN}/{path}'
+    async with aiohttp.ClientSession() as session:
+        async with session.get(cdn_url) as resp:
+            if resp.status != 200:
+                return web.json_response({'error': 'flyfish asset not found'}, status=404)
+            body = await resp.read()
+            ct = resp.headers.get('Content-Type', 'application/octet-stream').split(';')[0].strip()
+            return web.Response(
+                body=body,
+                content_type=ct,
+                headers={
+                    'Cache-Control': 'public, max-age=86400',
+                    'Access-Control-Allow-Origin': '*',
+                },
+            )
+
 # ---------------------------------------------------------------------------
 # Server bootstrap
 # ---------------------------------------------------------------------------
@@ -442,6 +464,7 @@ async def main_async(port: int, host: str, db_path: str,
     app.router.add_get('/api/cables', cables_handler)
     app.router.add_get('/api/cable/{cable}', cable_handler)
     app.router.add_get('/file', file_handler)
+    app.router.add_get('/flyfish/{path:.*}', flyfish_handler)
 
     runner = web.AppRunner(app)
     await runner.setup()
