@@ -1,15 +1,15 @@
-"""cable_match_viewer — web UI to browse cable_match state.json + cache.db.
+"""cable_match_viewer — web UI to browse a cable_engine cable.db.
 
 Launch with:
-    python -m tools cable-match-viewer --state .../state.json --cache .../cache.db [-l 8003]
+    python -m tools cable-match-viewer --db path/to/cable.db [-l 8003]
+
+Or directly:
+    python -m tools.cable_match_viewer.server --db path/to/cable.db [-l 8003]
 
 Open the printed URL in a browser; you'll get a 3-pane UI:
-  - left  : cable tree (matched first, natural-sorted)
-  - middle: PDFs under the selected cable
-  - right : PDF.js preview + OCR text + cable-highlighted matches
-
-For details see README in this directory and the docstrings in
-viewer.py / server.py.
+  - left   : document list + cable tree
+  - middle : document entities / matches / OCR text
+  - right  : source document preview via flyfish viewer
 """
 
 from .server import main, main_async, PORT_DEFAULT

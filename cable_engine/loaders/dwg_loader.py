@@ -1,32 +1,8 @@
-"""cable_engine.loaders.dwg_loader — DWG/DXF → Document.
-
-Uses ezdxf to read vector entities from a DWG file. The DWG Loader
-produces a Document whose entities are LineEntity / PolylineEntity /
-TextEntity / SymbolEntity — these are inserted directly into
-`doc.entities` (no Page / PixelImage layer, since DWG is vector and
-the OCR Stage is bypassed).
-
-Why no Page for DWG:
-  DWG is conventionally single-page (the entire drawing is on one
-  "sheet"). A future multi-sheet DWG (xref'd layouts) would extend
-  this to one Page per layout, but for now a single synthetic Page
-  with page_number=1 and no PixelImage suffices to satisfy the
-  pipeline's iteration contract.
-
-Why TextEntity for DWG text (not raw text string):
-  Fusion logic downstream treats text uniformly — `for e in
-  doc.iter_text(): ...` works whether the text came from OCR or from
-  DWG's stored text. This is the whole point of the source-agnostic
-  IR.
-
-ezdxf is imported lazily: this module-level import is wrapped so
-that DWGLoader can be imported even when ezdxf isn't installed. The
-actual `import ezdxf` happens inside `load()`.
-"""
-
 from __future__ import annotations
 
 import hashlib
+import re
+import subprocess
 from pathlib import Path
 from typing import Optional
 
@@ -39,7 +15,6 @@ from .base import BaseLoader, _register_suffix
 
 
 def _content_hash(p: Path) -> str:
-    """sha256 of the file contents (for cross-run dedup)."""
     h = hashlib.sha256()
     with open(p, 'rb') as f:
         for chunk in iter(lambda: f.read(1 << 20), b''):
@@ -47,9 +22,13 @@ def _content_hash(p: Path) -> str:
     return h.hexdigest()
 
 
-class DWGLoader(BaseLoader):
-    """DWG/DXF → Document with vector entities (no rasterization)."""
+_DWG_TEXT_ATTR_KEYS = frozenset([
+    'WIRECODE', 'EQUCODE', 'EQUNAME', 'NO', 'ObjTerm.Name',
+    'DESC', 'TERNO', 'CODE', 'DWGNO0', 'DIC1', 'DIC2', 'WireSerial',
+])
 
+
+class DWGLoader(BaseLoader):
     document_type: DocumentType = DocumentType.DWG
     name: str = 'dwg'
 
@@ -60,8 +39,6 @@ class DWGLoader(BaseLoader):
             content_hash=_content_hash(document_path) if document_path.exists()
                          else '',
         )
-        # DWG is single-page; create a synthetic Page so downstream
-        # code can iterate uniformly.
         doc.pages.append(Page(
             pdf_path=document_path,
             content_hash=doc.content_hash,
@@ -69,7 +46,6 @@ class DWGLoader(BaseLoader):
             source='dwg',
         ))
 
-        # If file doesn't exist, return early with error text entity
         if not document_path.exists():
             doc.entities.append(TextEntity(
                 id='err-missing', source='dwg', page=1, confidence=0.0,
@@ -77,10 +53,6 @@ class DWGLoader(BaseLoader):
             ))
             return doc
 
-        # Lazy-import ezdxf: keeps the module importable when ezdxf
-        # isn't installed (e.g. when the user only uses PDF). The full
-        # ezdxf dependency tree pulls in numpy/fontTools/pyparsing;
-        # we avoid forcing all of that on the PDF-only path.
         try:
             import ezdxf
         except ImportError as e:
@@ -91,13 +63,10 @@ class DWGLoader(BaseLoader):
             ))
             return doc
 
-        try:
-            dwg = ezdxf.readfile(str(document_path))
-        except Exception as e:
-            doc.entities.append(TextEntity(
-                id='err-open', source='dwg', page=1, confidence=0.0,
-                text=f'<dwg open error: {e}>',
-            ))
+        dwg = self._open_document(document_path, doc)
+        if dwg is None:
+            return doc
+        if dwg is True:
             return doc
 
         msp = dwg.modelspace()
@@ -108,10 +77,142 @@ class DWGLoader(BaseLoader):
                 pass
         return doc
 
+    def _open_document(self, path: Path, doc: Document):
+        import ezdxf
+        from ezdxf.lldxf.const import DXFStructureError
+
+        suffix = path.suffix.lower()
+
+        # .dwg files: try dwgread JSON first (more reliable for libredwg)
+        # then fall back to ezdxf
+        if suffix == '.dwg':
+            result = self._open_via_dwgread(path, doc)
+            if result is not None:
+                return result
+
+        # .dxf files: try ezdxf first
+        for _ in range(2):
+            try:
+                return ezdxf.readfile(str(path))
+            except DXFStructureError as e:
+                msg = str(e)
+                if 'INSERT or SEQEND' in msg:
+                    fixed = self._fix_dxf_blocks(path)
+                    if fixed:
+                        path = fixed
+                        continue
+                else:
+                    fixed = self._fix_dxf_utf8(path)
+                    if fixed:
+                        path = fixed
+                        continue
+            except Exception:
+                pass
+            break
+
+        # Last resort: try dwgread JSON for .dxf files too
+        result = self._open_via_dwgread(path, doc)
+        if result is not None:
+            return result
+
+        return None
+
+    def _fix_dxf_blocks(self, path: Path) -> Path | None:
+        try:
+            txt = path.read_text(errors='replace')
+        except Exception:
+            return None
+        start = txt.find('\n  0\nSECTION\n  2\nBLOCKS\n')
+        if start < 0:
+            return None
+        end = txt.find('\n  0\nENDSEC\n', start + 1)
+        if end < 0:
+            return None
+        blocks_raw = txt[start:end]
+        seqend_count = blocks_raw.count('\n  0\nSEQEND\n')
+        insert_count = blocks_raw.count('\n  0\nINSERT\n')
+        diff = seqend_count - insert_count
+        if diff <= 0:
+            return None
+        lines = blocks_raw.split('\n')
+        fixed_lines = []
+        seen_insert = False
+        removed = 0
+        for line in lines:
+            if line.strip() == 'INSERT':
+                seen_insert = True
+                fixed_lines.append(line)
+            elif line.strip() == 'SEQEND':
+                if seen_insert:
+                    seen_insert = False
+                    fixed_lines.append(line)
+                else:
+                    removed += 1
+            else:
+                fixed_lines.append(line)
+        if removed == 0:
+            return None
+        patched = '\n'.join(fixed_lines)
+        dst = path.parent / (path.stem + '_blocks_fixed.dxf')
+        dst.write_text(txt[:start] + patched + txt[end:], encoding='utf-8')
+        return dst
+
+    def _fix_dxf_utf8(self, path: Path) -> Path | None:
+        try:
+            txt = path.read_text(errors='replace')
+        except Exception:
+            return None
+        lines = txt.split('\n')
+        clean = []
+        changed = False
+        for line in lines:
+            try:
+                clean.append(line)
+            except UnicodeEncodeError:
+                clean.append(line.encode('utf-8', errors='replace').decode('utf-8'))
+                changed = True
+        if not changed:
+            return None
+        dst = path.parent / (path.stem + '_utf8.dxf')
+        dst.write_text('\n'.join(clean), encoding='utf-8')
+        return dst
+
+    def _open_via_dwgread(self, path: Path, doc: Document):
+        try:
+            r = subprocess.run(
+                ['dwgread', '-O', 'JSON', str(path)],
+                capture_output=True, timeout=30,
+            )
+            if r.returncode != 0:
+                return None
+            raw = r.stdout.decode('utf-8', errors='replace')
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return None
+
+        text_values = []
+        try:
+            import ijson
+            with open(path.with_suffix('.json'), 'wb') as f:
+                f.write(r.stdout)
+        except ImportError:
+            text_values = re.findall(r'"text_value":\s*"([^"]*)"', raw)
+
+        if not text_values:
+            text_values = re.findall(r'"text_value":\s*"([^"]*)"', raw)
+
+        for v in text_values:
+            clean = v.replace('\\n', ' ').strip()
+            if not clean:
+                continue
+            doc.add_entity(TextEntity(
+                id=f'dwgread_{hash(clean) & 0xffffff:06x}',
+                source='dwg', page=1, confidence=1.0,
+                text=clean,
+            ))
+
+        return True  # signal: entities added, no ezdxf Document needed
+
     def _consume_entity(self, e, doc: Document) -> None:
-        """Translate one ezdxf entity into one or more IR entities and
-        append to doc.entities. Skips entities we don't know how to
-        handle (we add new mappings as new source types appear)."""
         typ = e.dxftype()
         handle = getattr(e.dxf, 'handle', '')
         layer = getattr(e.dxf, 'layer', '')
@@ -150,18 +251,45 @@ class DWGLoader(BaseLoader):
             ))
 
         elif typ == 'INSERT':
-            doc.add_entity(SymbolEntity(
+            name = getattr(e.dxf, 'name', '') or ''
+            insert = e.dxf.insert if hasattr(e.dxf, 'insert') else (0, 0, 0)
+            x, y = insert[0], insert[1]
+
+            if not name and abs(x) < 2 and abs(y) < 2:
+                return
+
+            syment = SymbolEntity(
                 id=handle, source='dwg', page=1, confidence=1.0,
-                layer=layer,
-                name=getattr(e.dxf, 'name', ''),
-            ))
+                layer=layer, name=name,
+            )
+            syment.custom_fields['insert_x'] = float(x)
+            syment.custom_fields['insert_y'] = float(y)
+            doc.add_entity(syment)
+
+            for att in getattr(e, 'attribs', []):
+                tag = getattr(att.dxf, 'tag', '') or ''
+                val = getattr(att.dxf, 'text', '') or ''
+                tag_upper = tag.upper().strip()
+                if not tag_upper or not val.strip():
+                    continue
+                if tag_upper in _DWG_TEXT_ATTR_KEYS or any(
+                    tag_upper.endswith(s) for s in ('NO', 'NAME', 'CODE', 'TYPE')
+                ):
+                    doc.add_entity(TextEntity(
+                        id=f'{handle}__{tag}',
+                        source='dwg', page=1, confidence=1.0,
+                        layer=layer,
+                        text=val.strip(),
+                        custom_fields={
+                            'attrib_tag': tag_upper,
+                            'insert_x': float(x),
+                            'insert_y': float(y),
+                            'block': name,
+                        },
+                    ))
 
 
-# Register accepted suffixes (even if ezdxf isn't installed, the
-# suffix dispatch still routes here; load() handles the missing-dep case)
 _register_suffix(DWGLoader, '.dwg')
 _register_suffix(DWGLoader, '.dxf')
 
-
 __all__ = ['DWGLoader']
-
