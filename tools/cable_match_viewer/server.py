@@ -470,8 +470,8 @@ def main() -> None:
     )
     parser.add_argument('-l', '--listen', type=int, default=PORT_DEFAULT,
                         help=f'Port (default {PORT_DEFAULT})')
-    parser.add_argument('-b', '--bind', default='127.0.0.1',
-                        help='Bind address (default 127.0.0.1; use 0.0.0.0 for LAN)')
+    parser.add_argument('-b', '--bind', default='0.0.0.0',
+                        help='Bind address (default 0.0.0.0 for LAN access)')
     parser.add_argument('--db', required=True,
                         help='Path to cable.db')
     parser.add_argument('--input-root',
