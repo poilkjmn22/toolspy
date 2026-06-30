@@ -8,7 +8,7 @@ cleaner entry that:
   4. Persists everything to one cable.db
 
 Usage:
-  cable_engine.cli scan <input_dir> --csv <cables.csv> --output <dir>
+  cable_engine.cli scan <input_dir> [--csv <cables.csv>] --output <dir>
 
 Note: this module is the canonical entry. The old scripts/cable_match.py
 remains as a thin wrapper for backwards compatibility with run_union.sh
@@ -211,11 +211,12 @@ def cmd_scan(args: argparse.Namespace) -> int:
         import tempfile
         db_path = Path(tempfile.mkdtemp()) / 'cable.db'
 
-    targets = _load_targets(Path(args.csv).expanduser())
-    if not targets:
-        print(f'ERROR: no targets loaded from {args.csv}', file=sys.stderr)
-        return 1
-    print(f'Loaded {len(targets)} unique targets from CSV', flush=True)
+    targets: list[str] = []
+    if args.csv:
+        targets = _load_targets(Path(args.csv).expanduser())
+        print(f'Loaded {len(targets)} unique targets from CSV', flush=True)
+    else:
+        print('No --csv provided; running in extraction-only mode (no cable matching)', flush=True)
     print(f'Input:  {input_dir}', flush=True)
     print(f'Output: {output_root}', flush=True)
     print(f'DB:     {db_path}', flush=True)
@@ -225,7 +226,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
     store.set_state('started_at', time.strftime('%Y-%m-%dT%H:%M:%S'))
     store.set_state('input', str(input_dir))
     store.set_state('output', str(output_root))
-    store.set_state('csv', str(args.csv))
+    store.set_state('csv', str(args.csv) if args.csv else '')
     store.set_state('dpi', args.dpi)
     store.set_state('lang', args.lang)
     store.set_state('engine', args.engine)
@@ -339,7 +340,7 @@ def _build_argparser() -> argparse.ArgumentParser:
 
     s = sub.add_parser('scan', help='Scan a directory tree for cable IDs')
     s.add_argument('--input', required=True, help='Input directory to scan recursively')
-    s.add_argument('--csv', required=True, help='CSV file with 电缆编号 column')
+    s.add_argument('--csv', help='CSV file with 电缆编号 column (optional; skip matching if omitted)')
     s.add_argument('--output', help='Output root for matched PDFs (default: same as --input)')
     s.add_argument('--db-name', help='Cable DB filename (default: cable.db)')
     s.add_argument('--no-db', action='store_true', help='Skip writing to cable.db (debug only)')
