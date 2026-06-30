@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import subprocess
 from pathlib import Path
@@ -21,6 +22,8 @@ def _content_hash(p: Path) -> str:
             h.update(chunk)
     return h.hexdigest()
 
+
+_ENTITY_RE = re.compile(r'"entity":\s*"(\w+)"')
 
 _DWG_TEXT_ATTR_KEYS = frozenset([
     'WIRECODE', 'EQUCODE', 'EQUNAME', 'NO', 'ObjTerm.Name',
@@ -53,6 +56,17 @@ class DWGLoader(BaseLoader):
             ))
             return doc
 
+        suffix = document_path.suffix.lower()
+        if suffix == '.dwg':
+            try:
+                import ezdxf
+                _ = ezdxf  # silence unused
+            except ImportError:
+                pass
+            loaded = self._open_via_dwgread(document_path, doc)
+            if loaded:
+                return doc
+
         try:
             import ezdxf
         except ImportError as e:
@@ -62,35 +76,21 @@ class DWGLoader(BaseLoader):
             ))
             return doc
 
-        dwg = self._open_document(document_path, doc)
-        if dwg is None:
-            return doc
-        if dwg is True:
-            return doc
-
-        msp = dwg.modelspace()
-        for e in msp:
-            try:
-                self._consume_entity(e, doc)
-            except Exception:
-                pass
+        dwg = self._open_document_via_ezdxf(document_path, doc)
+        if dwg and dwg is not True:
+            msp = dwg.modelspace()
+            for e in msp:
+                try:
+                    self._consume_entity(e, doc)
+                except Exception:
+                    pass
         return doc
 
-    def _open_document(self, path: Path, doc: Document):
+    def _open_document_via_ezdxf(self, path: Path, doc: Document):
         import ezdxf
         from ezdxf.lldxf.const import DXFStructureError
 
-        suffix = path.suffix.lower()
-
-        # .dwg files: try dwgread JSON first (more reliable for libredwg)
-        # then fall back to ezdxf
-        if suffix == '.dwg':
-            result = self._open_via_dwgread(path, doc)
-            if result is not None:
-                return result
-
-        # .dxf files: try ezdxf first
-        for _ in range(2):
+        for attempt in range(2):
             try:
                 return ezdxf.readfile(str(path))
             except DXFStructureError as e:
@@ -109,12 +109,8 @@ class DWGLoader(BaseLoader):
                 pass
             break
 
-        # Last resort: try dwgread JSON for .dxf files too
         result = self._open_via_dwgread(path, doc)
-        if result is not None:
-            return result
-
-        return None
+        return result
 
     def _fix_dxf_blocks(self, path: Path) -> Path | None:
         try:
@@ -128,15 +124,14 @@ class DWGLoader(BaseLoader):
         if end < 0:
             return None
         blocks_raw = txt[start:end]
-        seqend_count = blocks_raw.count('\n  0\nSEQEND\n')
         insert_count = blocks_raw.count('\n  0\nINSERT\n')
+        seqend_count = blocks_raw.count('\n  0\nSEQEND\n')
         diff = seqend_count - insert_count
         if diff <= 0:
             return None
         lines = blocks_raw.split('\n')
         fixed_lines = []
         seen_insert = False
-        removed = 0
         for line in lines:
             if line.strip() == 'INSERT':
                 seen_insert = True
@@ -145,15 +140,10 @@ class DWGLoader(BaseLoader):
                 if seen_insert:
                     seen_insert = False
                     fixed_lines.append(line)
-                else:
-                    removed += 1
             else:
                 fixed_lines.append(line)
-        if removed == 0:
-            return None
-        patched = '\n'.join(fixed_lines)
         dst = path.parent / (path.stem + '_blocks_fixed.dxf')
-        dst.write_text(txt[:start] + patched + txt[end:], encoding='utf-8')
+        dst.write_text(txt[:start] + '\n'.join(fixed_lines) + txt[end:], encoding='utf-8')
         return dst
 
     def _fix_dxf_utf8(self, path: Path) -> Path | None:
@@ -176,41 +166,286 @@ class DWGLoader(BaseLoader):
         dst.write_text('\n'.join(clean), encoding='utf-8')
         return dst
 
-    def _open_via_dwgread(self, path: Path, doc: Document):
+    # ------------------------------------------------------------------
+    # Comprehensive dwgread JSON parser
+    # ------------------------------------------------------------------
+    def _open_via_dwgread(self, path: Path, doc: Document) -> bool:
         try:
             r = subprocess.run(
                 ['dwgread', '-O', 'JSON', str(path)],
                 capture_output=True, timeout=30,
             )
             if r.returncode != 0:
-                return None
+                return False
             raw = r.stdout.decode('utf-8', errors='replace')
         except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False
+
+        self._parse_json_entities(raw, doc)
+        return True
+
+    def _parse_json_entities(self, raw: str, doc: Document) -> None:
+        entity_id = [0]
+        text_seen: set[str] = set()
+
+        for m in _ENTITY_RE.finditer(raw):
+            etype = m.group(1)
+            idx = m.start()
+            start = raw.rfind('{', max(0, idx - 2000), idx)
+            if start < 0:
+                continue
+            depth = 0
+            end = start
+            for i in range(start, len(raw)):
+                if raw[i] == '{':
+                    depth += 1
+                elif raw[i] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        end = i + 1
+                        break
+            block = raw[start:end]
+
+            try:
+                if etype in ('TEXT', 'MTEXT'):
+                    self._parse_text_entity(block, etype, doc, entity_id, text_seen)
+                elif etype == 'ATTRIB':
+                    self._parse_attrib_entity(block, doc, entity_id, text_seen)
+                elif etype == 'LINE':
+                    self._parse_line_entity(block, doc, entity_id)
+                elif etype == 'LWPOLYLINE':
+                    self._parse_lwpolyline_entity(block, doc, entity_id)
+                elif etype == 'CIRCLE':
+                    self._parse_circle_entity(block, doc, entity_id)
+                elif etype == 'INSERT':
+                    self._parse_insert_entity(block, doc, entity_id)
+                elif etype == 'SPLINE':
+                    self._parse_spline_entity(block, doc, entity_id)
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # Individual entity parsers
+    # ------------------------------------------------------------------
+    def _json_field(self, block: str, *keys: str) -> str | None:
+        for key in keys:
+            p = f'"{key}":'
+            i = block.find(p)
+            if i >= 0:
+                val_start = i + len(p)
+                line_end = block.find('\n', val_start)
+                val = block[val_start:line_end].strip().rstrip(',')
+                return val
+        return None
+
+    def _json_point(self, block: str, key: str) -> tuple[float, float] | None:
+        p = f'"{key}":'
+        i = block.find(p)
+        if i < 0:
+            return None
+        val_start = block.find('[', i) + 1
+        if val_start <= 0:
+            return None
+        val_end = block.find(']', val_start)
+        if val_end < 0:
+            return None
+        parts = block[val_start:val_end].split(',')
+        try:
+            return (float(parts[0].strip()), float(parts[1].strip()))
+        except (ValueError, IndexError):
             return None
 
-        text_values = []
-        try:
-            import ijson
-            with open(path.with_suffix('.json'), 'wb') as f:
-                f.write(r.stdout)
-        except ImportError:
-            text_values = re.findall(r'"text_value":\s*"([^"]*)"', raw)
+    def _json_points_array(self, block: str, key: str) -> list[tuple[float, float]]:
+        p = f'"{key}":'
+        i = block.find(p)
+        if i < 0:
+            return []
+        arr_start = block.find('[', i) + 1
+        if arr_start <= 0:
+            return []
+        depth = 0
+        arr_end = arr_start
+        for j in range(arr_start, len(block)):
+            ch = block[j]
+            if ch == '[':
+                depth += 1
+            elif ch == ']':
+                if depth == 0:
+                    arr_end = j
+                    break
+                depth -= 1
+        arr_raw = block[arr_start:arr_end]
+        pts = []
+        for m in re.finditer(r'\{\s*"x":\s*([^,]+),\s*"y":\s*([^}]+)\s*\}', arr_raw):
+            try:
+                pts.append((float(m.group(1)), float(m.group(2))))
+            except ValueError:
+                pass
+        return pts
 
-        if not text_values:
-            text_values = re.findall(r'"text_value":\s*"([^"]*)"', raw)
+    def _json_first_float(self, block: str, *keys: str) -> float | None:
+        v = self._json_field(block, *keys)
+        if v:
+            try:
+                return float(v.strip())
+            except ValueError:
+                pass
+        return None
 
-        for v in text_values:
-            clean = v.replace('\\n', ' ').strip()
-            if not clean:
-                continue
-            doc.add_entity(TextEntity(
-                id=f'dwgread_{hash(clean) & 0xffffff:06x}',
+    def _json_str(self, block: str, *keys: str) -> str:
+        v = self._json_field(block, *keys)
+        if v:
+            return v.strip().strip('"')
+        return ''
+
+    def _parse_text_entity(self, block: str, etype: str, doc: Document,
+                           eid: list, text_seen: set) -> None:
+        text = self._json_str(block, 'text_value', 'default_value')
+        if not text or not text.strip():
+            return
+        text = text.strip()
+        if text in text_seen and len(text) < 60:
+            return
+        text_seen.add(text) if len(text) < 60 else None
+        pt = self._json_point(block, 'ins_pt')
+        rot = self._json_first_float(block, 'rotation') or 0.0
+        height = self._json_first_float(block, 'height')
+        layer = self._json_str(block, 'layer')
+        eid[0] += 1
+        ent = TextEntity(
+            id=f'dwg_txt_{eid[0]}',
+            source='dwg', page=1, confidence=1.0,
+            text=text,
+        )
+        ent.custom_fields = {
+                'x': pt[0] if pt else None,
+                'y': pt[1] if pt else None,
+                'rotation': rot,
+                'height': height,
+                'layer': layer,
+            }
+        doc.add_entity(ent)
+
+    def _parse_attrib_entity(self, block: str, doc: Document,
+                              eid: list, text_seen: set) -> None:
+        text = self._json_str(block, 'text_value', 'default_value')
+        tag = self._json_str(block, 'tag')
+        if not text or not text.strip():
+            return
+        text = text.strip()
+        tag_upper = tag.upper().strip()
+        pt = self._json_point(block, 'ins_pt')
+        rel = tag_upper in _DWG_TEXT_ATTR_KEYS or any(
+            tag_upper.endswith(s) for s in ('NO', 'NAME', 'CODE', 'TYPE')
+        )
+        if rel or text not in text_seen:
+            if len(text) < 60:
+                text_seen.add(text)
+            eid[0] += 1
+            ent = TextEntity(
+                id=f'dwg_att_{eid[0]}',
                 source='dwg', page=1, confidence=1.0,
-                text=clean,
+                text=text,
+            )
+            ent.custom_fields = {
+                    'attrib_tag': tag_upper,
+                    'x': pt[0] if pt else None,
+                    'y': pt[1] if pt else None,
+                }
+            doc.add_entity(ent)
+
+    def _parse_line_entity(self, block: str, doc: Document, eid: list) -> None:
+        start = self._json_point(block, 'start')
+        end = self._json_point(block, 'end')
+        if not start or not end:
+            return
+        layer = self._json_str(block, 'layer')
+        eid[0] += 1
+        doc.add_entity(LineEntity(
+            id=f'dwg_line_{eid[0]}',
+            source='dwg', page=1, confidence=1.0,
+            layer=layer,
+            points=[Point(start[0], start[1]), Point(end[0], end[1])],
+        ))
+
+    def _parse_lwpolyline_entity(self, block: str, doc: Document, eid: list) -> None:
+        pts = self._json_points_array(block, 'points')
+        if not pts:
+            return
+        layer = self._json_str(block, 'layer')
+        eid[0] += 1
+        point_objs = [Point(x, y) for x, y in pts]
+        if len(pts) == 2:
+            doc.add_entity(LineEntity(
+                id=f'dwg_line_{eid[0]}',
+                source='dwg', page=1, confidence=1.0,
+                layer=layer, points=point_objs,
+            ))
+        else:
+            doc.add_entity(PolylineEntity(
+                id=f'dwg_poly_{eid[0]}',
+                source='dwg', page=1, confidence=1.0,
+                layer=layer, points=point_objs,
             ))
 
-        return True  # signal: entities added, no ezdxf Document needed
+    def _parse_circle_entity(self, block: str, doc: Document, eid: list) -> None:
+        center = self._json_point(block, 'center')
+        radius = self._json_first_float(block, 'radius')
+        if not center or not radius:
+            return
+        layer = self._json_str(block, 'layer')
+        eid[0] += 1
+        pts = []
+        for angle_deg in range(0, 360, 10):
+            rad = angle_deg * 3.14159 / 180
+            pts.append(Point(
+                center[0] + radius * __import__('math').cos(rad),
+                center[1] + radius * __import__('math').sin(rad),
+            ))
+        doc.add_entity(PolylineEntity(
+            id=f'dwg_circle_{eid[0]}',
+            source='dwg', page=1, confidence=1.0,
+            layer=layer, points=pts,
+        ))
 
+    def _parse_insert_entity(self, block: str, doc: Document, eid: list) -> None:
+        name = self._json_str(block, 'name')
+        pt = self._json_point(block, 'ins_pt')
+        rotation = self._json_first_float(block, 'rotation') or 0.0
+        layer = self._json_str(block, 'layer')
+
+        if not name and pt and abs(pt[0]) < 2 and abs(pt[1]) < 2:
+            return
+
+        eid[0] += 1
+        syment = SymbolEntity(
+            id=f'dwg_ins_{eid[0]}',
+            source='dwg', page=1, confidence=1.0,
+            layer=layer, name=name,
+        )
+        syment.custom_fields = {
+            'insert_x': pt[0] if pt else None,
+            'insert_y': pt[1] if pt else None,
+            'rotation': rotation,
+        }
+        doc.add_entity(syment)
+
+    def _parse_spline_entity(self, block: str, doc: Document, eid: list) -> None:
+        pts = self._json_points_array(block, 'control_points', 'fit_pts')
+        if not pts:
+            return
+        layer = self._json_str(block, 'layer')
+        eid[0] += 1
+        doc.add_entity(PolylineEntity(
+            id=f'dwg_spline_{eid[0]}',
+            source='dwg', page=1, confidence=1.0,
+            layer=layer,
+            points=[Point(x, y) for x, y in pts],
+        ))
+
+    # ------------------------------------------------------------------
+    # ezdxf entity consumer (fallback for clean DXF files)
+    # ------------------------------------------------------------------
     def _consume_entity(self, e, doc: Document) -> None:
         typ = e.dxftype()
         handle = getattr(e.dxf, 'handle', '')
@@ -240,23 +475,18 @@ class DWGLoader(BaseLoader):
                 ))
 
         elif typ in ('TEXT', 'MTEXT'):
-            text = (
-                e.plain_text() if typ == 'MTEXT'
-                else e.dxf.text
-            )
+            text = (e.plain_text() if typ == 'MTEXT' else e.dxf.text) or ''
             doc.add_entity(TextEntity(
                 id=handle, source='dwg', page=1, confidence=1.0,
-                layer=layer, text=text or '',
+                layer=layer, text=text,
             ))
 
         elif typ == 'INSERT':
             name = getattr(e.dxf, 'name', '') or ''
             insert = e.dxf.insert if hasattr(e.dxf, 'insert') else (0, 0, 0)
             x, y = insert[0], insert[1]
-
             if not name and abs(x) < 2 and abs(y) < 2:
                 return
-
             syment = SymbolEntity(
                 id=handle, source='dwg', page=1, confidence=1.0,
                 layer=layer, name=name,
@@ -264,7 +494,6 @@ class DWGLoader(BaseLoader):
             syment.custom_fields['insert_x'] = float(x)
             syment.custom_fields['insert_y'] = float(y)
             doc.add_entity(syment)
-
             for att in getattr(e, 'attribs', []):
                 tag = getattr(att.dxf, 'tag', '') or ''
                 val = getattr(att.dxf, 'text', '') or ''
@@ -277,12 +506,10 @@ class DWGLoader(BaseLoader):
                     doc.add_entity(TextEntity(
                         id=f'{handle}__{tag}',
                         source='dwg', page=1, confidence=1.0,
-                        layer=layer,
-                        text=val.strip(),
+                        layer=layer, text=val.strip(),
                         custom_fields={
                             'attrib_tag': tag_upper,
-                            'insert_x': float(x),
-                            'insert_y': float(y),
+                            'insert_x': float(x), 'insert_y': float(y),
                             'block': name,
                         },
                     ))
