@@ -127,11 +127,12 @@ CREATE TABLE IF NOT EXISTS relations(
 );
 
 CREATE TABLE IF NOT EXISTS graph_nodes(
-    id INTEGER PRIMARY KEY,
+    id TEXT PRIMARY KEY,
     page INTEGER,
     x REAL,
     y REAL,
-    node_type TEXT
+    node_type TEXT,
+    label TEXT
 );
 
 CREATE TABLE IF NOT EXISTS graph_edges(

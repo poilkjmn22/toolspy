@@ -31,7 +31,8 @@ from cable_engine.loaders import get_loader_for
 from cable_engine.match import find_matches
 from cable_engine.pipeline import Context, Pipeline
 from cable_engine.stages import (
-    CopyStage, MatchStage, OCRStage, PersistStage, RasterizeStage,
+    CopyStage, FusionStage, GraphStage, MatchStage,
+    OCRStage, PersistStage, RasterizeStage,
 )
 from cable_engine.storage import CableStore
 
@@ -105,6 +106,8 @@ def _pipeline_for(doc_type: DocumentType, ctx: Context, targets: list[str],
         store=store, input_root=input_root,
         no_state=ctx.no_state,
     ))
+    stages.append(FusionStage(store=store))
+    stages.append(GraphStage(store=store))
 
     if output_root is not None and doc_type == DocumentType.PDF:
         stages.append(CopyStage(
