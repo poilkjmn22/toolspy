@@ -34,7 +34,7 @@ INDEX_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <title>Cable Viewer</title>
-<script src="https://cdn.jsdelivr.net/npm/@file-viewer/web-full@latest/dist/flyfish-file-viewer-web-full.iife.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@file-viewer/web-full@latest/dist/flyfish-file-viewer-web-full.iife.js" crossorigin="anonymous"></script>
 <style>
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; height: 100%; font-family: -apple-system, "SF Pro", "Helvetica Neue", Arial, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 13px; color: #222; background: #fafafa; }
@@ -100,6 +100,7 @@ INDEX_HTML = """<!DOCTYPE html>
       locale="zh-CN"
       theme="light"
       toolbar-position="bottom-right"
+      worker-url="https://cdn.jsdelivr.net/npm/@file-viewer/web-full@latest/dist/wasm/cad/dwg-worker.js"
     ></flyfish-file-viewer>
   </div>
 </div>
