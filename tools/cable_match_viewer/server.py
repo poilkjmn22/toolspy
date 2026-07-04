@@ -140,22 +140,30 @@ async function selectCable(cableId) {
 
 function renderDetail(d) {
   let html = `<div class="cable-id">${d.cable_id}</div>`;
-  if (d.conductors.length && d.conductors[0].cabinet_name) {
-    html += `<div style="font-size:12px;color:#666;margin-bottom:10px;">柜体: ${d.conductors[0].cabinet_name}</div>`;
-  }
+
+  // Source type badge
+  const sourceType = d.conductors.length ? d.conductors[0].source_type : '';
+  const badge = sourceType === 'terminal_strip' ? '端子排图' : sourceType === 'circuit_loop' ? '回路图' : '未知';
+  html += `<span style="display:inline-block;padding:2px 8px;border-radius:3px;font-size:11px;font-weight:600;background:${sourceType === 'terminal_strip' ? '#e3f2fd' : '#fff3e0'};color:${sourceType === 'terminal_strip' ? '#1565c0' : '#e65100'};margin-bottom:10px;">${badge}</span>`;
+
+  // Cabinet info
+  const cabinetLocal = d.conductors.length ? (d.conductors[0].cabinet_name || '--') : '--';
+  const cabinetRemote = d.conductors.length ? (d.conductors[0].cabinet_name_remote || '--') : '--';
+  html += `<div style="font-size:12px;color:#666;margin-bottom:10px;">本端柜体: ${cabinetLocal} &nbsp;|&nbsp; 对端柜体: ${cabinetRemote}</div>`;
+
   html += `<div class="section"><h3>线芯 (${d.conductor_count})</h3>`;
   if (!d.conductors.length) html += '<div class="empty-state">无关联线芯</div>';
   else {
     html += '<table style="width:100%;border-collapse:collapse;font-size:12px;">';
-    html += '<tr style="background:#f5f5f5;font-weight:600;"><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">线芯</th><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">左侧端子</th><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">右侧端子</th><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">回路描述</th><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">回路编号</th></tr>';
+    html += '<tr style="background:#f5f5f5;font-weight:600;"><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">线芯</th><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">端子</th><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">对端端子</th><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">回路描述</th><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">回路编号</th></tr>';
     d.conductors.forEach((c, i) => {
       const no = c.conductor_no || (i + 1);
-      const strip = c.strip_name || '-';
-      const tn = c.terminal_no != null ? c.terminal_no : '-';
-      const tn_right = c.terminal_no_right || '-';
-      const desc = c.circuit_desc || '-';
-      const loop = c.loop_id || '-';
-      html += `<tr style="border-bottom:1px solid #eee;"><td style="padding:4px 6px;font-family:monospace;">${no}</td><td style="padding:4px 6px;font-family:monospace;">${strip}:${tn}</td><td style="padding:4px 6px;font-family:monospace;">${tn_right}</td><td style="padding:4px 6px;">${desc}</td><td style="padding:4px 6px;font-family:monospace;">${loop}</td></tr>`;
+      const strip = c.strip_name || '--';
+      const tn = c.terminal_no != null ? c.terminal_no : '--';
+      const remote = c.terminal_no_remote || '--';
+      const desc = c.circuit_desc || '--';
+      const loop = c.loop_id || '--';
+      html += `<tr style="border-bottom:1px solid #eee;"><td style="padding:4px 6px;font-family:monospace;">${no}</td><td style="padding:4px 6px;font-family:monospace;">${strip}:${tn}</td><td style="padding:4px 6px;font-family:monospace;">${remote}</td><td style="padding:4px 6px;">${desc}</td><td style="padding:4px 6px;font-family:monospace;">${loop}</td></tr>`;
     });
     html += '</table>';
   }

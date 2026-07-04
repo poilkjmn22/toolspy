@@ -283,12 +283,38 @@ class TerminalStripAnalyzer:
                     return int(txt)
         return None
 
+    def _find_remote_cabinet(self, h_y: float, texts: list) -> Optional[str]:
+        """Find remote cabinet name from ATTRIB with tag='EQUNAME'
+        near the horizontal line y (to the right of cable labels)."""
+        candidates = []
+        for e in texts:
+            if not isinstance(e, AttributeEntity):
+                continue
+            if (e.tag or '').upper() != 'EQUNAME':
+                continue
+            cf = getattr(e, 'custom_fields', None) or {}
+            ex = cf.get('x')
+            ey = cf.get('y')
+            if ex is None or ey is None:
+                continue
+            if abs(ey - h_y) > 10:
+                continue
+            val = (e.text or '').strip()
+            if val:
+                candidates.append((ex, val))
+        if not candidates:
+            return None
+        # Pick the rightmost EQUNAME (farthest from cable labels on the left)
+        candidates.sort(key=lambda c: -c[0])
+        return candidates[0][1]
+
     def _analyze_one_cable(self, cable_id, horizontals, verticals, texts):
         if not horizontals:
             return []
         h = horizontals[0]
         hpts = list(h.points or [])
         h_y = hpts[0].y if hpts else 0.0
+        cabinet_name_remote = self._find_remote_cabinet(h_y, texts)
         records: list[dict] = []
         for v in verticals:
             pts = list(v.points or [])
@@ -308,7 +334,7 @@ class TerminalStripAnalyzer:
                 end_y = pts[0].y
             conductor_no = self._find_conductor_no(vx, h_y, texts)
             column_texts = _collect_texts_along_vertical(vx, corner_y, end_y, texts)
-            circuit_desc, terminal_no, loop_id, unknown_busi = _classify_column_text(column_texts)
+            circuit_desc, terminal_no, loop_id, _ = _classify_column_text(column_texts)
             strip_name: Optional[str] = None
             if terminal_no is not None:
                 for item in column_texts:
@@ -320,11 +346,11 @@ class TerminalStripAnalyzer:
                 'conductor_no': conductor_no,
                 'strip_name': strip_name,
                 'terminal_no': terminal_no,
-                'terminal_no_right': None,
+                'terminal_no_remote': None,
                 'cabinet_name': self._cabinet_name,
+                'cabinet_name_remote': cabinet_name_remote,
                 'circuit_desc': circuit_desc,
                 'loop_id': loop_id,
-                'unknown_busi': unknown_busi,
                 'source_type': 'terminal_strip',
             })
         return records
@@ -427,19 +453,19 @@ class CircuitLoopAnalyzer:
                     except ValueError:
                         pass
 
-                # Right terminal (full ID string, e.g. "9D:1")
-                terminal_no_right = info.get('right_terminal')
+                # Remote terminal (full ID string, e.g. "9D:1")
+                terminal_no_remote = info.get('right_terminal')
 
                 records.append({
                     'cable_id': cid,
                     'conductor_no': core,
                     'strip_name': strip_name,
                     'terminal_no': terminal_no,
-                    'terminal_no_right': terminal_no_right,
+                    'terminal_no_remote': terminal_no_remote,
                     'cabinet_name': None,
+                    'cabinet_name_remote': None,
                     'circuit_desc': circuit_desc,
                     'loop_id': loop_id,
-                    'unknown_busi': None,
                     'source_type': 'circuit_loop',
                 })
         return records
@@ -487,11 +513,11 @@ class TopologyStage(Stage):
                 conductor_no=rec['conductor_no'],
                 strip_name=rec['strip_name'],
                 terminal_no=rec['terminal_no'],
-                terminal_no_right=rec.get('terminal_no_right'),
+                terminal_no_remote=rec.get('terminal_no_remote'),
                 cabinet_name=rec.get('cabinet_name'),
+                cabinet_name_remote=rec.get('cabinet_name_remote'),
                 circuit_desc=rec['circuit_desc'],
                 loop_id=rec['loop_id'],
-                unknown_busi=rec['unknown_busi'],
                 document_hash=doc.content_hash,
                 source_type=rec['source_type'],
             )
