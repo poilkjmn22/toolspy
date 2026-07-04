@@ -72,6 +72,8 @@ CREATE TABLE IF NOT EXISTS cable_topology (
     conductor_no    INTEGER,
     strip_name      TEXT,
     terminal_no     INTEGER,
+    terminal_no_right TEXT,
+    cabinet_name    TEXT,
     circuit_desc    TEXT,
     loop_id         TEXT,
     unknown_busi    TEXT,
@@ -204,19 +206,23 @@ class CableStore:
         conductor_no: Optional[int],
         strip_name: Optional[str],
         terminal_no: Optional[int],
-        circuit_desc: Optional[str],
-        loop_id: Optional[str],
-        unknown_busi: Optional[str],
-        document_hash: str,
+        terminal_no_right: Optional[str] = None,
+        cabinet_name: Optional[str] = None,
+        circuit_desc: Optional[str] = None,
+        loop_id: Optional[str] = None,
+        unknown_busi: Optional[str] = None,
+        document_hash: str = '',
         source_type: str = 'terminal_strip',
     ) -> None:
         self._conn.execute(
             """INSERT INTO cable_topology
                    (cable_id, conductor_no, strip_name, terminal_no,
+                    terminal_no_right, cabinet_name,
                     circuit_desc, loop_id, unknown_busi,
                     document_hash, source_type)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (cable_id, conductor_no, strip_name, terminal_no,
+             terminal_no_right, cabinet_name,
              circuit_desc, loop_id, unknown_busi,
              document_hash, source_type),
         )

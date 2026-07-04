@@ -226,7 +226,17 @@ class TerminalStripAnalyzer:
     """Analyze a terminal-strip DWG and emit cable_topology records."""
     MIN_VERTICAL_LENGTH = 20.0
 
+    def _find_cabinet_name(self, texts: list) -> Optional[str]:
+        """Find cabinet name from text containing '端子排图'."""
+        for e in texts:
+            txt = (e.text or '').strip()
+            if '端子排图' in txt:
+                name = txt.replace('端子排图', '').strip()
+                return name if name else txt
+        return None
+
     def analyze(self, doc: Document) -> list[dict]:
+        self._cabinet_name = None
         emitted: list[dict] = []
         lines: list[LineGeometry] = []
         texts: list = []
@@ -235,6 +245,7 @@ class TerminalStripAnalyzer:
                 lines.append(e)
             elif isinstance(e, (TextEntity, AttributeEntity)):
                 texts.append(e)
+        self._cabinet_name = self._find_cabinet_name(texts)
         cable_groups: dict[str, dict] = {}
         for line in lines:
             cf = getattr(line, 'custom_fields', None) or {}
@@ -309,6 +320,8 @@ class TerminalStripAnalyzer:
                 'conductor_no': conductor_no,
                 'strip_name': strip_name,
                 'terminal_no': terminal_no,
+                'terminal_no_right': None,
+                'cabinet_name': self._cabinet_name,
                 'circuit_desc': circuit_desc,
                 'loop_id': loop_id,
                 'unknown_busi': unknown_busi,
@@ -414,14 +427,19 @@ class CircuitLoopAnalyzer:
                     except ValueError:
                         pass
 
+                # Right terminal (full ID string, e.g. "9D:1")
+                terminal_no_right = info.get('right_terminal')
+
                 records.append({
                     'cable_id': cid,
                     'conductor_no': core,
                     'strip_name': strip_name,
                     'terminal_no': terminal_no,
+                    'terminal_no_right': terminal_no_right,
+                    'cabinet_name': None,
                     'circuit_desc': circuit_desc,
                     'loop_id': loop_id,
-                    'unknown_busi': info.get('right_terminal'),
+                    'unknown_busi': None,
                     'source_type': 'circuit_loop',
                 })
         return records
@@ -469,6 +487,8 @@ class TopologyStage(Stage):
                 conductor_no=rec['conductor_no'],
                 strip_name=rec['strip_name'],
                 terminal_no=rec['terminal_no'],
+                terminal_no_right=rec.get('terminal_no_right'),
+                cabinet_name=rec.get('cabinet_name'),
                 circuit_desc=rec['circuit_desc'],
                 loop_id=rec['loop_id'],
                 unknown_busi=rec['unknown_busi'],

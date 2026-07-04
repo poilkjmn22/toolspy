@@ -61,9 +61,11 @@ class CableViewer:
                 'conductor_no': r['conductor_no'],
                 'strip_name': r['strip_name'],
                 'terminal_no': r['terminal_no'],
+                'terminal_no_right': r['terminal_no_right'],
+                'cabinet_name': r['cabinet_name'],
                 'circuit_desc': r['circuit_desc'],
                 'loop_id': r['loop_id'],
-                'unknown_busi': r['unknown_busi'],
+                'source_type': r['source_type'],
             })
             dh = r['document_hash']
             if dh:

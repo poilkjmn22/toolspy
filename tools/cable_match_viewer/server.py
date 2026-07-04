@@ -140,19 +140,22 @@ async function selectCable(cableId) {
 
 function renderDetail(d) {
   let html = `<div class="cable-id">${d.cable_id}</div>`;
+  if (d.conductors.length && d.conductors[0].cabinet_name) {
+    html += `<div style="font-size:12px;color:#666;margin-bottom:10px;">柜体: ${d.conductors[0].cabinet_name}</div>`;
+  }
   html += `<div class="section"><h3>线芯 (${d.conductor_count})</h3>`;
   if (!d.conductors.length) html += '<div class="empty-state">无关联线芯</div>';
   else {
     html += '<table style="width:100%;border-collapse:collapse;font-size:12px;">';
-    html += '<tr style="background:#f5f5f5;font-weight:600;"><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">线芯</th><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">端子排</th><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">端子</th><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">回路描述</th><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">回路编号</th><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">其他</th></tr>';
+    html += '<tr style="background:#f5f5f5;font-weight:600;"><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">线芯</th><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">左侧端子</th><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">右侧端子</th><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">回路描述</th><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">回路编号</th></tr>';
     d.conductors.forEach((c, i) => {
       const no = c.conductor_no || (i + 1);
       const strip = c.strip_name || '-';
       const tn = c.terminal_no != null ? c.terminal_no : '-';
+      const tn_right = c.terminal_no_right || '-';
       const desc = c.circuit_desc || '-';
       const loop = c.loop_id || '-';
-      const unk = c.unknown_busi || '-';
-      html += `<tr style="border-bottom:1px solid #eee;"><td style="padding:4px 6px;font-family:monospace;">${no}</td><td style="padding:4px 6px;font-family:monospace;">${strip}:${tn}</td><td style="padding:4px 6px;">${tn}</td><td style="padding:4px 6px;">${desc}</td><td style="padding:4px 6px;font-family:monospace;">${loop}</td><td style="padding:4px 6px;font-family:monospace;">${unk}</td></tr>`;
+      html += `<tr style="border-bottom:1px solid #eee;"><td style="padding:4px 6px;font-family:monospace;">${no}</td><td style="padding:4px 6px;font-family:monospace;">${strip}:${tn}</td><td style="padding:4px 6px;font-family:monospace;">${tn_right}</td><td style="padding:4px 6px;">${desc}</td><td style="padding:4px 6px;font-family:monospace;">${loop}</td></tr>`;
     });
     html += '</table>';
   }
