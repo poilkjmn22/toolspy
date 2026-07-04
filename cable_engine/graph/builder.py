@@ -382,17 +382,17 @@ class CircuitLoopAnalyzer:
     """
 
     def analyze(self, doc: Document) -> list[dict]:
-        # Collect all ATTRIB entities with position (x, y)
         attribs: list[dict] = []
         for e in doc.entities:
-            if isinstance(e, AttributeEntity):
+            if isinstance(e, (AttributeEntity, TextEntity)):
                 cf = getattr(e, 'custom_fields', None) or {}
                 x = cf.get('x')
                 y = cf.get('y')
                 if x is None or y is None:
                     continue
+                tag = e.tag if isinstance(e, AttributeEntity) else ''
                 attribs.append({
-                    'tag': e.tag or '',
+                    'tag': tag,
                     'val': (e.text or '').strip(),
                     'x': x,
                     'y': y,
@@ -411,70 +411,89 @@ class CircuitLoopAnalyzer:
                     cable_cores[cid][core] = {
                         'x': a['x'],
                         'y': a['y'],
-                        'row_y': a['y'],
                     }
 
-        # For each core, find OTHER ATTRIB entities with same cable
-        # by matching y within CORE_TOLERANCE
-        _CORE_TOLERANCE = 1.0  # mm — max y diff between texts in same core row
-        for cid, cores in cable_cores.items():
-            for core, info in cores.items():
-                cy = info['y']
-                for a in attribs:
-                    if a['tag'] == 'WireSerial':
-                        continue
-                    if abs(a['y'] - cy) > _CORE_TOLERANCE:
-                        continue
-                    tag = a['tag']
-                    val = a['val']
-                    if tag == 'WireDescription' and not info.get('circuit_desc'):
-                        info['circuit_desc'] = val
-                    elif tag == 'LoopCode' and not info.get('loop_id'):
-                        info['loop_id'] = val
-                    elif tag == 'NO':
-                        # Collect NO tags. Filter by max x distance from
-                        # the WireSerial to avoid cross-cable interference
-                        # (e.g. 21CD:1 at same y but 240mm away).
-                        dx = abs(a['x'] - info.get('x', a['x']))
-                        if dx > 200:
-                            continue
-                        if not info.get('_no_tags'):
-                            info['_no_tags'] = []
-                        info['_no_tags'].append((a['x'], val))
-                    elif tag == 'InOut' and not info.get('direction'):
-                        info['direction'] = val
-                    elif tag == 'ToOtherEqu' and not info.get('equipment'):
-                        info['equipment'] = val
+        # Pre-scan: collect horizontal LINE/LWPOLYLINE for core-line detection
+        core_lines: list[dict] = []
+        for e in doc.entities:
+            if not isinstance(e, LineGeometry):
+                continue
+            pts = list(e.points or [])
+            if len(pts) < 2:
+                continue
+            ys = [p.y for p in pts]
+            xs = [p.x for p in pts]
+            if max(ys) - min(ys) > 3:
+                continue
+            core_lines.append({
+                'y': ys[0],
+                'x_min': min(xs),
+                'x_max': max(xs),
+            })
 
-        # Build records — sort cores by y position (physical drawing
-        # order, top-to-bottom = descending y). Core numbers may be
-        # non-sequential (e.g. 4,5,6,1,2,3) in multi-column layouts.
+        # Group NO tags and cable-level ATTRIB by y position
+        no_tags_by_y: dict[int, list[tuple[float, str]]] = {}
+        cable_attribs: dict[str, list[dict]] = {}  # tag → [(x, y, val)]
+        for a in attribs:
+            if a['tag'] == 'NO' and ':' in a['val']:
+                key = round(a['y'] * 2)
+                no_tags_by_y.setdefault(key, []).append((a['x'], a['val']))
+            elif a['tag'] in ('WireDescription', 'LoopCode', 'WIRECODE'):
+                cable_attribs.setdefault(a['tag'], []).append(a)
+
         records: list[dict] = []
         for cid in sorted(cable_cores.keys()):
             cores = cable_cores[cid]
             core_order = sorted(cores.items(), key=lambda kv: -kv[1]['y'])
             for core, info in core_order:
-                circuit_desc = info.get('circuit_desc')
-                loop_id = info.get('loop_id')
+                wx = info['x']
+                wy = info['y']
 
-                # Resolve left/right terminals from collected NO tags.
-                # If >2 NO tags at this y row, pick the closest pair
-                # (by x distance) to avoid cross-cable interference.
-                no_tags = info.get('_no_tags', [])
-                if len(no_tags) >= 2:
-                    # Find the closest pair by x distance
-                    best_pair = None
-                    best_dist = float('inf')
-                    for i in range(len(no_tags)):
-                        for j in range(i + 1, len(no_tags)):
-                            d = abs(no_tags[i][0] - no_tags[j][0])
-                            if d < best_dist:
-                                best_dist = d
-                                best_pair = (no_tags[i], no_tags[j])
-                    no_tags = list(best_pair) if best_pair else no_tags[:2]
-                no_tags.sort(key=lambda t: t[0])  # sort by x
-                left_terminal = no_tags[0][1] if len(no_tags) >= 1 else None
-                right_terminal = no_tags[1][1] if len(no_tags) >= 2 else None
+                # Step 1: find the core line below the WireSerial
+                core_y = wy
+                for cl in core_lines:
+                    if cl['y'] > wy and cl['x_min'] <= wx <= cl['x_max']:
+                        core_y = cl['y']
+                        break
+
+                # Step 2: find NO tags by matching y position (same row).
+                # Pick the EXTREME pair: smallest x = left terminal,
+                # largest x = right terminal. This naturally picks the
+                # correct III:xxx / Xx:xxx pair per core row.
+                left_candidate: Optional[tuple[float, str]] = None
+                right_candidate: Optional[tuple[float, str]] = None
+                key = round(core_y * 2)
+                for dk in (-1, 0, 1):
+                    for nx, nv in no_tags_by_y.get(key + dk, []):
+                        if left_candidate is None or nx < left_candidate[0]:
+                            left_candidate = (nx, nv)
+                        if right_candidate is None or nx > right_candidate[0]:
+                            right_candidate = (nx, nv)
+
+                left_terminal = left_candidate[1] if left_candidate else None
+                right_terminal = right_candidate[1] if right_candidate else None
+                # If both terminals are the same entity, clear right
+                if left_candidate and right_candidate and left_candidate[0] == right_candidate[0]:
+                    right_terminal = None
+
+                # Step 3: circuit_desc/loop_id — find the nearest
+                # WireDescription and LoopCode ATTRIB to the cable's
+                # y range (scanning within 80mm y of core_y).
+                circuit_desc = None
+                loop_id = None
+                for tag in ('WireDescription', 'LoopCode'):
+                    candidates = cable_attribs.get(tag, [])
+                    best = None
+                    best_dy = float('inf')
+                    for a in candidates:
+                        dy = abs(a['y'] - core_y)
+                        if dy < best_dy and dy < 80:
+                            best_dy = dy
+                            best = a['val']
+                    if tag == 'WireDescription':
+                        circuit_desc = best
+                    else:
+                        loop_id = best
 
                 # Extract strip_name:terminal_no from left terminal
                 strip_name = None
