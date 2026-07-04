@@ -416,7 +416,7 @@ class CircuitLoopAnalyzer:
 
         # For each core, find OTHER ATTRIB entities with same cable
         # by matching y within CORE_TOLERANCE
-        _CORE_TOLERANCE = 2.0  # mm — max y diff between texts in same core row
+        _CORE_TOLERANCE = 1.0  # mm — max y diff between texts in same core row
         for cid, cores in cable_cores.items():
             for core, info in cores.items():
                 cy = info['y']
@@ -432,29 +432,55 @@ class CircuitLoopAnalyzer:
                     elif tag == 'LoopCode' and not info.get('loop_id'):
                         info['loop_id'] = val
                     elif tag == 'NO':
-                        if a['x'] < 100 and not info.get('left_terminal'):
-                            info['left_terminal'] = val
-                        elif a['x'] >= 100 and not info.get('right_terminal'):
-                            info['right_terminal'] = val
+                        # Collect NO tags. Filter by max x distance from
+                        # the WireSerial to avoid cross-cable interference
+                        # (e.g. 21CD:1 at same y but 240mm away).
+                        dx = abs(a['x'] - info.get('x', a['x']))
+                        if dx > 200:
+                            continue
+                        if not info.get('_no_tags'):
+                            info['_no_tags'] = []
+                        info['_no_tags'].append((a['x'], val))
                     elif tag == 'InOut' and not info.get('direction'):
                         info['direction'] = val
                     elif tag == 'ToOtherEqu' and not info.get('equipment'):
                         info['equipment'] = val
 
-        # Build records
+        # Build records — sort cores by y position (physical drawing
+        # order, top-to-bottom = descending y). Core numbers may be
+        # non-sequential (e.g. 4,5,6,1,2,3) in multi-column layouts.
         records: list[dict] = []
-        for cid, cores in sorted(cable_cores.items()):
-            for core in sorted(cores.keys()):
-                info = cores[core]
-                # Circuit_desc from WireDescription
+        for cid in sorted(cable_cores.keys()):
+            cores = cable_cores[cid]
+            core_order = sorted(cores.items(), key=lambda kv: -kv[1]['y'])
+            for core, info in core_order:
                 circuit_desc = info.get('circuit_desc')
                 loop_id = info.get('loop_id')
-                # Extract strip_name:terminal_no from left terminal (closest to cable)
-                strip_name: Optional[str] = None
-                terminal_no: Optional[int] = None
-                lt = info.get('left_terminal', '')
-                if ':' in lt:
-                    parts = lt.split(':', 1)
+
+                # Resolve left/right terminals from collected NO tags.
+                # If >2 NO tags at this y row, pick the closest pair
+                # (by x distance) to avoid cross-cable interference.
+                no_tags = info.get('_no_tags', [])
+                if len(no_tags) >= 2:
+                    # Find the closest pair by x distance
+                    best_pair = None
+                    best_dist = float('inf')
+                    for i in range(len(no_tags)):
+                        for j in range(i + 1, len(no_tags)):
+                            d = abs(no_tags[i][0] - no_tags[j][0])
+                            if d < best_dist:
+                                best_dist = d
+                                best_pair = (no_tags[i], no_tags[j])
+                    no_tags = list(best_pair) if best_pair else no_tags[:2]
+                no_tags.sort(key=lambda t: t[0])  # sort by x
+                left_terminal = no_tags[0][1] if len(no_tags) >= 1 else None
+                right_terminal = no_tags[1][1] if len(no_tags) >= 2 else None
+
+                # Extract strip_name:terminal_no from left terminal
+                strip_name = None
+                terminal_no = None
+                if left_terminal and ':' in left_terminal:
+                    parts = left_terminal.split(':', 1)
                     strip_name = parts[0].strip()
                     try:
                         terminal_no = int(parts[1].strip())
@@ -462,7 +488,7 @@ class CircuitLoopAnalyzer:
                         pass
 
                 # Remote terminal (full ID string, e.g. "9D:1")
-                terminal_no_remote = info.get('right_terminal')
+                terminal_no_remote = right_terminal
 
                 records.append({
                     'cable_id': cid,
