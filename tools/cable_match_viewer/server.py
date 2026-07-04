@@ -34,6 +34,7 @@ INDEX_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <title>Cable Viewer</title>
+<script src="https://cdn.jsdelivr.net/npm/@file-viewer/web-full@latest/dist/flyfish-file-viewer-web-full.iife.js"></script>
 <style>
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; height: 100%; font-family: -apple-system, "SF Pro", "Helvetica Neue", Arial, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 13px; color: #222; background: #fafafa; }
@@ -54,17 +55,22 @@ INDEX_HTML = """<!DOCTYPE html>
   #detail .cable-id { font-family: "SF Mono", Menlo, monospace; font-size: 18px; font-weight: 600; margin-bottom: 10px; }
   #detail .section { margin: 18px 0; }
   #detail .section h3 { margin: 0 0 6px 0; font-size: 12px; color: #666; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 1px solid #eee; padding-bottom: 4px; }
-  #detail .terminal, #detail .loop, #detail .doc { padding: 4px 0; font-family: "SF Mono", Menlo, monospace; font-size: 12px; }
-  #detail .terminal .conf, #detail .loop .conf, #detail .doc .conf { color: #888; font-size: 10px; margin-left: 8px; }
-  #detail .doc { cursor: pointer; color: #06c; }
-  #detail .doc:hover { text-decoration: underline; }
+  #detail .doc-row { padding: 4px 0; display: flex; align-items: center; gap: 8px; font-size: 12px; }
+  #detail .doc-row .doc-link { cursor: pointer; color: #06c; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #detail .doc-row .doc-link:hover { text-decoration: underline; }
+  #detail .doc-row .doc-type { font-size: 10px; color: #888; }
+  #detail .doc-row .preview-btn { padding: 2px 10px; border: 1px solid #4dabf7; background: #e3f2fd; color: #1565c0; border-radius: 3px; cursor: pointer; font-size: 11px; white-space: nowrap; }
+  #detail .doc-row .preview-btn:hover { background: #bbdefb; }
   #detail .empty-state { color: #999; font-style: italic; padding: 4px 0; }
-  #preview { height: 360px; border-top: 1px solid #e0e0e0; background: #fff; display: flex; flex-direction: column; }
-  #preview-header { padding: 6px 14px; border-bottom: 1px solid #e0e0e0; font-size: 11px; color: #666; display: flex; justify-content: space-between; align-items: center; }
-  #preview-header .close { cursor: pointer; color: #888; }
-  #preview-header .close:hover { color: #c00; }
-  #preview-frame { flex: 1; width: 100%; border: none; }
-  #preview-hint { padding: 14px; color: #888; font-size: 12px; }
+
+  /* Full-screen flyfish modal */
+  #flyfish-modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: #000; z-index: 9999; flex-direction: column; }
+  #flyfish-modal.open { display: flex; }
+  #flyfish-modal-header { padding: 8px 16px; background: #1a1a2e; color: white; display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; }
+  #flyfish-modal-header .title { font-size: 13px; }
+  #flyfish-modal-header .close-btn { cursor: pointer; color: #ff6b6b; font-size: 18px; line-height: 1; padding: 0 4px; }
+  #flyfish-modal-body { flex: 1; min-height: 0; }
+  flyfish-file-viewer { width: 100%; height: 100%; display: block; }
 </style>
 </head>
 <body>
@@ -79,13 +85,22 @@ INDEX_HTML = """<!DOCTYPE html>
     <div id="detail">
       <div class="empty-state">← 选择一条电缆查看详情</div>
     </div>
-    <div id="preview" style="display:none">
-      <div id="preview-header">
-        <span id="preview-title"></span>
-        <span id="preview-close" class="close">关闭 ✕</span>
-      </div>
-      <iframe id="preview-frame"></iframe>
-    </div>
+  </div>
+</div>
+
+<!-- Full-screen flyfish modal -->
+<div id="flyfish-modal">
+  <div id="flyfish-modal-header">
+    <span class="title" id="flyfish-title"></span>
+    <span class="close-btn" id="flyfish-close">✕</span>
+  </div>
+  <div id="flyfish-modal-body">
+    <flyfish-file-viewer
+      id="flyfish-viewer"
+      locale="zh-CN"
+      theme="light"
+      toolbar-position="bottom-right"
+    ></flyfish-file-viewer>
   </div>
 </div>
 <script>
@@ -96,10 +111,10 @@ const $ = (id) => document.getElementById(id);
 const cableList = $('cable-list');
 const detail = $('detail');
 const search = $('search-input');
-const preview = $('preview');
-const previewTitle = $('preview-title');
-const previewFrame = $('preview-frame');
-const previewClose = $('preview-close');
+const flyfishModal = $('flyfish-modal');
+const flyfishViewer = $('flyfish-viewer');
+const flyfishTitle = $('flyfish-title');
+const flyfishClose = $('flyfish-close');
 
 async function loadCables() {
   const r = await fetch('/api/cables');
@@ -139,7 +154,7 @@ async function selectCable(cableId) {
 }
 
 function renderDetail(d) {
-  let html = `<div class="cable-id">${d.cable_id}</div>`;
+  let html = `<div class="cable-id">${escHtml(d.cable_id)}</div>`;
 
   // Source type badge
   const sourceType = d.conductors.length ? d.conductors[0].source_type : '';
@@ -149,7 +164,7 @@ function renderDetail(d) {
   // Cabinet info
   const cabinetLocal = d.conductors.length ? (d.conductors[0].cabinet_name || '--') : '--';
   const cabinetRemote = d.conductors.length ? (d.conductors[0].cabinet_name_remote || '--') : '--';
-  html += `<div style="font-size:12px;color:#666;margin-bottom:10px;">本端柜体: ${cabinetLocal} &nbsp;|&nbsp; 对端柜体: ${cabinetRemote}</div>`;
+  html += `<div style="font-size:12px;color:#666;margin-bottom:10px;">本端柜体: ${escHtml(cabinetLocal)} &nbsp;|&nbsp; 对端柜体: ${escHtml(cabinetRemote)}</div>`;
 
   html += `<div class="section"><h3>线芯 (${d.conductor_count})</h3>`;
   if (!d.conductors.length) html += '<div class="empty-state">无关联线芯</div>';
@@ -163,37 +178,51 @@ function renderDetail(d) {
       const remote = c.terminal_no_remote || '--';
       const desc = c.circuit_desc || '--';
       const loop = c.loop_id || '--';
-      html += `<tr style="border-bottom:1px solid #eee;"><td style="padding:4px 6px;font-family:monospace;">${no}</td><td style="padding:4px 6px;font-family:monospace;">${strip}:${tn}</td><td style="padding:4px 6px;font-family:monospace;">${remote}</td><td style="padding:4px 6px;">${desc}</td><td style="padding:4px 6px;font-family:monospace;">${loop}</td></tr>`;
+      html += `<tr style="border-bottom:1px solid #eee;"><td style="padding:4px 6px;font-family:monospace;">${no}</td><td style="padding:4px 6px;font-family:monospace;">${escHtml(strip)}:${tn}</td><td style="padding:4px 6px;font-family:monospace;">${escHtml(remote)}</td><td style="padding:4px 6px;">${escHtml(desc)}</td><td style="padding:4px 6px;font-family:monospace;">${escHtml(loop)}</td></tr>`;
     });
     html += '</table>';
   }
   html += `</div>`;
   html += `<div class="section"><h3>来源图纸 (${d.documents.length})</h3>`;
-  html += d.documents.map(doc =>
-    `<div class="doc" data-hash="${doc.document.content_hash}">${doc.document.rel_path || doc.document.content_hash}<span class="conf">${doc.document.document_type}</span></div>`
-  ).join('');
+  html += d.documents.map(doc => {
+    const rel = doc.document.rel_path || doc.document.content_hash;
+    return `<div class="doc-row">
+      <span class="doc-link" data-hash="${doc.document.content_hash}">${escHtml(rel)}</span>
+      <span class="doc-type">${doc.document.document_type}</span>
+      <span class="preview-btn" data-hash="${doc.document.content_hash}" data-name="${escHtml(rel)}">预览</span>
+    </div>`;
+  }).join('');
   html += `</div>`;
   detail.innerHTML = html;
-  detail.querySelectorAll('.doc').forEach(el => {
-    el.onclick = () => previewDoc(el.dataset.hash);
+
+  // Doc link click → open flyfish
+  detail.querySelectorAll('.doc-link').forEach(el => {
+    el.onclick = () => openFlyfish(el.dataset.hash, el.textContent.trim());
+  });
+  detail.querySelectorAll('.preview-btn').forEach(el => {
+    el.onclick = () => openFlyfish(el.dataset.hash, el.dataset.name);
   });
 }
 
-async function previewDoc(hash) {
-  const r = await fetch('/api/document/' + encodeURIComponent(hash));
-  if (!r.ok) return;
-  const d = await r.json();
-  previewTitle.textContent = d.rel_path || hash;
-  previewFrame.src = '/api/document/' + encodeURIComponent(hash) + '/file';
-  preview.style.display = 'flex';
+function openFlyfish(hash, name) {
+  flyfishTitle.textContent = name || hash;
+  flyfishViewer.setAttribute('src', '/api/document/' + encodeURIComponent(hash) + '/file');
+  flyfishViewer.setAttribute('filename', name || 'preview.dwg');
+  flyfishModal.classList.add('open');
 }
 
-previewClose.onclick = () => {
-  preview.style.display = 'none';
-  previewFrame.src = '';
+flyfishClose.onclick = () => {
+  flyfishModal.classList.remove('open');
+  flyfishViewer.removeAttribute('src');
+  flyfishViewer.removeAttribute('filename');
 };
 
 search.oninput = renderCables;
+
+function escHtml(s) {
+  if (!s) return s;
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
 
 loadCables().catch(e => {
   $('stats').textContent = '加载失败: ' + e;

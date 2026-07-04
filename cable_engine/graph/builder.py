@@ -145,8 +145,16 @@ def _find_strip_name(
     closest_one: Optional[tuple[float, float]] = None
     closest_dist = float('inf')
     for ox, oy in ones:
-        if ox < terminal_x:
+        if ox < terminal_x - 1.0:
             d = terminal_x - ox
+            if d < closest_dist:
+                closest_dist = d
+                closest_one = (ox, oy)
+    # If no "1" strictly left, fallback: use the closest "1"
+    # (handles terminal_no=1 where terminal IS the strip start)
+    if closest_one is None:
+        for ox, oy in ones:
+            d = abs(ox - terminal_x)
             if d < closest_dist:
                 closest_dist = d
                 closest_one = (ox, oy)
