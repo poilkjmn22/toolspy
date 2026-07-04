@@ -1,456 +1,242 @@
-#!/usr/bin/env python3
-"""cable_match_viewer.server — aiohttp HTTP server for cable.db.
+"""cable_viewer.server — V5 minimal viewer.
 
-Routes:
-    GET  /                     — main HTML+JS shell (flyfish viewer frontend)
-    GET  /api/summary          — global stats
-    GET  /api/documents        — all documents in cable.db
-    GET  /api/document/{hash}  — one document with entities + matches
-    GET  /api/cables           — all matched cables
-    GET  /api/cable/{cable}    — documents for one cable
-    GET  /file?hash=<hash>     — stream PDF file from disk
-    GET  /healthz              — liveness
+Layout:
+  - Left column: cable list (scrollable, click to select)
+  - Right column: cable detail (terminals, loops, source docs)
+  - Bottom drawer: file preview iframe (PDF via built-in viewer,
+    DWG served as application/octet-stream with a "download" hint)
+
+The viewer is intentionally minimal — no graph visualization, no
+complex topology renderer. Per the V5 spec, it answers two
+questions:
+  1. "What cables are in the project?"  (left column)
+  2. "Where does cable X connect?"       (right column, on-demand)
+  3. "Show me the source document."      (bottom drawer)
 """
 
 from __future__ import annotations
 
 import argparse
-import asyncio
-import json
 import mimetypes
-import socket
+import sqlite3
+from functools import partial
 from pathlib import Path
 
 from aiohttp import web
-import aiohttp
 
-from .viewer import CableDbViewer
+from cable_engine.storage import CableStore, open_db, ensure_schema
 
-PORT_DEFAULT = 8003
-
-# ---------------------------------------------------------------------------
-# Local IP discovery
-# ---------------------------------------------------------------------------
-def get_local_ip() -> str:
-    for iface in ('en0', 'en1'):
-        try:
-            import subprocess
-            out = subprocess.check_output(
-                ['ipconfig', 'getifaddr', iface], stderr=subprocess.DEVNULL
-            ).decode().strip()
-            if out:
-                return out
-        except Exception:
-            pass
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.settimeout(0.2)
-        s.connect(("192.168.1.1", 80))
-        return s.getsockname()[0]
-    except Exception:
-        return "127.0.0.1"
-    finally:
-        s.close()
+from .store import CableViewer
 
 
-# ---------------------------------------------------------------------------
-# Inline HTML+JS shell (flyfish viewer CDN)
-# ---------------------------------------------------------------------------
-HTML_PAGE = r"""<!DOCTYPE html>
+INDEX_HTML = """<!DOCTYPE html>
 <html lang="zh">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Cable Match Viewer</title>
-<script src="/flyfish/flyfish-file-viewer-web-full.iife.js"></script>
+<title>Cable Viewer</title>
 <style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  html, body { height: 100%; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 13px; color: #222; background: #fafafa; }
-  body { display: flex; flex-direction: column; overflow: hidden; }
-  #header { padding: 10px 16px; background: #1a1a2e; color: white; display: flex; align-items: center; gap: 12px; flex-shrink: 0; flex-wrap: wrap; }
-  #header h1 { font-size: 16px; font-weight: 600; }
-  #header .stats { font-size: 12px; opacity: 0.85; flex: 1; }
-  #main { flex: 1; display: flex; min-height: 0; }
-  #left, #mid, #right { height: 100%; overflow-y: auto; }
-  #left { width: 280px; background: white; border-right: 1px solid #e0e0e0; flex-shrink: 0; }
-  #mid { width: 380px; background: white; border-right: 1px solid #e0e0e0; flex-shrink: 0; display: flex; flex-direction: column; }
-  #right { flex: 1; display: flex; flex-direction: column; min-width: 0; background: #f5f5f5; }
-  .tree-section { padding: 8px 12px 4px; font-size: 11px; font-weight: 600; color: #888; text-transform: uppercase; letter-spacing: 0.5px; border-top: 1px solid #f0f0f0; }
-  .tree-section:first-child { border-top: none; }
-  .cable-item, .doc-item { padding: 4px 12px; cursor: pointer; display: flex; align-items: center; gap: 6px; user-select: none; }
-  .cable-item:hover, .doc-item:hover { background: #f0f7ff; }
-  .cable-item.selected, .doc-item.selected { background: #d0e8ff; font-weight: 600; }
-  .cable-item .badge { background: #4dabf7; color: white; border-radius: 9px; padding: 0 6px; font-size: 10px; min-width: 18px; text-align: center; }
-  .doc-item .type-badge { font-size: 10px; padding: 1px 5px; border-radius: 3px; color: white; }
-  .type-badge.dwg { background: #845ef7; }
-  .type-badge.pdf { background: #e64980; }
-  .doc-item .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  #mid h2 { padding: 10px 16px; font-size: 13px; background: #f7f7f7; border-bottom: 1px solid #e0e0e0; flex-shrink: 0; }
-  #mid .tab-bar { display: flex; border-bottom: 1px solid #e0e0e0; flex-shrink: 0; background: #f7f7f7; }
-  #mid .tab-btn { padding: 8px 16px; cursor: pointer; font-size: 12px; border: none; background: transparent; border-bottom: 2px solid transparent; }
-  #mid .tab-btn.active { border-bottom-color: #4dabf7; font-weight: 600; background: white; }
-  #mid .tab-content { flex: 1; overflow-y: auto; }
-  .entity-row { padding: 4px 12px; border-bottom: 1px solid #f0f0f0; font-size: 12px; display: flex; gap: 8px; align-items: flex-start; }
-  .entity-row .type { font-weight: 600; color: #4dabf7; min-width: 50px; }
-  .entity-row .text { font-family: 'SF Mono', Menlo, monospace; font-size: 11px; white-space: pre-wrap; word-break: break-all; color: #333; flex: 1; }
-  .entity-row .meta { color: #888; font-size: 10px; min-width: 40px; text-align: right; }
-  .match-row { padding: 4px 12px; border-bottom: 1px solid #e8f5e9; background: #f1f8e9; font-size: 12px; }
-  .match-row .cable { color: #2e7d32; font-weight: 600; }
-  .match-row .tier { font-size: 10px; color: #888; }
-  .empty { padding: 40px 16px; text-align: center; color: #999; font-size: 13px; }
-  .loading { padding: 16px; text-align: center; color: #999; font-size: 12px; }
-  /* Right pane: flyfish viewer */
-  #right { padding: 0; }
-  #right .placeholder { flex: 1; display: flex; align-items: center; justify-content: center; color: #999; font-size: 14px; }
-  flyfish-file-viewer { width: 100%; height: 100%; display: block; }
-  /* Search */
-  #search { padding: 5px 10px; border: 1px solid #444; border-radius: 4px; background: rgba(255,255,255,0.1); color: white; width: 180px; }
-  #search::placeholder { color: rgba(255,255,255,0.5); }
-  #search:focus { outline: none; background: rgba(255,255,255,0.2); }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; height: 100%; font-family: -apple-system, "SF Pro", "Helvetica Neue", Arial, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 13px; color: #222; background: #fafafa; }
+  #app { display: flex; height: 100vh; }
+  #left { width: 280px; border-right: 1px solid #e0e0e0; background: #fff; display: flex; flex-direction: column; }
+  #right { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #header { padding: 10px 14px; border-bottom: 1px solid #e0e0e0; font-weight: 600; font-size: 14px; }
+  #stats { padding: 6px 14px; border-bottom: 1px solid #e0e0e0; color: #888; font-size: 11px; }
+  #search { padding: 6px 10px; border-bottom: 1px solid #e0e0e0; }
+  #search input { width: 100%; padding: 5px 8px; border: 1px solid #ccc; border-radius: 3px; font-size: 12px; }
+  #cable-list { flex: 1; overflow-y: auto; }
+  .cable-row { padding: 5px 14px; cursor: pointer; display: flex; justify-content: space-between; align-items: center; font-family: "SF Mono", Menlo, monospace; font-size: 12px; }
+  .cable-row:hover { background: #f0f7ff; }
+  .cable-row.selected { background: #d0e8ff; font-weight: 600; }
+  .cable-row .cnt { color: #888; font-size: 11px; }
+  .empty { padding: 14px; text-align: center; color: #999; font-size: 12px; }
+  #detail { flex: 1; overflow-y: auto; padding: 14px 18px; }
+  #detail .cable-id { font-family: "SF Mono", Menlo, monospace; font-size: 18px; font-weight: 600; margin-bottom: 10px; }
+  #detail .section { margin: 18px 0; }
+  #detail .section h3 { margin: 0 0 6px 0; font-size: 12px; color: #666; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 1px solid #eee; padding-bottom: 4px; }
+  #detail .terminal, #detail .loop, #detail .doc { padding: 4px 0; font-family: "SF Mono", Menlo, monospace; font-size: 12px; }
+  #detail .terminal .conf, #detail .loop .conf, #detail .doc .conf { color: #888; font-size: 10px; margin-left: 8px; }
+  #detail .doc { cursor: pointer; color: #06c; }
+  #detail .doc:hover { text-decoration: underline; }
+  #detail .empty-state { color: #999; font-style: italic; padding: 4px 0; }
+  #preview { height: 360px; border-top: 1px solid #e0e0e0; background: #fff; display: flex; flex-direction: column; }
+  #preview-header { padding: 6px 14px; border-bottom: 1px solid #e0e0e0; font-size: 11px; color: #666; display: flex; justify-content: space-between; align-items: center; }
+  #preview-header .close { cursor: pointer; color: #888; }
+  #preview-header .close:hover { color: #c00; }
+  #preview-frame { flex: 1; width: 100%; border: none; }
+  #preview-hint { padding: 14px; color: #888; font-size: 12px; }
 </style>
 </head>
 <body>
-<div id="header">
-  <h1>Cable Match Viewer</h1>
-  <div class="stats" id="header-stats">加载中…</div>
-  <input id="search" type="text" placeholder="搜索 cable / document">
-</div>
-<div id="main">
+<div id="app">
   <div id="left">
-    <div class="tree-section">📄 文档</div>
-    <div id="doc-list"></div>
-    <div class="tree-section">🔌 匹配 Cable</div>
-    <div id="cable-list"></div>
-  </div>
-  <div id="mid">
-    <div id="mid-placeholder" class="placeholder" style="flex:1;display:flex;align-items:center;justify-content:center">
-      ← 从左侧选择文档或 cable
-    </div>
+    <div id="header">电缆列表</div>
+    <div id="stats">加载中…</div>
+    <div id="search"><input id="search-input" placeholder="过滤电缆…"></div>
+    <div id="cable-list"><div class="empty">加载中…</div></div>
   </div>
   <div id="right">
-    <div class="placeholder" id="right-placeholder">← 选文档后在右侧预览</div>
+    <div id="detail">
+      <div class="empty-state">← 选择一条电缆查看详情</div>
+    </div>
+    <div id="preview" style="display:none">
+      <div id="preview-header">
+        <span id="preview-title"></span>
+        <span id="preview-close" class="close">关闭 ✕</span>
+      </div>
+      <iframe id="preview-frame"></iframe>
+    </div>
   </div>
 </div>
-
 <script>
-const state = {
-  documents: [],
-  cables: [],
-  selectedDoc: null,
-  selectedCable: null,
-  docDetail: null,
-  filter: '',
-};
+let allCables = [];
+let selectedCable = null;
 
 const $ = (id) => document.getElementById(id);
-
-async function api(path) {
-  const r = await fetch(path);
-  if (!r.ok) throw new Error(`${path} → ${r.status}`);
-  return await r.json();
-}
-
-async function loadSummary() {
-  const s = await api('/api/summary');
-  $('header-stats').innerHTML = [
-    `${s.documents} documents`,
-    `${s.entities} entities`,
-    `${s.matches} matches`,
-    `${s.cables_with_matches}/${s.total_cables} cables`,
-    `engine: ${s.engine_used}`,
-  ].join(' &nbsp;·&nbsp; ');
-}
-
-async function loadDocuments() {
-  state.documents = await api('/api/documents');
-  renderLeftPane();
-}
+const cableList = $('cable-list');
+const detail = $('detail');
+const search = $('search-input');
+const preview = $('preview');
+const previewTitle = $('preview-title');
+const previewFrame = $('preview-frame');
+const previewClose = $('preview-close');
 
 async function loadCables() {
-  state.cables = await api('/api/cables');
-  renderLeftPane();
+  const r = await fetch('/api/cables');
+  allCables = await r.json();
+  renderCables();
+  $('stats').textContent = `共 ${allCables.length} 条电缆`;
 }
 
-function renderLeftPane() {
-  const filter = state.filter.toLowerCase();
-  const left = $('left');
-
-  // Documents
-  const docs = state.documents.filter(d => !filter || (d.pdf_rel_path || '').toLowerCase().includes(filter));
-  const docHtml = docs.map(d => {
-    const rel = d.pdf_rel_path || d.content_hash || '';
-    const style = d.document_type === 'dwg' ? 'dwg' : 'pdf';
-    return `<div class="doc-item${state.selectedDoc === d.content_hash ? ' selected' : ''}" data-hash="${d.content_hash}">
-      <span class="type-badge ${style}">${style}</span>
-      <span class="name" title="${rel}">${rel.slice(-50)}</span>
-    </div>`;
-  }).join('') || '<div class="empty">无文档</div>';
-
-  // Cables
-  const cables = state.cables.filter(c => !filter || c.cable.toLowerCase().includes(filter));
-  const cableHtml = cables.map(c => {
-    return `<div class="cable-item${state.selectedCable === c.cable ? ' selected' : ''}" data-cable="${c.cable}">
-      <span class="badge">${c.match_count}</span>
-      <span>${c.cable}</span>
-    </div>`;
-  }).join('') || '<div class="empty">无匹配电缆</div>';
-
-  left.innerHTML = `
-    <div class="tree-section">📄 文档 (${docs.length})</div>
-    ${docHtml}
-    <div class="tree-section">🔌 匹配 Cable (${cables.length})</div>
-    ${cableHtml}
-  `;
-
-  left.querySelectorAll('.doc-item').forEach(el => {
-    el.onclick = () => selectDocument(el.dataset.hash);
-  });
-  left.querySelectorAll('.cable-item').forEach(el => {
+function renderCables() {
+  const q = search.value.trim().toLowerCase();
+  const filtered = q ? allCables.filter(c => c.cable_id.toLowerCase().includes(q)) : allCables;
+  if (!filtered.length) {
+    cableList.innerHTML = '<div class="empty">没有匹配的电缆</div>';
+    return;
+  }
+  cableList.innerHTML = filtered.map(c =>
+    `<div class="cable-row ${selectedCable === c.cable_id ? 'selected' : ''}" data-cable="${c.cable_id}">
+       <span>${c.cable_id}</span>
+       <span class="cnt">×${c.occurrence_count}</span>
+     </div>`
+  ).join('');
+  cableList.querySelectorAll('.cable-row').forEach(el => {
     el.onclick = () => selectCable(el.dataset.cable);
   });
 }
 
-async function selectDocument(hash) {
-  state.selectedDoc = hash;
-  state.selectedCable = null;
-  state.docDetail = null;
-  renderLeftPane();
-
-  try {
-    const detail = await api(`/api/document/${hash}`);
-    state.docDetail = detail;
-    renderMidPane('document');
-    renderRightPane(detail);
-  } catch (e) {
-    $('mid').innerHTML = `<div class="empty">加载失败: ${e.message}</div>`;
-  }
-}
-
-async function selectCable(cable) {
-  state.selectedCable = cable;
-  state.selectedDoc = null;
-  state.docDetail = null;
-  renderLeftPane();
-  try {
-    const data = await api(`/api/cable/${encodeURIComponent(cable)}`);
-    renderMidPane('cable', data);
-    $('right').innerHTML = '<div class="placeholder">← 选文档看预览</div>';
-  } catch (e) {
-    $('mid').innerHTML = `<div class="empty">无此 cable: ${cable}</div>`;
-  }
-}
-
-function renderMidPane(mode, data) {
-  const mid = $('mid');
-  if (mode === 'document' && state.docDetail) {
-    const d = state.docDetail;
-    const rel = d.pdf_rel_path || 'unknown';
-    const docType = d.document_type || '?';
-    const entities = d.entities || [];
-    const matches = d.matches || [];
-    const ocrPages = d.ocr_pages || [];
-
-    const textEntities = entities.filter(e => e.entity_type === 'text' && e.text && e.text.trim());
-    const lineEntities = entities.filter(e => e.entity_type === 'line');
-
-    let html = `<h2>${rel.slice(-60)} <span class="type-badge ${docType}">${docType}</span></h2>`;
-    html += `<div class="tab-bar">
-      <button class="tab-btn active" data-tab="entities">实体 (${entities.length})</button>
-      <button class="tab-btn" data-tab="matches">匹配 (${matches.length})</button>
-      <button class="tab-btn" data-tab="ocr">OCR (${ocrPages.length})</button>
-    </div>`;
-    html += `<div class="tab-content" id="tab-entities">
-      ${textEntities.slice(0, 200).map(e =>
-        `<div class="entity-row">
-          <span class="type">text</span>
-          <span class="text">${escHtml((e.text || '').slice(0, 120))}</span>
-          <span class="meta">${e.confidence || ''}</span>
-        </div>`
-      ).join('')}
-      ${textEntities.length > 200 ? `<div class="empty">…还有 ${textEntities.length - 200} 个</div>` : ''}
-    </div>`;
-
-    let matchHtml = matches.map(m =>
-      `<div class="match-row"><span class="cable">${escHtml(m.cable)}</span> <span class="tier">(${m.tier})</span></div>`
-    ).join('') || '<div class="empty">无匹配</div>';
-    html += `<div class="tab-content" id="tab-matches" style="display:none">${matchHtml}</div>`;
-
-    let ocrHtml = ocrPages.map(p =>
-      `<div class="entity-row">
-        <span class="type">page ${p.page}</span>
-        <span class="text">${escHtml((p.text || '').slice(0, 500))}</span>
-      </div>`
-    ).join('') || '<div class="empty">无 OCR 文本</div>';
-    html += `<div class="tab-content" id="tab-ocr" style="display:none">${ocrHtml}</div>`;
-
-    mid.innerHTML = html;
-
-    // Tab switching
-    mid.querySelectorAll('.tab-btn').forEach(btn => {
-      btn.onclick = () => {
-        mid.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-        mid.querySelectorAll('.tab-content').forEach(c => c.style.display = 'none');
-        btn.classList.add('active');
-        const tab = $('tab-' + btn.dataset.tab);
-        if (tab) tab.style.display = '';
-      };
-    });
-  } else if (mode === 'cable' && data) {
-    const docs = data.documents || [];
-    let html = `<h2>${escHtml(data.cable)} <span class="count">(${docs.length} documents)</span></h2>`;
-    docs.forEach(d => {
-      const rel = d.pdf_rel_path || d.content_hash || '';
-      const style = d.document_type === 'dwg' ? 'dwg' : 'pdf';
-      html += `<div class="doc-item" data-hash="${d.content_hash}">
-        <span class="type-badge ${style}">${style}</span>
-        <span class="name">${rel.slice(-50)}</span>
-      </div>`;
-    });
-    html += '</div>';
-    mid.innerHTML = html;
-    mid.querySelectorAll('.doc-item').forEach(el => {
-      el.onclick = () => selectDocument(el.dataset.hash);
-    });
-  }
-}
-
-function renderRightPane(detail) {
-  if (!detail) {
-    $('right').innerHTML = '<div class="placeholder">无文档数据</div>';
+async function selectCable(cableId) {
+  selectedCable = cableId;
+  renderCables();
+  const r = await fetch('/api/cable/' + encodeURIComponent(cableId));
+  if (!r.ok) {
+    detail.innerHTML = '<div class="empty-state">未找到此电缆</div>';
     return;
   }
-  const rel = detail.pdf_rel_path || '';
-  const hash = detail.content_hash;
-  const fileUrl = `/file?hash=${hash}`;
-  const sourceFile = detail.source_file || rel;
-  const ext = sourceFile.split('.').pop().toLowerCase();
-  const docType = detail.document_type || '';
-
-  $('right').innerHTML = `
-    <div id="preview-container" style="width:100%;height:100%;display:flex;flex-direction:column;">
-      <flyfish-file-viewer
-        id="preview"
-        src="${fileUrl}"
-        filename="${sourceFile}"
-        locale="zh-CN"
-        theme="light"
-        toolbar-position="bottom-right"
-        style="width:100%;height:100%"
-      ></flyfish-file-viewer>
-    </div>
-  `;
-
-  // Error fallback: if flyfish fails, show entities
-  const viewer = document.getElementById('preview');
-  viewer.addEventListener('viewer-error', (e) => {
-    console.warn('Flyfish preview error, showing entity fallback', e.detail);
-    showEntityFallback(detail);
-  });
-
-  // Timeout fallback: if no ready event within 30s
-  let ready = false;
-  const timer = setTimeout(() => {
-    if (!ready) {
-      console.warn('Flyfish preview timeout, showing entity fallback');
-      showEntityFallback(detail);
-    }
-  }, 30000);
-  viewer.addEventListener('viewer-ready', () => { ready = true; clearTimeout(timer); });
+  const data = await r.json();
+  renderDetail(data);
 }
 
-function showEntityFallback(detail) {
-  const entities = detail.entities || [];
-  const textEntities = entities.filter(e => e.entity_type === 'text' && e.text && e.text.trim());
-  const matches = detail.matches || [];
-  const ocrPages = detail.ocr_pages || [];
-  let html = `<div class="placeholder" style="padding:16px;text-align:left;font-size:13px;color:#555;">
-    <p style="color:#e74c3c;margin-bottom:8px;">⚠ 文档预览不可用，显示提取的实体数据</p>`;
-  if (matches.length) {
-    html += `<p><b>匹配:</b> ${matches.map(m => m.cable).join(', ')}</p>`;
+function renderDetail(d) {
+  let html = `<div class="cable-id">${d.cable_id}</div>`;
+  html += `<div class="section"><h3>线芯 (${d.conductor_count})</h3>`;
+  if (!d.conductors.length) html += '<div class="empty-state">无关联线芯</div>';
+  else {
+    html += '<table style="width:100%;border-collapse:collapse;font-size:12px;">';
+    html += '<tr style="background:#f5f5f5;font-weight:600;"><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">线芯</th><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">端子排</th><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">端子</th><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">回路描述</th><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">回路编号</th><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">其他</th></tr>';
+    d.conductors.forEach((c, i) => {
+      const no = c.conductor_no || (i + 1);
+      const strip = c.strip_name || '-';
+      const tn = c.terminal_no != null ? c.terminal_no : '-';
+      const desc = c.circuit_desc || '-';
+      const loop = c.loop_id || '-';
+      const unk = c.unknown_busi || '-';
+      html += `<tr style="border-bottom:1px solid #eee;"><td style="padding:4px 6px;font-family:monospace;">${no}</td><td style="padding:4px 6px;font-family:monospace;">${strip}:${tn}</td><td style="padding:4px 6px;">${tn}</td><td style="padding:4px 6px;">${desc}</td><td style="padding:4px 6px;font-family:monospace;">${loop}</td><td style="padding:4px 6px;font-family:monospace;">${unk}</td></tr>`;
+    });
+    html += '</table>';
   }
-  html += `<p><b>文本实体:</b> ${textEntities.length} 个</p>`;
-  html += `<div style="max-height:300px;overflow-y:auto;margin-top:8px;font-family:monospace;font-size:11px;background:#f9f9f9;padding:8px;border-radius:4px;">`;
-  textEntities.slice(0, 100).forEach(e => {
-    html += `<div>${escHtml((e.text || '').slice(0, 120))}</div>`;
+  html += `</div>`;
+  html += `<div class="section"><h3>来源图纸 (${d.documents.length})</h3>`;
+  html += d.documents.map(doc =>
+    `<div class="doc" data-hash="${doc.document.content_hash}">${doc.document.rel_path || doc.document.content_hash}<span class="conf">${doc.document.document_type}</span></div>`
+  ).join('');
+  html += `</div>`;
+  detail.innerHTML = html;
+  detail.querySelectorAll('.doc').forEach(el => {
+    el.onclick = () => previewDoc(el.dataset.hash);
   });
-  if (textEntities.length > 100) html += `<div>…还有 ${textEntities.length - 100} 个</div>`;
-  html += `</div></div>`;
-  $('right').innerHTML = html;
 }
 
-function escHtml(s) {
-  if (!s) return '';
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+async function previewDoc(hash) {
+  const r = await fetch('/api/document/' + encodeURIComponent(hash));
+  if (!r.ok) return;
+  const d = await r.json();
+  previewTitle.textContent = d.rel_path || hash;
+  previewFrame.src = '/api/document/' + encodeURIComponent(hash) + '/file';
+  preview.style.display = 'flex';
 }
 
-// Search
-$('search').addEventListener('input', (e) => {
-  state.filter = e.target.value.trim();
-  renderLeftPane();
+previewClose.onclick = () => {
+  preview.style.display = 'none';
+  previewFrame.src = '';
+};
+
+search.oninput = renderCables;
+
+loadCables().catch(e => {
+  $('stats').textContent = '加载失败: ' + e;
+  cableList.innerHTML = '<div class="empty">加载失败</div>';
 });
-
-// Init
-(async function init() {
-  try {
-    await loadSummary();
-    await Promise.all([loadDocuments(), loadCables()]);
-  } catch (e) {
-    $('header-stats').textContent = '加载失败: ' + e.message;
-  }
-})();
 </script>
 </body>
 </html>
 """
 
+
 # ---------------------------------------------------------------------------
-# Route handlers
+# Handlers
 # ---------------------------------------------------------------------------
 async def index_handler(request: web.Request) -> web.Response:
-    return web.Response(
-        text=HTML_PAGE,
-        content_type='text/html',
-        charset='utf-8',
-        headers={'Cache-Control': 'no-cache'},
-    )
+    return web.Response(text=INDEX_HTML, content_type='text/html')
 
-async def healthz_handler(request: web.Request) -> web.Response:
-    return web.Response(text='OK', content_type='text/plain')
 
-def _viewer(request: web.Request) -> CableDbViewer:
-    return request.app['_viewer']
+async def cables_handler(request: web.Request) -> web.Response:
+    return web.json_response(_viewer(request).list_cables())
 
-async def summary_handler(request: web.Request) -> web.Response:
-    return web.json_response(_viewer(request).stats)
 
-async def documents_handler(request: web.Request) -> web.Response:
-    return web.json_response(_viewer(request).get_documents())
+async def cable_handler(request: web.Request) -> web.Response:
+    cable_id = request.match_info['cable']
+    data = _viewer(request).get_cable(cable_id)
+    if data is None:
+        return web.json_response(
+            {'error': f'unknown cable: {cable_id!r}'},
+            status=404,
+        )
+    return web.json_response(data)
+
 
 async def document_handler(request: web.Request) -> web.Response:
     h = request.match_info['hash']
     data = _viewer(request).get_document(h)
     if data is None:
-        return web.json_response({'error': f'unknown hash: {h!r}'}, status=404)
+        return web.json_response({'error': f'unknown document: {h!r}'}, status=404)
     return web.json_response(data)
 
-async def cables_handler(request: web.Request) -> web.Response:
-    return web.json_response(_viewer(request).get_cables())
 
-async def cable_handler(request: web.Request) -> web.Response:
-    cable = request.match_info['cable']
-    data = _viewer(request).get_cable(cable)
-    if data is None:
-        return web.json_response({'error': f'unknown cable: {cable!r}'}, status=404)
-    return web.json_response(data)
-
-async def file_handler(request: web.Request) -> web.Response:
-    h = request.query.get('hash', '')
-    if not h:
-        return web.json_response({'error': 'missing ?hash='}, status=400)
-    viewer = _viewer(request)
-    abs_path = viewer.resolve_document_path(h)
+async def document_file_handler(request: web.Request) -> web.Response:
+    h = request.match_info['hash']
+    abs_path = _viewer(request).resolve_document_path(h)
     if abs_path is None:
-        return web.json_response({'error': f'file not found: {h!r}'}, status=404)
+        return web.json_response(
+            {'error': f'no path for document: {h!r}'},
+            status=404,
+        )
+    if not abs_path.exists():
+        return web.json_response(
+            {'error': f'file not found on disk: {abs_path}'},
+            status=404,
+        )
     mime, _ = mimetypes.guess_type(str(abs_path))
     mime = mime or 'application/octet-stream'
     return web.FileResponse(abs_path, headers={
@@ -460,97 +246,51 @@ async def file_handler(request: web.Request) -> web.Response:
     })
 
 
-_FLYFISH_CDN = 'https://cdn.jsdelivr.net/npm/@file-viewer/web-full@latest/dist'
+async def stats_handler(request: web.Request) -> web.Response:
+    return web.json_response(_viewer(request).stats())
 
-async def flyfish_handler(request: web.Request) -> web.Response:
-    path = request.match_info['path']
-    cdn_url = f'{_FLYFISH_CDN}/{path}'
-    async with aiohttp.ClientSession() as session:
-        async with session.get(cdn_url) as resp:
-            if resp.status != 200:
-                return web.json_response({'error': 'flyfish asset not found'}, status=404)
-            body = await resp.read()
-            ct = resp.headers.get('Content-Type', 'application/octet-stream').split(';')[0].strip()
-            if path.endswith('.wasm') and 'wasm' not in ct:
-                ct = 'application/wasm'
-            return web.Response(
-                body=body,
-                content_type=ct,
-                headers={
-                    'Cache-Control': 'public, max-age=86400',
-                    'Access-Control-Allow-Origin': '*',
-                    'Cross-Origin-Opener-Policy': 'same-origin',
-                    'Cross-Origin-Embedder-Policy': 'require-corp',
-                },
-            )
+
+async def healthz_handler(request: web.Request) -> web.Response:
+    return web.Response(text='OK', content_type='text/plain')
+
+
+def _viewer(request: web.Request) -> CableViewer:
+    return request.app['_viewer']
+
 
 # ---------------------------------------------------------------------------
-# Server bootstrap
+# App factory
 # ---------------------------------------------------------------------------
-async def main_async(port: int, host: str, db_path: str,
-                     input_root: str | None = None) -> None:
-    print(f'Loading viewer...', flush=True)
-    viewer = CableDbViewer(db_path=db_path, input_root=input_root)
-    stats = viewer.stats
-    print(f'  DB:    {stats["db_path"]}', flush=True)
-    print(f'  input: {stats["input_root"]}', flush=True)
-    print(f'  docs:  {stats["documents"]}, entities: {stats["entities"]}', flush=True)
-    print(f'  cables: {stats["total_cables"]} ({stats["cables_with_matches"]} matched)', flush=True)
-
+def make_app(db_path: Path) -> web.Application:
+    conn = open_db(db_path)
+    ensure_schema(conn)
+    store = CableStore(conn)
+    viewer = CableViewer(store)
     app = web.Application()
     app['_viewer'] = viewer
-
+    app['_conn'] = conn
     app.router.add_get('/', index_handler)
-    app.router.add_get('/healthz', healthz_handler)
-    app.router.add_get('/api/summary', summary_handler)
-    app.router.add_get('/api/documents', documents_handler)
-    app.router.add_get('/api/document/{hash}', document_handler)
     app.router.add_get('/api/cables', cables_handler)
     app.router.add_get('/api/cable/{cable}', cable_handler)
-    app.router.add_get('/file', file_handler)
-    app.router.add_get('/flyfish/{path:.*}', flyfish_handler)
-
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, host, port)
-    await site.start()
-
-    ip = get_local_ip()
-    print(flush=True)
-    print(f'Serving at http://{ip}:{port}', flush=True)
-    print(f'Or http://localhost:{port}', flush=True)
-    print(f'Press Ctrl+C to stop', flush=True)
-
-    try:
-        while True:
-            await asyncio.sleep(1)
-    except (asyncio.CancelledError, KeyboardInterrupt):
-        pass
-    finally:
-        await runner.cleanup()
-        viewer.close()
+    app.router.add_get('/api/document/{hash}', document_handler)
+    app.router.add_get('/api/document/{hash}/file', document_file_handler)
+    app.router.add_get('/api/stats', stats_handler)
+    app.router.add_get('/healthz', healthz_handler)
+    return app
 
 
+# ---------------------------------------------------------------------------
+# CLI entry
+# ---------------------------------------------------------------------------
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description='Cable Match Viewer — browse cable_engine cable.db in a web UI',
-    )
-    parser.add_argument('-l', '--listen', type=int, default=PORT_DEFAULT,
-                        help=f'Port (default {PORT_DEFAULT})')
-    parser.add_argument('-b', '--bind', default='0.0.0.0',
-                        help='Bind address (default 0.0.0.0 for LAN access)')
-    parser.add_argument('--db', required=True,
-                        help='Path to cable.db')
-    parser.add_argument('--input-root',
-                        help='Source file root dir on disk')
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description='Cable viewer (V5 minimal)')
+    p.add_argument('--db', default='cable.db', help='Path to cable.db')
+    p.add_argument('--host', default='0.0.0.0')
+    p.add_argument('--port', type=int, default=8003)
+    args = p.parse_args()
 
-    try:
-        asyncio.run(main_async(
-            args.listen, args.bind, args.db, args.input_root,
-        ))
-    except KeyboardInterrupt:
-        print('\nShutting down...')
+    app = make_app(Path(args.db))
+    web.run_app(app, host=args.host, port=args.port)
 
 
 if __name__ == '__main__':

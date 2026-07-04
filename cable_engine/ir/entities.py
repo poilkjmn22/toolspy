@@ -123,13 +123,6 @@ class SymbolEntity(Entity):
 
 
 # ---------------------------------------------------------------------------
-# Convenience aliases (for brevity at call sites)
-# ---------------------------------------------------------------------------
-# Old names that downstream code may import. These are kept for compat
-# but the canonical names live in the @dataclass declarations above.
-from . import _compat  # noqa: E402  (see _compat.py for the shim)
-
-
 __all__ = [
     'Point', 'BBox',
     'Entity',

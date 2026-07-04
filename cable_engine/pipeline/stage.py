@@ -41,41 +41,21 @@ class Context:
     that are documented as their input/output contract.
     """
     # ---------- document ----------
-    document_path: Path                    # legacy alias (compat)
+    document_path: Path
     content_hash: str
     document_type: str = "pdf"
-    pdf_size: int = 0
-    pdf_mtime: float = 0.0
 
     # ---------- multi-source document (set by Loader before Pipeline) ----------
     # The current Document under processing. DWG and PDF both produce
     # a Document; the pipeline reads/writes through it.
     document: Any = None                     # cable_engine.ir.Document
 
-    # ---------- OCR config ----------
-    dpi: int = 300
-    lang: str = "chi_sim+eng"
-    rotation: int = 0
-    preprocess: str = "none"
-    psm: Optional[int] = None
-    oem: Optional[int] = None
-    engine_name: str = "tesseract"
-    use_levenshtein: bool = False
-    use_gpu: bool = False
-    no_state: bool = False
-
-    # ---------- runtime (PDF only; ignored for DWG) ----------
-    page_number: int = 1
-    pixel_image: Any = None
-
-    text_boxes: list = field(default_factory=list)
-    full_text: str = ""
-
-    matches: dict = field(default_factory=dict)
+    # ---------- V6 outputs ----------
+    # Result dict populated by the TopologyStage.
+    result: Optional[dict] = None
 
     # ---------- result ----------
     error_msg: Optional[str] = None
-    no_text: bool = False
 
     def has_error(self) -> bool:
         return self.error_msg is not None
@@ -86,16 +66,12 @@ class Context:
 class Stage(ABC):
     """Abstract base class. Subclass and implement `run`.
 
-    A Stage is a single-responsibility unit. Examples:
-      - RenderStage       (PDF -> PixelImage)
-      - PreprocessStage   (PixelImage -> PixelImage, applied transformations)
-      - OCRStage          (PixelImage -> TextBox list)
-      - MatchStage        (text -> matches)
-      - PersistStage      (matches -> writes to cable_engine.storage)
+    A Stage is a single-responsibility unit. Examples (V6):
+      - TopologyStage (Document IR -> cable_topology rows via dispatch).
 
     Each Stage's `run` method:
       - Reads from self.reads or ctx (whichever's clearer)
-      - Writes to ctx.<field>
+      - Writes to ctx.<field> (or directly to the store)
       - Returns ctx (for chaining)
     """
 

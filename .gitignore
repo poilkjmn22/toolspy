@@ -4,5 +4,6 @@ myenv/
 .DS_Store
 *.un~
 *.docx
+docs/
 
 myenv312/

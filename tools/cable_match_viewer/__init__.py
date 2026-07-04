@@ -1,17 +1,21 @@
-"""cable_match_viewer — web UI to browse a cable_engine cable.db.
+"""cable_viewer — V5 minimal viewer for cable.db.
 
-Launch with:
-    python -m tools cable-match-viewer --db path/to/cable.db [-l 8003]
+Two modules:
+  server.py    -- aiohttp server (entry point)
+  store.py     -- thin read-only wrapper around CableStore with
+                  on-demand graph traversal
 
-Or directly:
-    python -m tools.cable_match_viewer.server --db path/to/cable.db [-l 8003]
-
-Open the printed URL in a browser; you'll get a 3-pane UI:
-  - left   : document list + cable tree
-  - middle : document entities / matches / OCR text
-  - right  : source document preview via flyfish viewer
+API:
+  GET /                              -- main page (vanilla HTML)
+  GET /api/cables                    -- all cables
+  GET /api/cable/{id}                -- cable detail (terminals + loops +
+                                         source documents)
+  GET /api/document/{hash}           -- document metadata
+  GET /api/document/{hash}/file      -- raw file (PDF or DWG, inline)
+  GET /api/document/{hash}/entities  -- all graph nodes for the document
+                                       (used for the on-canvas preview)
 """
 
-from .server import main, main_async, PORT_DEFAULT
+from .server import main
 
-__all__ = ['main', 'main_async', 'PORT_DEFAULT']
+__all__ = ['main']
