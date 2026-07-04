@@ -6,7 +6,7 @@ V6 replaces GraphBuilderStage with a business-object pipeline:
                                      ├─ classify document type
                                      ├─ dispatch to Analyzer
                                      │   ├─ TerminalStripAnalyzer (端子排图)
-                                     │   └─ (future) CircuitLoopAnalyzer
+                                     │   └─ CircuitLoopAnalyzer (回路图)
                                      └─ persist cable_topology rows
 
 The viewer queries cable_topology directly — no BFS needed.
@@ -34,6 +34,10 @@ from ..pipeline.stage import Context, Stage
 _CABLE_ID_IN_EED = re.compile(
     r'^([A-Za-z0-9]{2,8}-[A-Za-z0-9]{1,8})'
 )
+# Matches "ZL-307ZF(1)" → group1=ZL-307ZF, group2=1
+_WIRE_SERIAL = re.compile(
+    r'^([A-Za-z0-9]{2,8}-[A-Za-z0-9]{1,8})\((\d+)\)$'
+)
 
 
 def _cable_id_from_eed(eed: list[str]) -> Optional[str]:
@@ -53,7 +57,6 @@ def _classify_document(path: str, doc: Optional[Document] = None) -> str:
         return 'terminal_strip'
     if '回路图' in low:
         return 'circuit_loop'
-    # Check text entities inside the document
     if doc is not None:
         for e in doc.entities:
             if isinstance(e, TextEntity) or isinstance(e, AttributeEntity):
@@ -66,9 +69,9 @@ def _classify_document(path: str, doc: Optional[Document] = None) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Geometry helpers
+# Geometry helpers (used by TerminalStripAnalyzer)
 # ---------------------------------------------------------------------------
-_CORRIDOR = 3.0       # x tolerance for vertical-column text
+_CORRIDOR = 3.0
 
 
 def _is_horizontal(entity: GeometryEntity) -> bool:
@@ -97,14 +100,8 @@ def _collect_texts_along_vertical(
     to_y: float,
     texts: list,
 ) -> list[dict]:
-    """Collect text entities along the vertical corridor at vx.
-
-    Starting from the far endpoint (to_y), continuing in the same
-    direction past it. Returns records sorted by distance from to_y.
-    """
     dy = to_y - from_y
     direction = 1 if dy > 0 else -1
-
     candidates: list[dict] = []
     for e in texts:
         cf = getattr(e, 'custom_fields', None) or {}
@@ -114,24 +111,17 @@ def _collect_texts_along_vertical(
             continue
         if abs(ex - vx) > _CORRIDOR:
             continue
-        # Must be past the far endpoint (continued direction)
         if direction > 0 and ey < to_y - 0.1:
             continue
         if direction < 0 and ey > to_y + 0.1:
             continue
         dist = abs(ey - to_y)
         if dist < 0.1:
-            continue  # skip text at the exact endpoint
+            continue
         label = (e.text or '').strip()
         if not label:
             continue
-        candidates.append({
-            'dist': dist,
-            'y': ey,
-            'x': ex,
-            'label': label,
-        })
-
+        candidates.append({'dist': dist, 'y': ey, 'x': ex, 'label': label})
     candidates.sort(key=lambda r: r['dist'])
     return candidates
 
@@ -141,16 +131,6 @@ def _find_strip_name(
     terminal_y: float,
     all_texts: list,
 ) -> Optional[str]:
-    """Find terminal strip code name.
-
-    Rule: locate the numbering-section start ("1") to the LEFT of
-    terminal_x, then find the closest short alphanumeric text
-    further left — that is the strip name (e.g. 21GD, 21QD).
-
-    The strip name may be above or below the terminal number row
-    (in some drawings it sits at the terminal-strip-top row, y≈115,
-    while the "1" is at y≈140). We use a wide y tolerance.
-    """
     ones: list[tuple[float, float]] = []
     for e in all_texts:
         if not isinstance(e, TextEntity):
@@ -160,11 +140,8 @@ def _find_strip_name(
         ey = cf.get('y')
         if ex is None or ey is None:
             continue
-        # Y tolerance: "1" can be in the terminal row (≈140) or
-        # the header row — accept anything within 40mm
         if (e.text or '').strip() == '1' and abs(ey - terminal_y) < 40:
             ones.append((ex, ey))
-
     closest_one: Optional[tuple[float, float]] = None
     closest_dist = float('inf')
     for ox, oy in ones:
@@ -173,29 +150,24 @@ def _find_strip_name(
             if d < closest_dist:
                 closest_dist = d
                 closest_one = (ox, oy)
-
     if closest_one is None:
         return None
-
     ox, oy = closest_one
+    _STRIP_NAME_RE = re.compile(
+        r'^(\d{1,2}[A-Za-z]{1,4})$'
+        r'|^([A-Za-z]{1,2}\d{1,4})$'
+        r'|^([A-Za-z]{1,4})$'
+        r'|^(\+?[A-Za-z]{1,3}\d{1,4})$'
+        r'|^(\d{1,2}-[A-Za-z]{1,4})$'
+    )
     best: Optional[str] = None
     best_dist = float('inf')
-    # Strip name pattern: e.g. "10D", "12D", "21GD", "J831", "YD",
-    #                      "A631", "1-4CD", "I", "+GPS1"
-    _STRIP_NAME_RE = re.compile(
-        r'^(\d{1,2}[A-Za-z]{1,4})$'          # 10D, 12D, 21GD, 21QD
-        r'|^([A-Za-z]{1,2}\d{1,4})$'          # J831, A631, YD
-        r'|^([A-Za-z]{1,4})$'                 # I, UB, YD
-        r'|^(\+?[A-Za-z]{1,3}\d{1,4})$'       # +GPS1, +GPS3
-        r'|^(\d{1,2}-[A-Za-z]{1,4})$'         # 1-4CD
-    )
     for e in all_texts:
         cf = getattr(e, 'custom_fields', None) or {}
         ex = cf.get('x')
         ey = cf.get('y')
         if ex is None or ey is None:
             continue
-        # Must be at least 3 units left of "1" (reject markers at the same x)
         if ex < ox - 3 and abs(ey - oy) < 38:
             t = (e.text or '').strip()
             if t and _STRIP_NAME_RE.match(t):
@@ -207,38 +179,23 @@ def _find_strip_name(
 
 
 _LOOP_LIKE = re.compile(r'^[A-Za-z0-9]{2,8}-[A-Za-z0-9]{1,8}$')
-_LOOP_ALPHA_DIGIT = re.compile(r'^[A-Za-z]\d{1,4}$')  # J701, A631, L630
+_LOOP_ALPHA_DIGIT = re.compile(r'^[A-Za-z]\d{1,4}$')
 
 
 def _classify_column_text(
     texts: list[dict],
 ) -> tuple[Optional[str], Optional[int], Optional[str], Optional[str]]:
-    """Classify ordered column texts into (circuit_desc, terminal_no,
-    loop_id, unknown_busi).
-
-    Heuristic (validated against D0210-35/38 terminal strip data):
-      - appears like 'CABLE-ID' (XXX-XXX) or 'J701'?   → loop_id
-      - pure digit?                                      → terminal_no
-      - contains alpha?                                  → circuit_desc (first) or unknown_busi (second)
-      - other (punctuation, numbers with -)?              → unknown_busi (first) or circuit_desc (second)
-    """
     circuit_desc: Optional[str] = None
     loop_id: Optional[str] = None
     terminal_no: Optional[int] = None
     unknown_busi: Optional[str] = None
-
     for item in texts:
         label = item['label']
-
-        # Pure digit = terminal number
         if label.isdigit():
             tn = int(label)
             if terminal_no is None:
                 terminal_no = tn
             continue
-
-        # Cable-ID-like or letter+digits = loop
-        # (WG3-J903, 3T-YW-C-, J701, Ⅴ-J911)
         if (_LOOP_LIKE.match(label)
                 or _LOOP_ALPHA_DIGIT.match(label)
                 or ('-' in label and len(label) >= 4)):
@@ -249,36 +206,28 @@ def _classify_column_text(
             elif unknown_busi is None:
                 unknown_busi = label
             continue
-
-        # Has alphabetic chars = Chinese or English description
         if any(c.isalpha() for c in label):
             if circuit_desc is None:
                 circuit_desc = label
             elif unknown_busi is None:
                 unknown_busi = label
             continue
-
-        # Other (e.g. "-OF-12", "-17")
         if unknown_busi is None:
             unknown_busi = label
         elif circuit_desc is None:
             circuit_desc = label
-
     return circuit_desc, terminal_no, loop_id, unknown_busi
 
 
 # ===================================================================
-# Analyzers
+# TerminalStripAnalyzer
 # ===================================================================
 class TerminalStripAnalyzer:
     """Analyze a terminal-strip DWG and emit cable_topology records."""
-
-    MIN_VERTICAL_LENGTH = 20.0  # minimum vertical drop to consider
+    MIN_VERTICAL_LENGTH = 20.0
 
     def analyze(self, doc: Document) -> list[dict]:
         emitted: list[dict] = []
-
-        # Separate entities by type
         lines: list[LineGeometry] = []
         texts: list = []
         for e in doc.entities:
@@ -286,8 +235,6 @@ class TerminalStripAnalyzer:
                 lines.append(e)
             elif isinstance(e, (TextEntity, AttributeEntity)):
                 texts.append(e)
-
-        # Group lines by cable ID (from EED)
         cable_groups: dict[str, dict] = {}
         for line in lines:
             cf = getattr(line, 'custom_fields', None) or {}
@@ -301,20 +248,14 @@ class TerminalStripAnalyzer:
                 cable_groups[cid]['horiz'].append(line)
             elif _is_vertical(line):
                 cable_groups[cid]['vert'].append(line)
-
-        # Process each cable
         for cable_id, groups in cable_groups.items():
             records = self._analyze_one_cable(
                 cable_id, groups['horiz'], groups['vert'], texts,
             )
             emitted.extend(records)
-
         return emitted
 
     def _find_conductor_no(self, vx: float, h_y: float, texts: list) -> Optional[int]:
-        """Find conductor number (NO tag) near the corner of a
-        vertical drop. Searches for ATTRIB with tag='NO' within 5mm
-        x and 10mm y of the corner."""
         for e in texts:
             if not isinstance(e, AttributeEntity):
                 continue
@@ -331,36 +272,21 @@ class TerminalStripAnalyzer:
                     return int(txt)
         return None
 
-    def _analyze_one_cable(
-        self,
-        cable_id: str,
-        horizontals: list[LineGeometry],
-        verticals: list[LineGeometry],
-        texts: list,
-    ) -> list[dict]:
+    def _analyze_one_cable(self, cable_id, horizontals, verticals, texts):
         if not horizontals:
             return []
-
-        # Use the first horizontal as reference
         h = horizontals[0]
         hpts = list(h.points or [])
         h_y = hpts[0].y if hpts else 0.0
-
         records: list[dict] = []
-
         for v in verticals:
             pts = list(v.points or [])
             if len(pts) < 2:
                 continue
             vx = pts[0].x
-
-            # Determine which end is connected to the horizontal
-            # (corner) and which is the far endpoint
             dy = pts[-1].y - pts[0].y
             if abs(dy) < self.MIN_VERTICAL_LENGTH:
                 continue
-
-            # Find the end closest to the horizontal y
             d0 = abs(pts[0].y - h_y)
             d1 = abs(pts[-1].y - h_y)
             if d0 < d1:
@@ -369,29 +295,15 @@ class TerminalStripAnalyzer:
             else:
                 corner_y = pts[-1].y
                 end_y = pts[0].y
-
-            # Find conductor number from NO ATTRIB near corner
             conductor_no = self._find_conductor_no(vx, h_y, texts)
-
-            # Collect texts along the vertical direction past the endpoint
-            column_texts = _collect_texts_along_vertical(
-                vx, corner_y, end_y, texts,
-            )
-
-            circuit_desc, terminal_no, loop_id, unknown_busi = (
-                _classify_column_text(column_texts)
-            )
-
-            # Find strip name
+            column_texts = _collect_texts_along_vertical(vx, corner_y, end_y, texts)
+            circuit_desc, terminal_no, loop_id, unknown_busi = _classify_column_text(column_texts)
             strip_name: Optional[str] = None
             if terminal_no is not None:
                 for item in column_texts:
                     if item['label'] == str(terminal_no):
-                        strip_name = _find_strip_name(
-                            item['x'], item['y'], texts,
-                        )
+                        strip_name = _find_strip_name(item['x'], item['y'], texts)
                         break
-
             records.append({
                 'cable_id': cable_id,
                 'conductor_no': conductor_no,
@@ -402,7 +314,116 @@ class TerminalStripAnalyzer:
                 'unknown_busi': unknown_busi,
                 'source_type': 'terminal_strip',
             })
+        return records
 
+
+# ===================================================================
+# CircuitLoopAnalyzer (回路图)
+# ===================================================================
+class CircuitLoopAnalyzer:
+    """Analyze a circuit-loop DWG and emit cable_topology records.
+
+    Circuit loop drawings use block-attribute pairs where each core
+    of a cable is a horizontal line with ATTRIB tags carrying:
+
+      WireSerial    —  cable_id(core_no)  e.g. "ZL-307ZF(1)"
+      WireDescription —  description       e.g. "直流电源+"
+      LoopCode      —  loop code          e.g. "+KZ1"
+      NO            —  left/right terminal e.g. "X2:1" / "9D:1"
+      WIRENO        —  core number        e.g. "1", "2"
+      InOut         —  direction
+    """
+
+    def analyze(self, doc: Document) -> list[dict]:
+        # Collect all ATTRIB entities with position (x, y)
+        attribs: list[dict] = []
+        for e in doc.entities:
+            if isinstance(e, AttributeEntity):
+                cf = getattr(e, 'custom_fields', None) or {}
+                x = cf.get('x')
+                y = cf.get('y')
+                if x is None or y is None:
+                    continue
+                attribs.append({
+                    'tag': e.tag or '',
+                    'val': (e.text or '').strip(),
+                    'x': x,
+                    'y': y,
+                })
+
+        # Detect cables from WireSerial entries
+        cable_cores: dict[str, dict[int, dict]] = {}
+        for a in attribs:
+            if a['tag'] == 'WireSerial':
+                m = _WIRE_SERIAL.match(a['val'])
+                if m:
+                    cid = m.group(1)
+                    core = int(m.group(2))
+                    if cid not in cable_cores:
+                        cable_cores[cid] = {}
+                    cable_cores[cid][core] = {
+                        'x': a['x'],
+                        'y': a['y'],
+                        'row_y': a['y'],
+                    }
+
+        # For each core, find OTHER ATTRIB entities with same cable
+        # by matching y within CORE_TOLERANCE
+        _CORE_TOLERANCE = 2.0  # mm — max y diff between texts in same core row
+        for cid, cores in cable_cores.items():
+            for core, info in cores.items():
+                cy = info['y']
+                for a in attribs:
+                    if a['tag'] == 'WireSerial':
+                        continue
+                    if abs(a['y'] - cy) > _CORE_TOLERANCE:
+                        continue
+                    tag = a['tag']
+                    val = a['val']
+                    if tag == 'WireDescription' and not info.get('circuit_desc'):
+                        info['circuit_desc'] = val
+                    elif tag == 'LoopCode' and not info.get('loop_id'):
+                        info['loop_id'] = val
+                    elif tag == 'NO':
+                        if a['x'] < 100 and not info.get('left_terminal'):
+                            info['left_terminal'] = val
+                        elif a['x'] >= 100 and not info.get('right_terminal'):
+                            info['right_terminal'] = val
+                    elif tag == 'InOut' and not info.get('direction'):
+                        info['direction'] = val
+                    elif tag == 'ToOtherEqu' and not info.get('equipment'):
+                        info['equipment'] = val
+
+        # Build records
+        records: list[dict] = []
+        for cid, cores in sorted(cable_cores.items()):
+            for core in sorted(cores.keys()):
+                info = cores[core]
+                # Circuit_desc from WireDescription
+                circuit_desc = info.get('circuit_desc')
+                loop_id = info.get('loop_id')
+                # Extract strip_name:terminal_no from left terminal (closest to cable)
+                strip_name: Optional[str] = None
+                terminal_no: Optional[int] = None
+                lt = info.get('left_terminal', '')
+                if ':' in lt:
+                    parts = lt.split(':', 1)
+                    strip_name = parts[0].strip()
+                    try:
+                        terminal_no = int(parts[1].strip())
+                    except ValueError:
+                        pass
+
+                records.append({
+                    'cable_id': cid,
+                    'conductor_no': core,
+                    'strip_name': strip_name,
+                    'terminal_no': terminal_no,
+                    'circuit_desc': circuit_desc,
+                    'loop_id': loop_id,
+                    'unknown_busi': info.get('right_terminal'),
+                    'source_type': 'circuit_loop',
+                })
         return records
 
 
@@ -431,17 +452,17 @@ class TopologyStage(Stage):
         doc_type = _classify_document(str(ctx.document_path), doc)
         ctx.document_type = doc_type
 
-        # Wipe any prior topology rows for this document
         self._store.delete_topology_for_document(doc.content_hash)
 
         if doc_type == 'terminal_strip':
             analyzer = TerminalStripAnalyzer()
             records = analyzer.analyze(doc)
+        elif doc_type == 'circuit_loop':
+            analyzer = CircuitLoopAnalyzer()
+            records = analyzer.analyze(doc)
         else:
-            # Fallback — no analyzer yet, skip
             records = []
 
-        # Persist
         for rec in records:
             self._store.upsert_cable_topology(
                 cable_id=rec['cable_id'],
@@ -460,9 +481,7 @@ class TopologyStage(Stage):
                     document_hash=doc.content_hash,
                 )
 
-        ctx.result = {
-            'cable_topology_count': len(records),
-        }
+        ctx.result = {'cable_topology_count': len(records)}
         return ctx
 
 
