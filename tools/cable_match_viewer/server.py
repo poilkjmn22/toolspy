@@ -34,7 +34,7 @@ INDEX_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <title>Cable Viewer</title>
-<script src="https://cdn.jsdelivr.net/npm/@file-viewer/web-full@latest/dist/flyfish-file-viewer-web-full.iife.js" crossorigin="anonymous"></script>
+<script src="/static/vendor/flyfish-file-viewer-web-full.iife.js"></script>
 <style>
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; height: 100%; font-family: -apple-system, "SF Pro", "Helvetica Neue", Arial, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 13px; color: #222; background: #fafafa; }
@@ -88,6 +88,7 @@ INDEX_HTML = """<!DOCTYPE html>
     <div id="tabs">
       <div class="tab active" data-tab="cables">电缆</div>
       <div class="tab" data-tab="cabinets">柜体</div>
+      <div class="tab" data-tab="stats">统计</div>
     </div>
     <div id="stats">加载中…</div>
     <div id="search"><input id="search-input" placeholder="过滤电缆…"></div>
@@ -112,7 +113,6 @@ INDEX_HTML = """<!DOCTYPE html>
       locale="zh-CN"
       theme="light"
       toolbar-position="bottom-right"
-      worker-url="https://cdn.jsdelivr.net/npm/@file-viewer/web-full@latest/dist/wasm/cad/dwg-worker.js"
     ></flyfish-file-viewer>
   </div>
 </div>
@@ -136,10 +136,13 @@ document.querySelectorAll('.tab').forEach(el => {
     activeTab = el.dataset.tab;
     document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === activeTab));
     search.value = '';
-    search.placeholder = activeTab === 'cables' ? '过滤电缆…' : '搜索柜体(区域-名称)…';
+    search.placeholder = activeTab === 'cables' ? '过滤电缆…' : activeTab === 'stats' ? '' : '搜索柜体(区域-名称)…';
+    search.style.display = activeTab === 'stats' ? 'none' : '';
     if (activeTab === 'cables') {
       renderCables();
       $('stats').textContent = `共 ${allCables.length} 条电缆`;
+    } else if (activeTab === 'stats') {
+      renderStats();
     } else {
       cableList.innerHTML = '<div class="empty">输入关键字搜索柜体</div>';
       $('stats').textContent = '柜体搜索';
@@ -148,10 +151,14 @@ document.querySelectorAll('.tab').forEach(el => {
 });
 
 async function loadCables() {
-  const r = await fetch('/api/cables');
-  allCables = await r.json();
+  const [cablesR, statsR] = await Promise.all([
+    fetch('/api/cables'),
+    fetch('/api/stats'),
+  ]);
+  allCables = await cablesR.json();
+  const statsData = await statsR.json();
   renderCables();
-  $('stats').textContent = `共 ${allCables.length} 条电缆`;
+  $('stats').textContent = `${statsData.documents} 份图纸, ${statsData.distinct_cables} 条电缆, ${statsData.conductors} 线芯`;
 }
 
 function renderCables() {
@@ -293,12 +300,89 @@ flyfishClose.onclick = () => {
 
 search.oninput = () => {
   if (activeTab === 'cables') renderCables();
-  else searchCabinets();
+  else if (activeTab === 'cabinets') searchCabinets();
 };
 
 function escHtml(s) {
   if (!s) return s;
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+async function renderStats() {
+  const r = await fetch('/api/stats');
+  const s = await r.json();
+  let html = '<div style="padding:10px 14px;">';
+
+  // Scan metadata
+  if (s.scan_input && s.scan_input !== '--') {
+    html += `<div style="font-size:11px;color:#888;margin-bottom:8px;">扫描目录: ${escHtml(s.scan_input)}</div>`;
+  }
+  if (s.started_at && s.started_at !== '--') {
+    html += `<div style="font-size:11px;color:#888;margin-bottom:12px;">开始扫描: ${escHtml(s.started_at)}</div>`;
+  }
+
+  // Summary cards
+  html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:14px;">';
+  const cards = [
+    {label:'图纸总数', value:s.documents, color:'#1565c0'},
+    {label:'关联电缆', value:s.distinct_cables, color:'#2e7d32'},
+    {label:'线芯总数', value:s.conductors, color:'#e65100'},
+    {label:'端子条', value:s.terminal_strips, color:'#6a1b9a'},
+  ];
+  cards.forEach(c => {
+    html += `<div style="background:#f5f5f5;border-radius:4px;padding:8px;text-align:center;">
+      <div style="font-size:20px;font-weight:700;color:${c.color};">${c.value}</div>
+      <div style="font-size:11px;color:#888;margin-top:2px;">${c.label}</div>
+    </div>`;
+  });
+  html += '</div>';
+
+  // Document type breakdown
+  if (s.documents_by_type && Object.keys(s.documents_by_type).length) {
+    html += '<div class="section"><h3>图纸类型分布</h3>';
+    html += '<table style="width:100%;border-collapse:collapse;font-size:12px;">';
+    html += '<tr style="background:#f5f5f5;font-weight:600;"><th style="padding:3px 6px;text-align:left;border-bottom:1px solid #ddd;">类型</th><th style="padding:3px 6px;text-align:right;border-bottom:1px solid #ddd;">数量</th></tr>';
+    for (const [t, n] of Object.entries(s.documents_by_type)) {
+      const label = t === 'dwg' ? 'DWG 图纸' : t === 'pdf' ? 'PDF 文档' : t;
+      html += `<tr style="border-bottom:1px solid #eee;"><td style="padding:3px 6px;">${escHtml(label)}</td><td style="padding:3px 6px;text-align:right;font-family:monospace;">${n}</td></tr>`;
+    }
+    html += '</table></div>';
+  }
+
+  // Unprocessed documents
+  if (s.unprocessed_documents > 0) {
+    html += `<div class="section"><h3 style="color:#d32f2f;">未处理图纸 <span style="font-weight:400;color:#888;font-size:11px;">(无业务分类命中)</span></h3>`;
+    html += `<div style="font-size:12px;color:#d32f2f;font-weight:600;">${s.unprocessed_documents} 份</div>`;
+    html += '<div style="font-size:11px;color:#888;margin-top:2px;">这些图档未匹配到 回路图 / 端子排图 分类，未抽取电缆拓扑</div>';
+    html += '</div>';
+  }
+
+  // Business type breakdown
+  if (s.topology_by_source_type && Object.keys(s.topology_by_source_type).length) {
+    html += '<div class="section"><h3>业务分类 (拓扑记录)</h3>';
+    html += '<table style="width:100%;border-collapse:collapse;font-size:12px;">';
+    html += '<tr style="background:#f5f5f5;font-weight:600;"><th style="padding:3px 6px;text-align:left;border-bottom:1px solid #ddd;">分类</th><th style="padding:3px 6px;text-align:right;border-bottom:1px solid #ddd;">记录数</th><th style="padding:3px 6px;text-align:right;border-bottom:1px solid #ddd;">关联电缆</th></tr>';
+    for (const [t, n] of Object.entries(s.topology_by_source_type)) {
+      const cables = s.cables_by_source_type && s.cables_by_source_type[t] ? s.cables_by_source_type[t] : '--';
+      const label = t === 'terminal_strip' ? '端子排图' : t === 'circuit_loop' ? '回路图' : t;
+      html += `<tr style="border-bottom:1px solid #eee;"><td style="padding:3px 6px;">${escHtml(label)}</td><td style="padding:3px 6px;text-align:right;font-family:monospace;">${n}</td><td style="padding:3px 6px;text-align:right;font-family:monospace;">${cables}</td></tr>`;
+    }
+    html += '</table></div>';
+  }
+
+  // Cables with/without terminals
+  html += '<div class="section"><h3>电缆端子状态</h3>';
+  html += `<div style="font-size:12px;">有端子: <strong>${s.cables_with_terminals}</strong> &nbsp; 无端子: <strong>${s.cables_without_terminals}</strong></div>`;
+  html += '</div>';
+
+  // Distinct cabinets
+  html += '<div class="section"><h3>其他</h3>';
+  html += `<div style="font-size:12px;">不同柜体: <strong>${s.distinct_cabinets}</strong></div>`;
+  html += '</div>';
+
+  html += '</div>';
+  cableList.innerHTML = html;
+  $('stats').textContent = `${s.documents} 份图纸, ${s.distinct_cables} 条电缆`;
 }
 
 loadCables().catch(e => {
@@ -390,9 +474,11 @@ def make_app(db_path: Path) -> web.Application:
     ensure_schema(conn)
     store = CableStore(conn)
     viewer = CableViewer(store)
+    static_path = Path(__file__).resolve().parent / 'static'
     app = web.Application()
     app['_viewer'] = viewer
     app['_conn'] = conn
+    app.router.add_static('/static', static_path)
     app.router.add_get('/', index_handler)
     app.router.add_get('/api/cables', cables_handler)
     app.router.add_get('/api/cable/{cable}', cable_handler)

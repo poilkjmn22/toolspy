@@ -331,7 +331,13 @@ class CableStore:
     # Stats
     # ------------------------------------------------------------------
     def stats(self) -> dict:
-        out = {}
+        out: dict = {}
+
+        # Scan metadata
+        out['scan_input'] = self.get_state('input', '--')
+        out['started_at'] = self.get_state('started_at', '--')
+
+        # Basic row counts (same as before)
         for table in ('documents', 'cable_topology', 'terminal_strips'):
             try:
                 row = self._conn.execute(
@@ -340,6 +346,104 @@ class CableStore:
                 out[table] = row['n']
             except sqlite3.OperationalError:
                 out[table] = 0
+
+        # Distinct cables
+        try:
+            row = self._conn.execute(
+                'SELECT COUNT(DISTINCT cable_id) AS n FROM cable_topology'
+            ).fetchone()
+            out['distinct_cables'] = row['n']
+        except sqlite3.OperationalError:
+            out['distinct_cables'] = 0
+
+        # Total file size of all documents
+        try:
+            row = self._conn.execute(
+                'SELECT COALESCE(SUM(file_size), 0) AS total FROM documents'
+            ).fetchone()
+            out['total_file_size'] = row['total']
+        except sqlite3.OperationalError:
+            out['total_file_size'] = 0
+
+        # Document type breakdown
+        out['documents_by_type'] = {}
+        try:
+            for r in self._conn.execute(
+                'SELECT document_type, COUNT(*) AS n FROM documents GROUP BY document_type ORDER BY n DESC'
+            ).fetchall():
+                out['documents_by_type'][r['document_type']] = r['n']
+        except sqlite3.OperationalError:
+            pass
+
+        # Business source type breakdown (from cable_topology)
+        out['topology_by_source_type'] = {}
+        try:
+            for r in self._conn.execute(
+                'SELECT source_type, COUNT(*) AS n FROM cable_topology GROUP BY source_type ORDER BY n DESC'
+            ).fetchall():
+                out['topology_by_source_type'][r['source_type']] = r['n']
+        except sqlite3.OperationalError:
+            pass
+
+        # Distinct cables by source type
+        out['cables_by_source_type'] = {}
+        try:
+            for r in self._conn.execute(
+                'SELECT source_type, COUNT(DISTINCT cable_id) AS n FROM cable_topology GROUP BY source_type ORDER BY n DESC'
+            ).fetchall():
+                out['cables_by_source_type'][r['source_type']] = r['n']
+        except sqlite3.OperationalError:
+            pass
+
+        # Unprocessed documents (in documents table but NOT in cable_topology)
+        try:
+            row = self._conn.execute(
+                """SELECT COUNT(*) AS n FROM documents d
+                   WHERE NOT EXISTS (
+                       SELECT 1 FROM cable_topology ct
+                       WHERE ct.document_hash = d.content_hash
+                   )"""
+            ).fetchone()
+            out['unprocessed_documents'] = row['n']
+        except sqlite3.OperationalError:
+            out['unprocessed_documents'] = 0
+
+        # Empty-terminal cables (cables where all conductors have no terminal)
+        out['cables_without_terminals'] = 0
+        out['cables_with_terminals'] = 0
+        try:
+            row = self._conn.execute(
+                """SELECT
+                    COUNT(DISTINCT CASE WHEN terminal_no IS NOT NULL THEN cable_id END) AS with_t,
+                    COUNT(DISTINCT cable_id) - COUNT(DISTINCT CASE WHEN terminal_no IS NOT NULL THEN cable_id END) AS without_t
+                   FROM cable_topology"""
+            ).fetchone()
+            if row:
+                out['cables_with_terminals'] = row['with_t']
+                out['cables_without_terminals'] = row['without_t']
+        except sqlite3.OperationalError:
+            pass
+
+        # Unique cabinets
+        try:
+            row = self._conn.execute(
+                """SELECT COUNT(DISTINCT COALESCE(cabinet_name, cabinet_name_remote))
+                   FROM cable_topology
+                   WHERE cabinet_name IS NOT NULL OR cabinet_name_remote IS NOT NULL"""
+            ).fetchone()
+            out['distinct_cabinets'] = row[0]
+        except sqlite3.OperationalError:
+            out['distinct_cabinets'] = 0
+
+        # Total conductors (terminal records)
+        try:
+            row = self._conn.execute(
+                'SELECT COUNT(*) AS n FROM cable_topology WHERE conductor_no IS NOT NULL'
+            ).fetchone()
+            out['conductors'] = row['n']
+        except sqlite3.OperationalError:
+            out['conductors'] = 0
+
         return out
 
 
