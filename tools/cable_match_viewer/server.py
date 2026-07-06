@@ -41,6 +41,10 @@ INDEX_HTML = """<!DOCTYPE html>
   #app { display: flex; height: 100vh; }
   #left { width: 280px; border-right: 1px solid #e0e0e0; background: #fff; display: flex; flex-direction: column; }
   #right { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #tabs { display: flex; border-bottom: 1px solid #e0e0e0; }
+  #tabs .tab { flex: 1; padding: 8px 14px; cursor: pointer; text-align: center; font-size: 12px; font-weight: 600; color: #888; border-bottom: 2px solid transparent; }
+  #tabs .tab:hover { color: #555; }
+  #tabs .tab.active { color: #1565c0; border-bottom-color: #1565c0; }
   #header { padding: 10px 14px; border-bottom: 1px solid #e0e0e0; font-weight: 600; font-size: 14px; }
   #stats { padding: 6px 14px; border-bottom: 1px solid #e0e0e0; color: #888; font-size: 11px; }
   #search { padding: 6px 10px; border-bottom: 1px solid #e0e0e0; }
@@ -50,6 +54,11 @@ INDEX_HTML = """<!DOCTYPE html>
   .cable-row:hover { background: #f0f7ff; }
   .cable-row.selected { background: #d0e8ff; font-weight: 600; }
   .cable-row .cnt { color: #888; font-size: 11px; }
+  .cab-row { padding: 6px 14px; border-bottom: 1px solid #f0f0f0; cursor: pointer; }
+  .cab-row:hover { background: #f0f7ff; }
+  .cab-row .cab-name { font-size: 12px; font-weight: 600; }
+  .cab-row .cab-meta { font-size: 11px; color: #888; margin-top: 2px; }
+  .cab-row .cab-doc { font-size: 10px; color: #999; margin-top: 1px; }
   .empty { padding: 14px; text-align: center; color: #999; font-size: 12px; }
   #detail { flex: 1; overflow-y: auto; padding: 14px 18px; }
   #detail .cable-id { font-family: "SF Mono", Menlo, monospace; font-size: 18px; font-weight: 600; margin-bottom: 10px; }
@@ -76,7 +85,10 @@ INDEX_HTML = """<!DOCTYPE html>
 <body>
 <div id="app">
   <div id="left">
-    <div id="header">电缆列表</div>
+    <div id="tabs">
+      <div class="tab active" data-tab="cables">电缆</div>
+      <div class="tab" data-tab="cabinets">柜体</div>
+    </div>
     <div id="stats">加载中…</div>
     <div id="search"><input id="search-input" placeholder="过滤电缆…"></div>
     <div id="cable-list"><div class="empty">加载中…</div></div>
@@ -107,6 +119,7 @@ INDEX_HTML = """<!DOCTYPE html>
 <script>
 let allCables = [];
 let selectedCable = null;
+let activeTab = 'cables';
 
 const $ = (id) => document.getElementById(id);
 const cableList = $('cable-list');
@@ -116,6 +129,23 @@ const flyfishModal = $('flyfish-modal');
 const flyfishViewer = $('flyfish-viewer');
 const flyfishTitle = $('flyfish-title');
 const flyfishClose = $('flyfish-close');
+
+// Tab switching
+document.querySelectorAll('.tab').forEach(el => {
+  el.onclick = () => {
+    activeTab = el.dataset.tab;
+    document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === activeTab));
+    search.value = '';
+    search.placeholder = activeTab === 'cables' ? '过滤电缆…' : '搜索柜体(区域-名称)…';
+    if (activeTab === 'cables') {
+      renderCables();
+      $('stats').textContent = `共 ${allCables.length} 条电缆`;
+    } else {
+      cableList.innerHTML = '<div class="empty">输入关键字搜索柜体</div>';
+      $('stats').textContent = '柜体搜索';
+    }
+  };
+});
 
 async function loadCables() {
   const r = await fetch('/api/cables');
@@ -139,6 +169,49 @@ function renderCables() {
   ).join('');
   cableList.querySelectorAll('.cable-row').forEach(el => {
     el.onclick = () => selectCable(el.dataset.cable);
+  });
+}
+
+async function searchCabinets() {
+  const q = search.value.trim();
+  if (!q) {
+    cableList.innerHTML = '<div class="empty">输入关键字搜索柜体</div>';
+    $('stats').textContent = '柜体搜索';
+    return;
+  }
+  $('stats').textContent = '搜索中…';
+  const r = await fetch('/api/search-cabinets?q=' + encodeURIComponent(q));
+  const data = await r.json();
+  $('stats').textContent = `找到 ${data.length} 个匹配项`;
+  if (!data.length) {
+    cableList.innerHTML = '<div class="empty">没有匹配的柜体</div>';
+    return;
+  }
+  cableList.innerHTML = data.map(item => {
+    const name = item.cabinet_name || item.cabinet_name_remote || '--';
+    const remote = item.cabinet_name_remote ? ' → ' + escHtml(item.cabinet_name_remote) : '';
+    const docName = item.document ? escHtml(item.document.rel_path || item.document.content_hash) : '--';
+    const cables = item.cable_ids ? item.cable_ids.join(', ') : '';
+    return `<div class="cab-row" data-cabinet="${escHtml(name)}">
+      <div class="cab-name">${escHtml(name)}${remote}</div>
+      <div class="cab-meta">${item.conductor_count} 线芯 | ${escHtml(cables)}</div>
+      <div class="cab-doc">${docName}</div>
+    </div>`;
+  }).join('');
+  cableList.querySelectorAll('.cab-row').forEach(el => {
+    el.onclick = () => {
+      const name = el.dataset.cabinet;
+      // Switch to cable tab and search for related cables
+      const cables = data.find(d => (d.cabinet_name || '') === name || (d.cabinet_name_remote || '') === name);
+      if (cables && cables.cable_ids) {
+        activeTab = 'cables';
+        document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === 'cables'));
+        search.placeholder = '过滤电缆…';
+        search.value = cables.cable_ids[0] || '';
+        renderCables();
+        if (cables.cable_ids[0]) selectCable(cables.cable_ids[0]);
+      }
+    };
   });
 }
 
@@ -218,7 +291,10 @@ flyfishClose.onclick = () => {
   flyfishViewer.removeAttribute('filename');
 };
 
-search.oninput = renderCables;
+search.oninput = () => {
+  if (activeTab === 'cables') renderCables();
+  else searchCabinets();
+};
 
 function escHtml(s) {
   if (!s) return s;
@@ -291,6 +367,13 @@ async def stats_handler(request: web.Request) -> web.Response:
     return web.json_response(_viewer(request).stats())
 
 
+async def search_cabinets_handler(request: web.Request) -> web.Response:
+    q = request.query.get('q', '').strip()
+    if not q:
+        return web.json_response([])
+    return web.json_response(_viewer(request).search_cabinets(q))
+
+
 async def healthz_handler(request: web.Request) -> web.Response:
     return web.Response(text='OK', content_type='text/plain')
 
@@ -315,6 +398,7 @@ def make_app(db_path: Path) -> web.Application:
     app.router.add_get('/api/cable/{cable}', cable_handler)
     app.router.add_get('/api/document/{hash}', document_handler)
     app.router.add_get('/api/document/{hash}/file', document_file_handler)
+    app.router.add_get('/api/search-cabinets', search_cabinets_handler)
     app.router.add_get('/api/stats', stats_handler)
     app.router.add_get('/healthz', healthz_handler)
     return app

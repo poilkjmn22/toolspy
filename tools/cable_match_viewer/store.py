@@ -133,6 +133,23 @@ class CableViewer:
         return Path(rp).expanduser()
 
     # ------------------------------------------------------------------
+    # Cabinet search
+    # ------------------------------------------------------------------
+    def search_cabinets(self, query: str) -> list[dict]:
+        rows = self._store.search_cabinets(query)
+        out = []
+        for r in rows:
+            doc = self._document_brief(r['document_hash']) if r['document_hash'] else None
+            out.append({
+                'cabinet_name': r['cabinet_name'],
+                'cabinet_name_remote': r['cabinet_name_remote'],
+                'conductor_count': r['conductor_count'],
+                'cable_ids': (r['cable_ids'] or '').split(','),
+                'document': doc,
+            })
+        return out
+
+    # ------------------------------------------------------------------
     # Stats
     # ------------------------------------------------------------------
     def stats(self) -> dict:

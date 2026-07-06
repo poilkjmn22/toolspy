@@ -381,6 +381,65 @@ class CircuitLoopAnalyzer:
       InOut         —  direction
     """
 
+    @staticmethod
+    def _find_cabinet(
+        tx: float, ty: float, texts: list[dict],
+    ) -> Optional[str]:
+        """Find cabinet display name for terminal at (tx, ty) in a 回路图.
+
+        Business logic (from user spec):
+          1. The terminal is enclosed by a cabinet (dashed rectangle).
+          2. The cabinet name text block is ABOVE the terminal (higher y,
+             since DWG origin is bottom-left).
+          3. Among all such blocks, pick the one with minimum dx+dy from
+             the terminal.
+          4. The name must contain at least one of 屏/柜/箱.
+          5. Text to the LEFT of the cabinet name (same y range) is the
+             cabinet location, appended as "location name".
+
+        Returns "location name" or "name" (if no location found), or
+        None.
+        """
+        candidates: list[tuple[float, float, str, float, float]] = []
+        for t in texts:
+            val = t['val']
+            if any(kw in val for kw in ('屏', '柜', '箱')):
+                ex = t['x']
+                ey = t['y']
+                if ex is not None and ey is not None and ey > ty:
+                    dx = abs(ex - tx)
+                    dy = abs(ey - ty)
+                    candidates.append((dx, dy, val, ex, ey))
+
+        if not candidates:
+            return None
+
+        # Pick the cabinet name with smallest dx; if tied, smaller dy.
+        candidates.sort(key=lambda r: (r[0], r[1]))
+        _, _, cab_name, cab_x, cab_y = candidates[0]
+
+        # Find location text to the left of cabinet name (same line)
+        _LOCATION_MAX_DX = 200.0
+        _LOCATION_DY_TOLERANCE = 3.0
+        location = None
+        best_dx = float('inf')
+        for t in texts:
+            val = t['val']
+            if not val:
+                continue
+            ex = t['x']
+            ey = t['y']
+            if ex is not None and ey is not None and ex < cab_x:
+                if abs(ey - cab_y) < _LOCATION_DY_TOLERANCE and val != cab_name:
+                    dx = cab_x - ex
+                    if dx < best_dx and dx < _LOCATION_MAX_DX:
+                        best_dx = dx
+                        location = val
+
+        if location:
+            return f"{location}-{cab_name}"
+        return cab_name
+
     def analyze(self, doc: Document) -> list[dict]:
         attribs: list[dict] = []
         for e in doc.entities:
@@ -431,13 +490,14 @@ class CircuitLoopAnalyzer:
                 'x_max': max(xs),
             })
 
-        # Group NO tags and cable-level ATTRIB by y position
-        no_tags_by_y: dict[int, list[tuple[float, str]]] = {}
-        cable_attribs: dict[str, list[dict]] = {}  # tag → [(x, y, val)]
+        # Group NO tags and cable-level ATTRIB by y position.
+        # Store (x, y, val) triples so we know terminal position for cabinet search.
+        no_tags_by_y: dict[int, list[tuple[float, float, str]]] = {}
+        cable_attribs: dict[str, list[dict]] = {}
         for a in attribs:
             if a['tag'] == 'NO' and ':' in a['val']:
                 key = round(a['y'] * 2)
-                no_tags_by_y.setdefault(key, []).append((a['x'], a['val']))
+                no_tags_by_y.setdefault(key, []).append((a['x'], a['y'], a['val']))
             elif a['tag'] in ('WireDescription', 'LoopCode', 'WIRECODE'):
                 cable_attribs.setdefault(a['tag'], []).append(a)
 
@@ -445,36 +505,132 @@ class CircuitLoopAnalyzer:
         for cid in sorted(cable_cores.keys()):
             cores = cable_cores[cid]
             core_order = sorted(cores.items(), key=lambda kv: -kv[1]['y'])
-            for core, info in core_order:
+
+            # Cabinet info is the same for all cores of a cable.
+            # Compute once using the first core that has valid terminals.
+            cabinet_local: Optional[str] = None
+            cabinet_remote: Optional[str] = None
+
+            for i, (core, info) in enumerate(core_order):
                 wx = info['x']
                 wy = info['y']
 
-                # Step 1: find the core line below the WireSerial
+                # Step 1: find the core line — closest horizontal line
+                # within ±30mm of WireSerial y. Prefer a line that
+                # spans wx (typical WS-on-left layout); if none,
+                # fall back to the closest line in the core area
+                # (x_min >= 250) — this picks the main core line
+                # even when WS is placed to its right
+                # (e.g. 110037-381(5) at x=449 vs line x_max=414)
+                # while excluding narrow formatting lines.
+                _CORE_LINE_TOLERANCE = 30.0
                 core_y = wy
+                best_cl: Optional[dict] = None
+                best_dy = float('inf')
+                # Pass 1: find closest line that spans wx
                 for cl in core_lines:
-                    if cl['y'] > wy and cl['x_min'] <= wx <= cl['x_max']:
-                        core_y = cl['y']
-                        break
+                    if cl['x_min'] <= wx <= cl['x_max']:
+                        dy = abs(cl['y'] - wy)
+                        if dy < best_dy and dy <= _CORE_LINE_TOLERANCE:
+                            best_dy = dy
+                            best_cl = cl
+                # Pass 2: if no spanning line, find closest line that
+                # is both in the core x-region (x_min >= 200) and has
+                # a substantial span (>= 50mm). This picks the main
+                # core line when WS is placed to its right, while
+                # excluding left-side formatting lines (x < 200) and
+                # right-side tick marks (span < 50mm).
+                if best_cl is None:
+                    for cl in core_lines:
+                        if (
+                            cl['x_min'] >= 200
+                            and cl['x_max'] - cl['x_min'] >= 50.0
+                        ):
+                            dy = abs(cl['y'] - wy)
+                            if dy < best_dy and dy <= _CORE_LINE_TOLERANCE:
+                                best_dy = dy
+                                best_cl = cl
+                core_line_x_min = best_cl['x_min'] if best_cl else None
+                core_line_x_max = best_cl['x_max'] if best_cl else None
+                if best_cl is not None:
+                    core_y = best_cl['y']
 
                 # Step 2: find NO tags by matching y position (same row).
-                # Pick the EXTREME pair: smallest x = left terminal,
-                # largest x = right terminal. This naturally picks the
-                # correct III:xxx / Xx:xxx pair per core row.
-                left_candidate: Optional[tuple[float, str]] = None
-                right_candidate: Optional[tuple[float, str]] = None
-                key = round(core_y * 2)
-                for dk in (-1, 0, 1):
-                    for nx, nv in no_tags_by_y.get(key + dk, []):
-                        if left_candidate is None or nx < left_candidate[0]:
-                            left_candidate = (nx, nv)
-                        if right_candidate is None or nx > right_candidate[0]:
-                            right_candidate = (nx, nv)
+                # Terminals sit on both sides of the WireSerial in a
+                # [left terminal] [WS] [right terminal] layout.
+                # Pick the closest tag on each side of WS. When WS
+                # is at the far right (no tags to its right), use
+                # the largest x-gap in the bucket to separate local
+                # and remote terminal groups.
+                key = round(wy * 2)
+                bucket_tags: list[tuple[float, float, str]] = []
+                for dk in (-2, -1, 0, 1, 2):
+                    bucket_tags.extend(no_tags_by_y.get(key + dk, []))
 
-                left_terminal = left_candidate[1] if left_candidate else None
-                right_terminal = right_candidate[1] if right_candidate else None
-                # If both terminals are the same entity, clear right
-                if left_candidate and right_candidate and left_candidate[0] == right_candidate[0]:
-                    right_terminal = None
+                _MIN_GAP = 50.0
+                split_x: Optional[float] = None
+                if len(bucket_tags) >= 2:
+                    st = sorted(bucket_tags, key=lambda t: t[0])
+                    mg = 0.0
+                    for j in range(1, len(st)):
+                        g = st[j][0] - st[j-1][0]
+                        if g > mg:
+                            mg = g
+                            split_x = (st[j][0] + st[j-1][0]) / 2
+                    if mg < _MIN_GAP:
+                        split_x = None
+
+                left_candidate: Optional[tuple[float, float, str]] = None
+                right_candidate: Optional[tuple[float, float, str]] = None
+                if bucket_tags:
+                    left_of_ws = [t for t in bucket_tags if t[0] < wx]
+                    right_of_ws = [t for t in bucket_tags if t[0] > wx]
+
+                    # Left side: apply split filter to exclude
+                    # remote-area tags when WS is on the right
+                    if left_of_ws:
+                        pool = left_of_ws
+                        if split_x is not None:
+                            pool = [t for t in pool if t[0] < split_x]
+                        if pool:
+                            left_candidate = min(
+                                pool, key=lambda t: abs(t[0] - wx)
+                            )
+
+                    # Right side: closest tag, no filter needed
+                    if right_of_ws:
+                        right_candidate = min(
+                            right_of_ws, key=lambda t: abs(t[0] - wx)
+                        )
+                    elif left_candidate and split_x is not None and not right_of_ws:
+                        # WS at far right — pick the remote-side tag
+                        remote_side = [
+                            t for t in bucket_tags if t[0] > split_x
+                        ]
+                        if remote_side:
+                            right_candidate = min(
+                                remote_side, key=lambda t: abs(t[0] - split_x)
+                            )
+
+                left_terminal = left_candidate[2] if left_candidate else None
+                left_terminal_x = left_candidate[0] if left_candidate else None
+                left_terminal_y = left_candidate[1] if left_candidate else None
+
+                right_terminal = right_candidate[2] if right_candidate else None
+                right_terminal_x = right_candidate[0] if right_candidate else None
+                right_terminal_y = right_candidate[1] if right_candidate else None
+
+                # Step 2a: Cabinet detection — once per cable on the
+                # first valid core. Search upward from each terminal
+                # position for text containing 屏/柜/箱.
+                if i == 0 and left_terminal_y is not None and cabinet_local is None:
+                    cabinet_local = self._find_cabinet(
+                        left_terminal_x, left_terminal_y, attribs,
+                    )
+                if i == 0 and right_terminal_y is not None and cabinet_remote is None:
+                    cabinet_remote = self._find_cabinet(
+                        right_terminal_x, right_terminal_y, attribs,
+                    )
 
                 # Step 3: circuit_desc/loop_id — find the nearest
                 # WireDescription and LoopCode ATTRIB to the cable's
@@ -515,8 +671,8 @@ class CircuitLoopAnalyzer:
                     'strip_name': strip_name,
                     'terminal_no': terminal_no,
                     'terminal_no_remote': terminal_no_remote,
-                    'cabinet_name': None,
-                    'cabinet_name_remote': None,
+                    'cabinet_name': cabinet_local,
+                    'cabinet_name_remote': cabinet_remote,
                     'circuit_desc': circuit_desc,
                     'loop_id': loop_id,
                     'source_type': 'circuit_loop',

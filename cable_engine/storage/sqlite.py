@@ -246,6 +246,21 @@ class CableStore:
         sql += ' ORDER BY cable_id, conductor_no'
         return list(self._conn.execute(sql, params).fetchall())
 
+    def search_cabinets(self, query: str) -> list[sqlite3.Row]:
+        """Search cabinet names by keyword, return distinct results."""
+        pattern = f'%{query}%'
+        return list(self._conn.execute(
+            """SELECT cabinet_name, cabinet_name_remote, document_hash,
+                      COUNT(*) as conductor_count,
+                      GROUP_CONCAT(DISTINCT cable_id) as cable_ids
+               FROM cable_topology
+               WHERE (cabinet_name LIKE ? OR cabinet_name_remote LIKE ?)
+                 AND (cabinet_name IS NOT NULL OR cabinet_name_remote IS NOT NULL)
+               GROUP BY cabinet_name, cabinet_name_remote, document_hash
+               ORDER BY cabinet_name""",
+            (pattern, pattern),
+        ).fetchall())
+
     def delete_topology_for_document(self, document_hash: str) -> None:
         self._conn.execute(
             'DELETE FROM cable_topology WHERE document_hash = ?',
