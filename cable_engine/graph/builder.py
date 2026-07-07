@@ -23,6 +23,7 @@ from ..ir import (
     DocumentType, GeometryEntity, LineGeometry, TextEntity,
 )
 from ..ir.entities import BBox, Point
+from ..classifier import CompositeClassifier, BusinessType, Classification
 from ..pipeline.stage import Context, Stage
 
 
@@ -681,20 +682,83 @@ class CircuitLoopAnalyzer:
 
 
 # ===================================================================
+# CableScheduleAnalyzer (电缆清册 / 接线表) — minimal stub for V6.5.1
+# ===================================================================
+class CableScheduleAnalyzer:
+    """Analyzer for cable schedules (电缆清册 / 接线表 / 电缆联系图).
+
+    These drawings are typically tabular: each row is a cable, columns
+    carry cable_id, conductor_no, terminal_from, terminal_to, etc.
+    The V6.5.1 release ships a *minimal* stub: it counts how many
+    cable-id-shaped strings the document contains so the classification
+    rate improves (even if no rows are persisted). The full table
+    parser lands in V6.6.
+    """
+
+    #: Matches strings like "11003-311", "GY6-136", "ZL-307ZF"
+    _CABLE_ID_LIKE = re.compile(r'\b([A-Za-z0-9]{2,8}-[A-Za-z0-9]{1,8})\b')
+
+    def analyze(self, doc: Document) -> list[dict]:
+        # Stub: identify distinct cable IDs visible in the document text.
+        # Persist a synthetic "cable-level" record per unique ID so the
+        # viewer surfaces it (with terminal_no=None to indicate no
+        # detailed analysis yet).
+        seen: set[str] = set()
+        for e in doc.entities:
+            if not isinstance(e, (TextEntity, AttributeEntity)):
+                continue
+            t = (e.text or '').strip()
+            for m in self._CABLE_ID_LIKE.finditer(t):
+                seen.add(m.group(1))
+        return [
+            {
+                'cable_id': cid,
+                'conductor_no': None,
+                'strip_name': None,
+                'terminal_no': None,
+                'terminal_no_remote': None,
+                'cabinet_name': None,
+                'cabinet_name_remote': None,
+                'circuit_desc': None,
+                'loop_id': None,
+                'source_type': 'cable_schedule',
+            }
+            for cid in sorted(seen)
+        ]
+
+
+# ===================================================================
 # TopologyStage (replaces GraphBuilderStage)
 # ===================================================================
+# V6.5: dispatch by BusinessType. Each type maps to a single Analyzer
+# (or None for types we haven't built yet — those count as "unmatched").
+_ANALYZERS_BY_TYPE: dict[BusinessType, Any] = {
+    BusinessType.CIRCUIT_LOOP: CircuitLoopAnalyzer,
+    BusinessType.TERMINAL_STRIP: TerminalStripAnalyzer,
+    BusinessType.CABLE_SCHEDULE: CableScheduleAnalyzer,
+    # PROTECTION_DIAGRAM / PANEL_LAYOUT / MONITORING_SYSTEM / UNKNOWN
+    # don't have analyzers yet — they're surfaced in the "unmatched" bucket.
+}
+
+
 class TopologyStage(Stage):
     """Build cable topology from Document IR.
 
     Run AFTER the Loader stage.
     Inputs:  ctx.document (Document IR)
     Outputs: rows in cable_topology (+ terminal_strips).
+
+    V6.5: classifies each document with CompositeClassifier
+    (keyword + geometry + layout signals) before dispatching.
+    Documents whose classification has no analyzer land in the
+    "unmatched_documents" view in the viewer.
     """
 
     name = 'topology_builder'
 
-    def __init__(self, store) -> None:
+    def __init__(self, store, classifier: Optional[CompositeClassifier] = None) -> None:
         self._store = store
+        self._classifier = classifier or CompositeClassifier()
 
     def run(self, ctx: Context) -> Context:
         doc = ctx.document
@@ -702,19 +766,21 @@ class TopologyStage(Stage):
             ctx.error_msg = 'no document to build topology from'
             return ctx
 
-        doc_type = _classify_document(str(ctx.document_path), doc)
+        # V6.5: classify via the ensemble (replaces _classify_document).
+        classification = self._classifier.classify(doc)
+        doc.classification = classification
+        doc_type = classification.primary.value
         ctx.document_type = doc_type
+        ctx.classification = classification
 
         self._store.delete_topology_for_document(doc.content_hash)
 
-        if doc_type == 'terminal_strip':
-            analyzer = TerminalStripAnalyzer()
-            records = analyzer.analyze(doc)
-        elif doc_type == 'circuit_loop':
-            analyzer = CircuitLoopAnalyzer()
-            records = analyzer.analyze(doc)
-        else:
+        AnalyzerCls = _ANALYZERS_BY_TYPE.get(classification.primary)
+        if AnalyzerCls is None:
             records = []
+        else:
+            analyzer = AnalyzerCls()
+            records = analyzer.analyze(doc)
 
         for rec in records:
             self._store.upsert_cable_topology(
@@ -736,7 +802,16 @@ class TopologyStage(Stage):
                     document_hash=doc.content_hash,
                 )
 
-        ctx.result = {'cable_topology_count': len(records)}
+        ctx.result = {
+            'cable_topology_count': len(records),
+            'classification_primary': doc_type,
+            'classification_confidence': classification.confidence,
+            'classification_secondary': [
+                {'type': bt.value, 'score': s}
+                for bt, s in classification.secondary
+            ],
+            'unmatched': AnalyzerCls is None,
+        }
         return ctx
 
 

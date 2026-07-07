@@ -49,6 +49,7 @@ from typing import Any, Optional
 SCHEMA = """
 -- ----------------------------------------------------------------------
 -- Documents (one row per source file)
+-- V6.5+: classification_primary + classification_confidence columns
 -- ----------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS documents (
     content_hash    TEXT PRIMARY KEY,
@@ -57,9 +58,12 @@ CREATE TABLE IF NOT EXISTS documents (
     file_mtime      REAL,
     first_seen_at   REAL NOT NULL,
     document_type   TEXT NOT NULL DEFAULT 'pdf',
-    source_file     TEXT
+    source_file     TEXT,
+    classification_primary     TEXT,             -- V6.5: e.g. 'terminal_strip'
+    classification_confidence  REAL              -- V6.5: 0..1
 );
 CREATE INDEX IF NOT EXISTS idx_documents_path ON documents(rel_path);
+CREATE INDEX IF NOT EXISTS idx_documents_class ON documents(classification_primary);
 
 -- ----------------------------------------------------------------------
 -- Topology: the primary query table.
@@ -102,13 +106,36 @@ CREATE TABLE IF NOT EXISTS scan_state (
 # ---------------------------------------------------------------------------
 # Schema / connection helpers
 # ---------------------------------------------------------------------------
+def _ensure_v65_columns(conn: sqlite3.Connection) -> None:
+    """Add V6.5 classification columns to existing documents table
+    if missing. Idempotent — safe to run on every open."""
+    cur = conn.execute("PRAGMA table_info(documents)")
+    cols = {row['name'] for row in cur.fetchall()}
+    if 'classification_primary' not in cols:
+        conn.execute(
+            "ALTER TABLE documents ADD COLUMN classification_primary TEXT"
+        )
+    if 'classification_confidence' not in cols:
+        conn.execute(
+            "ALTER TABLE documents ADD COLUMN classification_confidence REAL"
+        )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_documents_class "
+        "ON documents(classification_primary)"
+    )
+
+
 def ensure_schema(conn: sqlite3.Connection) -> None:
     """Create tables / indexes if they don't exist. Idempotent.
 
     V5 doesn't ship migrations from V4 — the schema is clean.
     If you have an old cable.db from V4, delete it and re-scan.
+
+    V6.5: also runs `_ensure_v65_columns` so existing cable.db files
+    get the classification columns without a manual migration.
     """
     conn.executescript(SCHEMA)
+    _ensure_v65_columns(conn)
     conn.commit()
 
 
@@ -164,24 +191,76 @@ class CableStore:
         file_mtime: Optional[float] = None,
         document_type: str = 'dwg',
         source_file: Optional[str] = None,
+        classification_primary: Optional[str] = None,
+        classification_confidence: Optional[float] = None,
     ) -> None:
         now = time.time()
         self._conn.execute(
             """INSERT INTO documents (content_hash, rel_path, file_size,
                                       file_mtime, first_seen_at,
-                                      document_type, source_file)
-               VALUES (?, ?, ?, ?, ?, ?, ?)
+                                      document_type, source_file,
+                                      classification_primary,
+                                      classification_confidence)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(content_hash) DO UPDATE SET
                    rel_path = excluded.rel_path,
                    file_size = excluded.file_size,
-                   file_mtime = excluded.file_mtime""",
+                   file_mtime = excluded.file_mtime,
+                   classification_primary = excluded.classification_primary,
+                   classification_confidence = excluded.classification_confidence""",
             (content_hash, rel_path, file_size, file_mtime,
-             now, document_type, source_file),
+             now, document_type, source_file,
+             classification_primary, classification_confidence),
         )
 
     def list_documents(self) -> list[sqlite3.Row]:
         return list(self._conn.execute(
             'SELECT * FROM documents ORDER BY rel_path'
+        ).fetchall())
+
+    def list_documents_by_classification(self) -> dict[str, int]:
+        """Return {classification_primary: doc_count} for every
+        classification that has at least one document. Includes
+        documents with classification_primary IS NULL (as None)."""
+        out: dict[str, int] = {}
+        for r in self._conn.execute(
+            """SELECT COALESCE(classification_primary, 'unclassified') AS cls,
+                      COUNT(*) AS n
+               FROM documents
+               GROUP BY cls
+               ORDER BY n DESC"""
+        ).fetchall():
+            out[r['cls']] = r['n']
+        return out
+
+    def list_unclassified_documents(
+        self,
+        limit: int = 500,
+    ) -> list[sqlite3.Row]:
+        """Documents whose classification has no analyzer yet — i.e.
+        the analyzer dispatch in TopologyStage would skip them.
+
+        Used by the viewer's "未分类图档" tab.
+
+        Note: this is *not* the same as "no cable_topology rows".
+        A circuit_loop drawing without topology rows might just have
+        no cables (e.g. an empty template) — that's a different
+        concern (see `unprocessed_documents` in stats).
+        """
+        return list(self._conn.execute(
+            """SELECT d.content_hash, d.rel_path, d.classification_primary,
+                      d.classification_confidence,
+                      (SELECT COUNT(*) FROM cable_topology ct
+                       WHERE ct.document_hash = d.content_hash) AS has_topology
+               FROM documents d
+               WHERE d.classification_primary IN (
+                       'protection_diagram', 'panel_layout',
+                       'monitoring_system', 'unknown'
+                   )
+                   OR d.classification_primary IS NULL
+               ORDER BY d.classification_primary, d.rel_path
+               LIMIT ?""",
+            (limit,),
         ).fetchall())
 
     def get_document(self, content_hash: str) -> Optional[sqlite3.Row]:
@@ -407,6 +486,28 @@ class CableStore:
             out['unprocessed_documents'] = row['n']
         except sqlite3.OperationalError:
             out['unprocessed_documents'] = 0
+
+        # V6.5: classification breakdown (replaces the rough
+        # "unprocessed" view with the business-type-aware view).
+        try:
+            out['documents_by_classification'] = self.list_documents_by_classification()
+        except sqlite3.OperationalError:
+            out['documents_by_classification'] = {}
+
+        # V6.5: documents whose classification has no analyzer.
+        # (matches what the viewer's "未分类图档" tab shows.)
+        try:
+            row = self._conn.execute(
+                """SELECT COUNT(*) AS n FROM documents
+                   WHERE classification_primary IN (
+                       'protection_diagram', 'panel_layout',
+                       'monitoring_system', 'unknown'
+                   )
+                      OR classification_primary IS NULL"""
+            ).fetchone()
+            out['unmatched_documents'] = row['n']
+        except sqlite3.OperationalError:
+            out['unmatched_documents'] = 0
 
         # Empty-terminal cables (cables where all conductors have no terminal)
         out['cables_without_terminals'] = 0

@@ -89,6 +89,9 @@ def _process_one_document(
 
     store = CableStore(open_db(Path(db_path_str), read_only=False))
     try:
+        # V6.5: do the initial insert without classification; the
+        # TopologyStage will set it. We update again after the pipeline
+        # finishes (see below).
         store.upsert_document(
             doc.content_hash, str(document_path),
             file_size=document_path.stat().st_size if document_path.exists() else None,
@@ -101,12 +104,30 @@ def _process_one_document(
             document=doc,
         )
         out = _pipeline_for(store).run(ctx)
+        # V6.5: persist classification back to documents row.
+        if ctx.classification is not None:
+            store.upsert_document(
+                doc.content_hash, str(document_path),
+                file_size=document_path.stat().st_size if document_path.exists() else None,
+                file_mtime=document_path.stat().st_mtime if document_path.exists() else None,
+                document_type=doc.document_type.value,
+                classification_primary=ctx.classification.primary.value,
+                classification_confidence=ctx.classification.confidence,
+            )
         return {
             'path': str(document_path),
             'content_hash': doc.content_hash,
             'source_type': doc.document_type.value,
             'pages': len(doc.pages),
             'entities': len(doc.entities),
+            'classification': (
+                out.result.get('classification_primary', '')
+                if out.result else ''
+            ),
+            'classification_confidence': (
+                out.result.get('classification_confidence', 0.0)
+                if out.result else 0.0
+            ),
             'error': out.error_msg,
         }
     finally:
@@ -158,8 +179,12 @@ def cmd_scan(args: argparse.Namespace) -> int:
                 print(f'[{completed}/{len(documents)}] {p.name} ({elapsed:.1f}s)  '
                       f'错误: {res["error"]}', flush=True)
             else:
+                cls = res.get('classification', '')
+                cls_short = cls.replace('_', '')[:8] if cls else '-'
+                conf = res.get('classification_confidence', 0.0)
                 print(f'[{completed}/{len(documents)}] {p.name} ({elapsed:.1f}s)  '
-                      f'[{res["source_type"]}] {res["pages"]}p/{res["entities"]}e',
+                      f'[{res["source_type"]}] {res["pages"]}p/{res["entities"]}e '
+                      f'cls={cls_short}({conf:.2f})',
                       flush=True)
     else:
         with mp.Pool(processes=args.workers) as pool:
@@ -174,9 +199,13 @@ def cmd_scan(args: argparse.Namespace) -> int:
                           f'{Path(result["path"]).name} ({elapsed:.1f}s)  '
                           f'错误: {result["error"]}', flush=True)
                 else:
+                    cls = result.get('classification', '')
+                    cls_short = cls.replace('_', '')[:8] if cls else '-'
+                    conf = result.get('classification_confidence', 0.0)
                     print(f'[{completed}/{len(documents)}] '
                           f'{Path(result["path"]).name} ({elapsed:.1f}s)  '
-                          f'[{result["source_type"]}] {result["pages"]}p/{result["entities"]}e',
+                          f'[{result["source_type"]}] {result["pages"]}p/{result["entities"]}e '
+                          f'cls={cls_short}({conf:.2f})',
                           flush=True)
 
     # Summary
@@ -189,7 +218,26 @@ def cmd_scan(args: argparse.Namespace) -> int:
     print(f'扫描: {s["documents"]} documents')
     print(f'  topology: {s["cable_topology"]} cable-conductor records')
     print(f'  strips: {s["terminal_strips"]} terminal strips')
-    print(f'  (graph tables removed — topology is the primary store)')
+    print()
+    # V6.5: classification breakdown
+    by_cls = s.get('documents_by_classification', {})
+    if by_cls:
+        print('  按业务分类:')
+        for cls, n in by_cls.items():
+            label = {
+                'circuit_loop': '回路图',
+                'terminal_strip': '端子排图',
+                'cable_schedule': '电缆清册',
+                'protection_diagram': '保护原理图',
+                'panel_layout': '屏位布置图',
+                'monitoring_system': '状态监测/通风',
+                'unknown': '目录/封面',
+                'unclassified': '(未分类)',
+            }.get(cls, cls)
+            print(f'    {label:<14} {n:>4}')
+        unmatched = s.get('unmatched_documents', 0)
+        if unmatched:
+            print(f'  无对应 analyzer 的图档: {unmatched}')
     print(f'耗时: {duration:.1f}s')
     print(f'DB: {db_path}')
     print()

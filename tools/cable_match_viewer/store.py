@@ -155,5 +155,22 @@ class CableViewer:
     def stats(self) -> dict:
         return self._store.stats()
 
+    # ------------------------------------------------------------------
+    # Unclassified documents (V6.5 — viewer's "未分类图档" tab)
+    # ------------------------------------------------------------------
+    def list_unclassified_documents(self, limit: int = 500) -> list[dict]:
+        """Documents whose classification has no analyzer, OR with no
+        cable_topology rows at all. Returned in a viewer-friendly shape."""
+        out = []
+        for r in self._store.list_unclassified_documents(limit=limit):
+            out.append({
+                'content_hash': r['content_hash'],
+                'rel_path': r['rel_path'],
+                'classification_primary': r['classification_primary'] or '',
+                'classification_confidence': r['classification_confidence'] or 0.0,
+                'has_topology': bool(r['has_topology']),
+            })
+        return out
+
 
 __all__ = ['CableViewer']

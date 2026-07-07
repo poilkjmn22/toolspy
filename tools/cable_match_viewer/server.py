@@ -88,6 +88,7 @@ INDEX_HTML = """<!DOCTYPE html>
     <div id="tabs">
       <div class="tab active" data-tab="cables">电缆</div>
       <div class="tab" data-tab="cabinets">柜体</div>
+      <div class="tab" data-tab="unclassified">未分类</div>
       <div class="tab" data-tab="stats">统计</div>
     </div>
     <div id="stats">加载中…</div>
@@ -136,13 +137,18 @@ document.querySelectorAll('.tab').forEach(el => {
     activeTab = el.dataset.tab;
     document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === activeTab));
     search.value = '';
-    search.placeholder = activeTab === 'cables' ? '过滤电缆…' : activeTab === 'stats' ? '' : '搜索柜体(区域-名称)…';
-    search.style.display = activeTab === 'stats' ? 'none' : '';
+    search.placeholder = activeTab === 'cables' ? '过滤电缆…'
+      : activeTab === 'stats' ? ''
+      : activeTab === 'unclassified' ? '过滤文件路径…'
+      : '搜索柜体(区域-名称)…';
+    search.style.display = (activeTab === 'stats' || activeTab === 'unclassified') ? 'none' : '';
     if (activeTab === 'cables') {
       renderCables();
       $('stats').textContent = `共 ${allCables.length} 条电缆`;
     } else if (activeTab === 'stats') {
       renderStats();
+    } else if (activeTab === 'unclassified') {
+      renderUnclassified();
     } else {
       cableList.innerHTML = '<div class="empty">输入关键字搜索柜体</div>';
       $('stats').textContent = '柜体搜索';
@@ -301,11 +307,61 @@ flyfishClose.onclick = () => {
 search.oninput = () => {
   if (activeTab === 'cables') renderCables();
   else if (activeTab === 'cabinets') searchCabinets();
+  else if (activeTab === 'unclassified') renderUnclassified();
 };
 
 function escHtml(s) {
   if (!s) return s;
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+async function renderUnclassified() {
+  const r = await fetch('/api/unclassified?limit=500');
+  const items = await r.json();
+  let html = '<div style="padding:10px 14px;">';
+
+  // Group by classification_primary for visual clarity
+  const groups = {};
+  for (const it of items) {
+    const cls = it.classification_primary || 'unclassified';
+    if (!groups[cls]) groups[cls] = [];
+    groups[cls].push(it);
+  }
+
+  const clsLabels = {
+    'protection_diagram': '保护 / 测控信号回路图',
+    'panel_layout': '屏位 / 屏柜布置图',
+    'monitoring_system': '状态监测 / 通风控制 / SF6',
+    'unknown': '目录 / 封面 / 总说明',
+    'unclassified': '未分类 (legacy)',
+    '': '未分类',
+  };
+
+  if (Object.keys(groups).length === 0) {
+    html += '<div class="empty" style="padding:20px;">所有图档均已分类 ✓</div>';
+  } else {
+    for (const cls of Object.keys(groups)) {
+      const list = groups[cls];
+      const label = clsLabels[cls] || cls;
+      html += `<div class="section"><h3>${escHtml(label)} (${list.length})</h3>`;
+      html += '<table style="width:100%;border-collapse:collapse;font-size:11px;">';
+      html += '<tr style="background:#f5f5f5;font-weight:600;"><th style="padding:3px 6px;text-align:left;border-bottom:1px solid #ddd;">路径</th><th style="padding:3px 6px;text-align:right;border-bottom:1px solid #ddd;">置信度</th></tr>';
+      for (const it of list.slice(0, 50)) {
+        const path = it.rel_path.split(/[/\\]/).slice(-2).join('/');
+        const conf = it.classification_confidence ? it.classification_confidence.toFixed(2) : '-';
+        const dot = it.has_topology ? '<span style="color:#2e7d32;">●</span>' : '<span style="color:#bbb;">○</span>';
+        html += `<tr style="border-bottom:1px solid #eee;"><td style="padding:3px 6px;font-family:monospace;">${dot} ${escHtml(path)}</td><td style="padding:3px 6px;text-align:right;font-family:monospace;">${conf}</td></tr>`;
+      }
+      if (list.length > 50) {
+        html += `<tr><td colspan="2" style="padding:4px 6px;color:#999;text-align:center;">… 还有 ${list.length - 50} 份</td></tr>`;
+      }
+      html += '</table></div>';
+    }
+    html += `<div style="font-size:11px;color:#888;margin-top:8px;">● 已有 cable_topology &nbsp; ○ 无业务数据</div>`;
+  }
+  html += '</div>';
+  cableList.innerHTML = html;
+  $('stats').textContent = `${items.length} 份未处理`;
 }
 
 async function renderStats() {
@@ -337,6 +393,38 @@ async function renderStats() {
   });
   html += '</div>';
 
+  // V6.5: classification breakdown
+  const clsLabels = {
+    'circuit_loop': '回路图',
+    'terminal_strip': '端子排图',
+    'cable_schedule': '电缆清册',
+    'protection_diagram': '保护原理图',
+    'panel_layout': '屏位布置图',
+    'monitoring_system': '状态监测/通风',
+    'unknown': '目录/封面',
+    'unclassified': '(未分类)',
+  };
+  if (s.documents_by_classification && Object.keys(s.documents_by_classification).length) {
+    html += '<div class="section"><h3>按业务分类 (V6.5)</h3>';
+    html += '<table style="width:100%;border-collapse:collapse;font-size:12px;">';
+    html += '<tr style="background:#f5f5f5;font-weight:600;"><th style="padding:3px 6px;text-align:left;border-bottom:1px solid #ddd;">分类</th><th style="padding:3px 6px;text-align:right;border-bottom:1px solid #ddd;">图档</th><th style="padding:3px 6px;text-align:right;border-bottom:1px solid #ddd;">占比</th></tr>';
+    const total = s.documents || 1;
+    for (const [cls, n] of Object.entries(s.documents_by_classification)) {
+      const label = clsLabels[cls] || cls;
+      const pct = ((n / total) * 100).toFixed(1);
+      html += `<tr style="border-bottom:1px solid #eee;"><td style="padding:3px 6px;">${escHtml(label)}</td><td style="padding:3px 6px;text-align:right;font-family:monospace;">${n}</td><td style="padding:3px 6px;text-align:right;font-family:monospace;color:#888;">${pct}%</td></tr>`;
+    }
+    html += '</table></div>';
+  }
+
+  // V6.5: unmatched alert
+  if (s.unmatched_documents > 0) {
+    html += `<div class="section"><h3 style="color:#d32f2f;">无 analyzer 的图档 <span style="font-weight:400;color:#888;font-size:11px;">(等待新增 analyzer)</span></h3>`;
+    html += `<div style="font-size:12px;color:#d32f2f;font-weight:600;">${s.unmatched_documents} 份</div>`;
+    html += '<div style="font-size:11px;color:#888;margin-top:2px;">查看 <b>未分类</b> 标签页了解详细分布</div>';
+    html += '</div>';
+  }
+
   // Document type breakdown
   if (s.documents_by_type && Object.keys(s.documents_by_type).length) {
     html += '<div class="section"><h3>图纸类型分布</h3>';
@@ -349,11 +437,13 @@ async function renderStats() {
     html += '</table></div>';
   }
 
-  // Unprocessed documents
-  if (s.unprocessed_documents > 0) {
+  // Unprocessed documents (legacy V6 stat — kept for backward compat;
+// the V6.5 "unmatched_documents" above replaces it with finer detail.)
+  if (s.unprocessed_documents && s.unprocessed_documents > 0
+      && (!s.unmatched_documents || s.unmatched_documents === 0)) {
     html += `<div class="section"><h3 style="color:#d32f2f;">未处理图纸 <span style="font-weight:400;color:#888;font-size:11px;">(无业务分类命中)</span></h3>`;
     html += `<div style="font-size:12px;color:#d32f2f;font-weight:600;">${s.unprocessed_documents} 份</div>`;
-    html += '<div style="font-size:11px;color:#888;margin-top:2px;">这些图档未匹配到 回路图 / 端子排图 分类，未抽取电缆拓扑</div>';
+    html += '<div style="font-size:11px;color:#888;margin-top:2px;">这些图档未匹配到任何业务分类</div>';
     html += '</div>';
   }
 
@@ -458,6 +548,12 @@ async def search_cabinets_handler(request: web.Request) -> web.Response:
     return web.json_response(_viewer(request).search_cabinets(q))
 
 
+async def unclassified_handler(request: web.Request) -> web.Response:
+    """V6.5: documents whose classification has no analyzer yet."""
+    limit = int(request.query.get('limit', '500'))
+    return web.json_response(_viewer(request).list_unclassified_documents(limit=limit))
+
+
 async def healthz_handler(request: web.Request) -> web.Response:
     return web.Response(text='OK', content_type='text/plain')
 
@@ -486,6 +582,7 @@ def make_app(db_path: Path) -> web.Application:
     app.router.add_get('/api/document/{hash}/file', document_file_handler)
     app.router.add_get('/api/search-cabinets', search_cabinets_handler)
     app.router.add_get('/api/stats', stats_handler)
+    app.router.add_get('/api/unclassified', unclassified_handler)
     app.router.add_get('/healthz', healthz_handler)
     return app
 

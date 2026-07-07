@@ -6,6 +6,7 @@ A Document is the top-level IR node. It bundles:
   - one or more Pages (PDF semantics) or a single synthetic Page
     (DWG semantics — see below)
   - all extracted entities (text, lines, polylines, symbols)
+  - V6.5+: business classification (set by TopologyStage)
 
 The Document is what gets passed to the rest of the pipeline (OCR
 Stage, Match Stage, Persist Stage). It is the smallest unit that
@@ -36,10 +37,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import TYPE_CHECKING, Iterator, Optional
 
 from .entities import Entity, TextEntity
 from .pdf import Page
+
+if TYPE_CHECKING:
+    from ..classifier import Classification
 
 
 class DocumentType(str, Enum):
@@ -58,12 +62,16 @@ class Document:
 
     `entities` is the FLAT list of every entity extracted from the
     document (text, line, polyline, symbol, future YOLO detections).
+
+    `classification` (V6.5+) is set by TopologyStage's DocumentClassifier.
+    None until the classification stage runs.
     """
     document_type: DocumentType
     document_path: Path
     content_hash: str = ''                 # sha256 of file bytes (DEDUP)
     pages: list[Page] = field(default_factory=list)
     entities: list[Entity] = field(default_factory=list)
+    classification: Optional['Classification'] = None  # V6.5+
 
     # ------------------------------------------------------------------
     # Convenience accessors (uniform across source types)

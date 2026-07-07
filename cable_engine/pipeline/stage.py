@@ -27,7 +27,10 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    from ..classifier import Classification
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +52,10 @@ class Context:
     # The current Document under processing. DWG and PDF both produce
     # a Document; the pipeline reads/writes through it.
     document: Any = None                     # cable_engine.ir.Document
+
+    # ---------- V6.5 outputs ----------
+    # Business classification set by TopologyStage's DocumentClassifier.
+    classification: Optional['Classification'] = None
 
     # ---------- V6 outputs ----------
     # Result dict populated by the TopologyStage.
