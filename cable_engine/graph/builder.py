@@ -492,15 +492,52 @@ class CircuitLoopAnalyzer:
             })
 
         # Group NO tags and cable-level ATTRIB by y position.
-        # Store (x, y, val) triples so we know terminal position for cabinet search.
-        no_tags_by_y: dict[int, list[tuple[float, float, str]]] = {}
+        # Store (x, y, val, tag) tuples so we know the tag type for the
+        # XB-ownership filter (ObjTerm.Name tags can only be claimed by
+        # the WS closest to them at the same y).
+        no_tags_by_y: dict[int, list[tuple[float, float, str, str]]] = {}
         cable_attribs: dict[str, list[dict]] = {}
+        # WireSerial x positions grouped by y-key, used by the
+        # ObjTerm.Name ownership filter below.
+        ws_x_by_y: dict[int, set[float]] = {}
         for a in attribs:
-            if a['tag'] == 'NO' and ':' in a['val']:
+            if a['tag'] in ('NO', 'ObjTerm.Name') and ':' in a['val']:
                 key = round(a['y'] * 2)
-                no_tags_by_y.setdefault(key, []).append((a['x'], a['y'], a['val']))
+                no_tags_by_y.setdefault(key, []).append((a['x'], a['y'], a['val'], a['tag']))
             elif a['tag'] in ('WireDescription', 'LoopCode', 'WIRECODE'):
                 cable_attribs.setdefault(a['tag'], []).append(a)
+            elif a['tag'] == 'WireSerial':
+                key = round(a['y'] * 2)
+                ws_x_by_y.setdefault(key, set()).add(a['x'])
+
+        # V6.5.3: Pre-compute NO tag ownership — for every NO tag,
+        # store (closest_ws_dist, second_closest_ws_dist) across all
+        # WSs at the same y-bucket. Tags where the 2nd-closest WS is
+        # within _NO_TAG_SHARE_DISTANCE are "shared" between the
+        # closest and 2nd-closest WSs (e.g. VI:1 between 11037-384
+        # and 11003-387). Tags with a far-away 2nd-closest WS are
+        # owned exclusively by their closest WS (e.g. X5:7 from
+        # 11037-383, X4:20 owned by 11037-384 only). This filter
+        # prevents the gap-split from picking noise tags like X5:7
+        # / III:29 when 3 WSs share the same row (e.g. 11037-387
+        # cores 3-4 in D0210-16, where the noise tags are ~600
+        # units from the target WS but only ~50 units from another
+        # WS in the row).
+        _NO_TAG_SHARE_DISTANCE = 200.0
+        no_tag_ownership: dict[tuple[float, float, str], tuple[Optional[float], Optional[float]]] = {}
+        for tag_key, tag_list in no_tags_by_y.items():
+            for tag in tag_list:
+                tx, ty, tval, ttype = tag
+                if ttype != 'NO':
+                    continue
+                distances: list[float] = []
+                for dk in (-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5):
+                    for ws_x in ws_x_by_y.get(tag_key + dk, set()):
+                        distances.append(abs(tx - ws_x))
+                distances.sort()
+                closest_d = distances[0] if distances else None
+                second_d = distances[1] if len(distances) >= 2 else None
+                no_tag_ownership[(tx, ty, tval)] = (closest_d, second_d)
 
         records: list[dict] = []
         for cid in sorted(cable_cores.keys()):
@@ -553,8 +590,17 @@ class CircuitLoopAnalyzer:
                                 best_cl = cl
                 core_line_x_min = best_cl['x_min'] if best_cl else None
                 core_line_x_max = best_cl['x_max'] if best_cl else None
-                if best_cl is not None:
-                    core_y = best_cl['y']
+                # V6.5.2 fix: do NOT update core_y to the line's y.
+                # When multiple cores share a single bus line (e.g.
+                # 11003-381 cores 4-6 all connect to a y=355 bus),
+                # best_cl['y'] is the SAME for all of them, which
+                # caused every core to receive the SAME description
+                # (the one closest to the bus y). The
+                # WireDescription / LoopCode ATTRIBs are placed on
+                # each individual core's row at WS y, not the bus
+                # y, so the ATTRIB search MUST use wy (the WS y).
+                # (previously: `if best_cl is not None: core_y = ...`)
+                _ = core_y  # keep reference for any downstream code
 
                 # Step 2: find NO tags by matching y position (same row).
                 # Terminals sit on both sides of the WireSerial in a
@@ -563,54 +609,130 @@ class CircuitLoopAnalyzer:
                 # is at the far right (no tags to its right), use
                 # the largest x-gap in the bucket to separate local
                 # and remote terminal groups.
+                # V6.5.2: bucket widened from ±2 to ±5 keys (=±2.5mm
+                # instead of ±1mm) to catch shallow L-shape drops
+                # where the terminal sits a couple of mm below the
+                # WS row. Deeper L/Z-shapes still need V6.5.4.
+                # V6.5.3: ObjTerm.Name tags (XB column, past the line
+                # end inside anonymous blocks) are "owned" by the WS
+                # at the same y whose x is closest to the tag. This
+                # excludes the XB terminal from a left-side WS that
+                # shares the row with a right-side WS (e.g. 11037-384
+                # sharing y=395 with 11003-387: XB:2 belongs to
+                # 11003-387, not 11037-384). NO tags (X4:20, VI:1)
+                # remain shared between cables at the same y.
                 key = round(wy * 2)
-                bucket_tags: list[tuple[float, float, str]] = []
-                for dk in (-2, -1, 0, 1, 2):
+                bucket_tags: list[tuple[float, float, str, str]] = []
+                for dk in (-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5):
                     bucket_tags.extend(no_tags_by_y.get(key + dk, []))
 
+                # Collect every WS x position that lives in this y-bucket
+                # (a cable's WS at the same y belongs to the same row).
+                ws_x_at_y: set[float] = set()
+                for dk in (-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5):
+                    ws_x_at_y.update(ws_x_by_y.get(key + dk, set()))
+
+                def _tag_owned_by_current(
+                    tag_x: float, tag_y: float, tag_val: str, tag_type: str,
+                ) -> bool:
+                    """ObjTerm.Name tags (XB column, past line end): owned
+                    exclusively by the WS at this y whose x is closest
+                    to the tag.
+
+                    NO tags (X4:N, VI:N, etc.): shared between cables if
+                    both the closest WS and the 2nd-closest WS at the
+                    same y are within _NO_TAG_SHARE_DISTANCE of the tag
+                    (e.g. VI:1 between 11037-384 and 11003-387 at
+                    ~30 and ~120 units — both within 200 → shared).
+                    Otherwise the tag is owned exclusively by its closest
+                    WS (e.g. X4:20 has 2nd-closest WS at ~220 > 200,
+                    so 11003-387 cannot claim it; X5:7 has 2nd-closest
+                    at ~620 → only 11037-383 can claim it)."""
+                    if tag_type == 'ObjTerm.Name':
+                        if len(ws_x_at_y) <= 1:
+                            return True
+                        closest = min(ws_x_at_y, key=lambda w: abs(w - tag_x))
+                        return closest == wx
+                    # NO tag: use pre-computed ownership
+                    ownership = no_tag_ownership.get((tag_x, tag_y, tag_val))
+                    if ownership is None:
+                        return False
+                    closest_d, second_d = ownership
+                    if closest_d is None:
+                        return False
+                    current_d = abs(tag_x - wx)
+                    if second_d is not None and second_d <= _NO_TAG_SHARE_DISTANCE:
+                        # Shared between closest and 2nd-closest WSs
+                        return current_d == closest_d or current_d == second_d
+                    # Exclusive — only the closest WS can claim
+                    return current_d == closest_d
+
                 _MIN_GAP = 50.0
-                split_x: Optional[float] = None
-                if len(bucket_tags) >= 2:
-                    st = sorted(bucket_tags, key=lambda t: t[0])
-                    mg = 0.0
-                    for j in range(1, len(st)):
-                        g = st[j][0] - st[j-1][0]
-                        if g > mg:
-                            mg = g
-                            split_x = (st[j][0] + st[j-1][0]) / 2
-                    if mg < _MIN_GAP:
-                        split_x = None
-
-                left_candidate: Optional[tuple[float, float, str]] = None
-                right_candidate: Optional[tuple[float, float, str]] = None
+                left_candidate: Optional[tuple[float, float, str, str]] = None
+                right_candidate: Optional[tuple[float, float, str, str]] = None
                 if bucket_tags:
-                    left_of_ws = [t for t in bucket_tags if t[0] < wx]
-                    right_of_ws = [t for t in bucket_tags if t[0] > wx]
+                    left_of_ws = [
+                        t for t in bucket_tags
+                        if t[0] < wx and _tag_owned_by_current(t[0], t[1], t[2], t[3])
+                    ]
+                    right_of_ws = [
+                        t for t in bucket_tags
+                        if t[0] > wx and _tag_owned_by_current(t[0], t[1], t[2], t[3])
+                    ]
 
-                    # Left side: apply split filter to exclude
-                    # remote-area tags when WS is on the right
-                    if left_of_ws:
-                        pool = left_of_ws
-                        if split_x is not None:
-                            pool = [t for t in pool if t[0] < split_x]
-                        if pool:
-                            left_candidate = min(
-                                pool, key=lambda t: abs(t[0] - wx)
-                            )
-
-                    # Right side: closest tag, no filter needed
+                    # V6.5.2 fix: split_x filter only applies when WS
+                    # is at the far right (no right-side tags). When
+                    # WS has tags on BOTH sides, the standard
+                    # "closest on each side" rule is correct — the
+                    # previous code was filtering out the correct
+                    # left terminal whenever a large gap existed
+                    # among the left tags (e.g. 11003-383 core 2:
+                    # tags at x=65/226/312 with split_x=146 filtered
+                    # out X5:10 at x=312, leaving only X1:13 at x=65).
                     if right_of_ws:
+                        # Standard layout: closest on each side.
+                        if left_of_ws:
+                            left_candidate = min(
+                                left_of_ws, key=lambda t: abs(t[0] - wx)
+                            )
                         right_candidate = min(
                             right_of_ws, key=lambda t: abs(t[0] - wx)
                         )
-                    elif left_candidate and split_x is not None and not right_of_ws:
-                        # WS at far right — pick the remote-side tag
-                        remote_side = [
-                            t for t in bucket_tags if t[0] > split_x
-                        ]
-                        if remote_side:
-                            right_candidate = min(
-                                remote_side, key=lambda t: abs(t[0] - split_x)
+                    else:
+                        # WS at far right: split left tags by largest
+                        # x-gap into a local cluster (closer to WS)
+                        # and a remote cluster (further away). Local
+                        # = left terminal; remote = right terminal.
+                        if len(left_of_ws) >= 2:
+                            st = sorted(left_of_ws, key=lambda t: t[0])
+                            mg = 0.0
+                            mg_idx = 0
+                            for j in range(1, len(st)):
+                                g = st[j][0] - st[j-1][0]
+                                if g > mg:
+                                    mg = g
+                                    mg_idx = j
+                            if mg >= _MIN_GAP:
+                                split_x = (st[mg_idx][0] + st[mg_idx-1][0]) / 2
+                                local_side = [t for t in st if t[0] <= split_x]
+                                remote_side = [t for t in st if t[0] > split_x]
+                                if local_side:
+                                    left_candidate = min(
+                                        local_side, key=lambda t: abs(t[0] - wx)
+                                    )
+                                if remote_side:
+                                    right_candidate = min(
+                                        remote_side, key=lambda t: abs(t[0] - split_x)
+                                    )
+                            else:
+                                # Gap too small to split: just pick
+                                # the closest left tag.
+                                left_candidate = min(
+                                    left_of_ws, key=lambda t: abs(t[0] - wx)
+                                )
+                        elif left_of_ws:
+                            left_candidate = min(
+                                left_of_ws, key=lambda t: abs(t[0] - wx)
                             )
 
                 left_terminal = left_candidate[2] if left_candidate else None
@@ -635,17 +757,32 @@ class CircuitLoopAnalyzer:
 
                 # Step 3: circuit_desc/loop_id — find the nearest
                 # WireDescription and LoopCode ATTRIB to the cable's
-                # y range (scanning within 80mm y of core_y).
+                # y range (scanning within 80mm y of wy).
+                # V6.5.2: ATTRIB search uses wy (WS y) instead of
+                # core_y (line y). The previous `core_y` was
+                # overwritten to the bus line's y when cores shared a
+                # bus, which collapsed all of them onto the same
+                # description (the one closest to the bus row).
+                # V6.5.2: x-distance to WS is used as a tie-breaker
+                # when multiple ATTRIBs at the same y belong to
+                # different cables' description columns.
                 circuit_desc = None
                 loop_id = None
                 for tag in ('WireDescription', 'LoopCode'):
                     candidates = cable_attribs.get(tag, [])
                     best = None
                     best_dy = float('inf')
+                    best_dx = float('inf')
                     for a in candidates:
-                        dy = abs(a['y'] - core_y)
-                        if dy < best_dy and dy < 80:
+                        dy = abs(a['y'] - wy)
+                        if dy > 80:
+                            continue
+                        dx = abs(a['x'] - wx)
+                        # Pick the closest in y first; if y tie, pick
+                        # the closer in x to the WS column.
+                        if dy < best_dy or (dy == best_dy and dx < best_dx):
                             best_dy = dy
+                            best_dx = dx
                             best = a['val']
                     if tag == 'WireDescription':
                         circuit_desc = best
