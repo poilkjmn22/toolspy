@@ -347,7 +347,7 @@ async function renderUnclassified() {
       html += '<table style="width:100%;border-collapse:collapse;font-size:11px;">';
       html += '<tr style="background:#f5f5f5;font-weight:600;"><th style="padding:3px 6px;text-align:left;border-bottom:1px solid #ddd;">路径</th><th style="padding:3px 6px;text-align:right;border-bottom:1px solid #ddd;">置信度</th></tr>';
       for (const it of list.slice(0, 50)) {
-        const path = it.rel_path.split(/[/\\]/).slice(-2).join('/');
+        const path = it.rel_path.split(/[/\\\\]/).slice(-2).join('/');
         const conf = it.classification_confidence ? it.classification_confidence.toFixed(2) : '-';
         const dot = it.has_topology ? '<span style="color:#2e7d32;">●</span>' : '<span style="color:#bbb;">○</span>';
         html += `<tr style="border-bottom:1px solid #eee;"><td style="padding:3px 6px;font-family:monospace;">${dot} ${escHtml(path)}</td><td style="padding:3px 6px;text-align:right;font-family:monospace;">${conf}</td></tr>`;
