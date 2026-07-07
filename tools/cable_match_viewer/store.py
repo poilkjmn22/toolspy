@@ -10,6 +10,7 @@ No BFS, no graph traversal, no on-demand computation.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -171,6 +172,177 @@ class CableViewer:
                 'has_topology': bool(r['has_topology']),
             })
         return out
+
+# ------------------------------------------------------------------
+    # Document tree (V6.5.3 — viewer's "图纸" tab)
+    # ------------------------------------------------------------------
+    def _scan_root_prefix(self) -> str:
+        """Return the `--input` directory stored in scan_state,
+        normalized as `path/` prefix for trimming, or '' if unset."""
+        scan_root = self._store.get_state('input', '') or ''
+        scan_root = scan_root.rstrip('/')
+        return scan_root + '/' if scan_root else ''
+
+    def _strip_scan_root(self, path: str) -> str:
+        """Trim the --input prefix from `path` so the tree shows only
+        paths under the input directory."""
+        prefix = self._scan_root_prefix()
+        if not prefix or not path:
+            return path
+        if path.startswith(prefix):
+            return path[len(prefix):]
+        try:
+            common = os.path.commonpath([prefix.rstrip('/'), path]) if path else ''
+            if common and common == prefix.rstrip('/'):
+                return path[len(prefix):]
+        except (ValueError, OSError):
+            pass
+        try:
+            abs_root = str(Path(prefix.rstrip('/')).resolve())
+            abs_path = str(Path(path).resolve())
+            if abs_path.startswith(abs_root + '/'):
+                return abs_path[len(abs_root) + 1:]
+        except (ValueError, OSError):
+            pass
+        return path
+
+    def list_documents_tree(self, query: str = "") -> dict:
+        """Return a tree of documents grouped by directory, optionally
+        filtered by a fuzzy match on `rel_path`.
+
+        All paths are trimmed of the `--input` prefix (the input
+        directory itself is the root of the tree).
+
+        Response shape:
+          {
+            'total_documents': int,
+            'matching_documents': int,
+            'with_topology': int,
+            'scan_root': <--input prefix>,
+            'tree': [
+              {
+                'name': <dir-name>,
+                'type': 'directory',
+                'children': [
+                  {
+                    'name': <filename>,
+                    'type': 'file',
+                    'content_hash': ...,
+                    'rel_path': <path relative to --input>,
+                    ...
+                  },
+                  ...
+                ],
+              },
+              ...
+            ],
+          }
+        """
+        docs = self._store.list_documents()
+        q = (query or '').strip().lower()
+        scan_root = self._scan_root_prefix()
+
+        total_documents = len(docs)
+        with_topology = 0
+        file_nodes: list[dict] = []
+
+        for r in docs:
+            rel_path = r['rel_path'] or ''
+            content_hash = r['content_hash']
+            display_path = self._strip_scan_root(rel_path) or rel_path
+
+            topology_rows = self._store.list_cable_topology(document_hash=content_hash)
+            cable_ids = {row['cable_id'] for row in topology_rows}
+            source_types = sorted({row['source_type'] for row in topology_rows if row['source_type']})
+            if cable_ids:
+                with_topology += 1
+
+            file_node = {
+                'name': Path(display_path).name if display_path else content_hash,
+                'type': 'file',
+                'content_hash': content_hash,
+                'rel_path': display_path,
+                'document_type': r['document_type'] or '',
+                'classification_primary': r['classification_primary'] or '',
+                'classification_confidence': float(r['classification_confidence'] or 0.0),
+                'cable_count': len(cable_ids),
+                'conductor_count': len(topology_rows),
+                'source_types': source_types,
+            }
+
+            if q and q not in display_path.lower():
+                continue
+
+            file_nodes.append(file_node)
+
+        root: dict = {'name': '', 'type': 'directory', 'children': []}
+        for node in file_nodes:
+            rel = node['rel_path']
+            parts = [p for p in rel.split('/') if p]
+            if len(parts) <= 1:
+                node['_leaf'] = True
+                root['children'].append(node)
+                continue
+            dir_parts = parts[:-1]
+            leaf_name = parts[-1]
+            cur = root
+            for d in dir_parts:
+                child = next((c for c in cur['children'] if c.get('type') == 'directory' and c['name'] == d), None)
+                if child is None:
+                    child = {'name': d, 'type': 'directory', 'children': []}
+                    cur['children'].append(child)
+                cur = child
+            node['name'] = leaf_name
+            node['_leaf'] = True
+            cur['children'].append(node)
+
+        return {
+            'total_documents': total_documents,
+            'matching_documents': len(file_nodes),
+            'with_topology': with_topology,
+            'scan_root': scan_root.rstrip('/'),
+            'tree': root['children'],
+        }
+
+    # ------------------------------------------------------------------
+    # Document topology (V6.5.3 — viewer's "图纸" tab detail pane)
+    # ------------------------------------------------------------------
+    def get_document_topology(self, content_hash: str) -> Optional[dict]:
+        """All cable_topology rows under one document, plus the
+        document's own metadata. `rel_path` is trimmed of the
+        `--input` prefix."""
+        doc = self._document_brief(content_hash)
+        if doc is None:
+            return None
+        if doc.get('rel_path'):
+            doc['rel_path'] = self._strip_scan_root(doc['rel_path']) or doc['rel_path']
+        rows = self._store.list_cable_topology(document_hash=content_hash)
+        conductors = []
+        cable_ids: set[str] = set()
+        source_types: set[str] = set()
+        for r in rows:
+            conductors.append({
+                'cable_id': r['cable_id'],
+                'conductor_no': r['conductor_no'],
+                'strip_name': r['strip_name'],
+                'terminal_no': r['terminal_no'],
+                'terminal_no_remote': r['terminal_no_remote'],
+                'cabinet_name': r['cabinet_name'],
+                'cabinet_name_remote': r['cabinet_name_remote'],
+                'circuit_desc': r['circuit_desc'],
+                'loop_id': r['loop_id'],
+                'source_type': r['source_type'],
+            })
+            cable_ids.add(r['cable_id'])
+            if r['source_type']:
+                source_types.add(r['source_type'])
+        return {
+            'document': doc,
+            'cable_count': len(cable_ids),
+            'conductor_count': len(conductors),
+            'source_types': sorted(source_types),
+            'conductors': sorted(conductors, key=lambda c: (c['cable_id'] or '', c['conductor_no'] or 0)),
+        }
 
 
 __all__ = ['CableViewer']

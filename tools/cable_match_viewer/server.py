@@ -41,8 +41,10 @@ INDEX_HTML = """<!DOCTYPE html>
   #app { display: flex; height: 100vh; }
   #left { width: 280px; border-right: 1px solid #e0e0e0; background: #fff; display: flex; flex-direction: column; }
   #right { flex: 1; display: flex; flex-direction: column; min-width: 0; }
-  #tabs { display: flex; border-bottom: 1px solid #e0e0e0; }
-  #tabs .tab { flex: 1; padding: 8px 14px; cursor: pointer; text-align: center; font-size: 12px; font-weight: 600; color: #888; border-bottom: 2px solid transparent; }
+  #tabs { display: flex; border-bottom: 1px solid #e0e0e0; overflow-x: auto; overflow-y: hidden; scrollbar-width: thin; }
+  #tabs::-webkit-scrollbar { height: 4px; }
+  #tabs::-webkit-scrollbar-thumb { background: #ccc; border-radius: 2px; }
+  #tabs .tab { flex: 0 0 auto; min-width: 64px; max-width: 140px; padding: 8px 14px; cursor: pointer; text-align: center; font-size: 12px; font-weight: 600; color: #888; border-bottom: 2px solid transparent; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; box-sizing: border-box; }
   #tabs .tab:hover { color: #555; }
   #tabs .tab.active { color: #1565c0; border-bottom-color: #1565c0; }
   #header { padding: 10px 14px; border-bottom: 1px solid #e0e0e0; font-weight: 600; font-size: 14px; }
@@ -80,6 +82,33 @@ INDEX_HTML = """<!DOCTYPE html>
   #flyfish-modal-header .close-btn { cursor: pointer; color: #ff6b6b; font-size: 18px; line-height: 1; padding: 0 4px; }
   #flyfish-modal-body { flex: 1; min-height: 0; }
   flyfish-file-viewer { width: 100%; height: 100%; display: block; }
+
+  /* Documents tree (V6.5.3) */
+  .doc-tree { font-size: 12px; user-select: none; }
+  .doc-tree .dir-row, .doc-tree .file-row { padding: 3px 14px; cursor: pointer; display: flex; align-items: center; gap: 4px; }
+  .doc-tree .dir-row:hover, .doc-tree .file-row:hover { background: #f0f7ff; }
+  .doc-tree .file-row.selected { background: #d0e8ff; font-weight: 600; }
+  .doc-tree .twisty { display: inline-block; width: 12px; color: #888; font-size: 10px; }
+  .doc-tree .dir-name { color: #1565c0; font-weight: 600; }
+  .doc-tree .file-name { font-family: "SF Mono", Menlo, monospace; color: #222; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .doc-tree .cls-badge { font-size: 10px; padding: 1px 6px; border-radius: 3px; font-weight: 600; }
+  .doc-tree .cls-circuit_loop { background: #fff3e0; color: #e65100; }
+  .doc-tree .cls-terminal_strip { background: #e3f2fd; color: #1565c0; }
+  .doc-tree .cls-cable_schedule { background: #f3e5f5; color: #6a1b9a; }
+  .doc-tree .cls-protection_diagram { background: #ffebee; color: #c62828; }
+  .doc-tree .cls-panel_layout { background: #e8f5e9; color: #2e7d32; }
+  .doc-tree .cls-monitoring_system { background: #ede7f6; color: #4527a0; }
+  .doc-tree .cls-unknown, .doc-tree .cls-unclassified { background: #eee; color: #888; }
+  .doc-tree .cable-cnt { font-size: 10px; color: #888; font-family: monospace; }
+  .doc-tree .children { margin-left: 14px; }
+  .doc-tree .children.collapsed { display: none; }
+  .doc-tree .empty-state { padding: 14px; color: #999; font-size: 12px; text-align: center; }
+  #detail .doc-summary { background: #f5f5f5; border-radius: 4px; padding: 10px 14px; margin-bottom: 12px; font-size: 12px; }
+  #detail .doc-summary .doc-name { font-family: "SF Mono", Menlo, monospace; font-size: 14px; font-weight: 600; margin-bottom: 6px; word-break: break-all; }
+  #detail .doc-summary .doc-meta { color: #666; line-height: 1.6; }
+  #detail .doc-summary .doc-stats { display: flex; gap: 14px; margin-top: 6px; }
+  #detail .doc-summary .doc-stats span { font-family: monospace; }
+  #detail .doc-summary .doc-stats strong { color: #1565c0; }
 </style>
 </head>
 <body>
@@ -88,6 +117,7 @@ INDEX_HTML = """<!DOCTYPE html>
     <div id="tabs">
       <div class="tab active" data-tab="cables">电缆</div>
       <div class="tab" data-tab="cabinets">柜体</div>
+      <div class="tab" data-tab="documents">图纸</div>
       <div class="tab" data-tab="unclassified">未分类</div>
       <div class="tab" data-tab="stats">统计</div>
     </div>
@@ -139,16 +169,20 @@ document.querySelectorAll('.tab').forEach(el => {
     search.value = '';
     search.placeholder = activeTab === 'cables' ? '过滤电缆…'
       : activeTab === 'stats' ? ''
+      : activeTab === 'documents' ? '过滤图纸路径…'
       : activeTab === 'unclassified' ? '过滤文件路径…'
       : '搜索柜体(区域-名称)…';
-    search.style.display = (activeTab === 'stats' || activeTab === 'unclassified') ? 'none' : '';
+    search.style.display = (activeTab === 'stats') ? 'none' : '';
     if (activeTab === 'cables') {
       renderCables();
       $('stats').textContent = `共 ${allCables.length} 条电缆`;
     } else if (activeTab === 'stats') {
       renderStats();
+    } else if (activeTab === 'documents') {
+      renderDocumentTree();
     } else if (activeTab === 'unclassified') {
       renderUnclassified();
+      search.style.display = 'none';
     } else {
       cableList.innerHTML = '<div class="empty">输入关键字搜索柜体</div>';
       $('stats').textContent = '柜体搜索';
@@ -307,12 +341,183 @@ flyfishClose.onclick = () => {
 search.oninput = () => {
   if (activeTab === 'cables') renderCables();
   else if (activeTab === 'cabinets') searchCabinets();
+  else if (activeTab === 'documents') renderDocumentTree();
   else if (activeTab === 'unclassified') renderUnclassified();
 };
 
 function escHtml(s) {
   if (!s) return s;
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+// ---------------------------------------------------------------------------
+// Documents tree tab (V6.5.3)
+// ---------------------------------------------------------------------------
+let allDocTree = null;
+let selectedDocHash = null;
+
+const CLS_LABELS = {
+  'circuit_loop': '回路图',
+  'terminal_strip': '端子排图',
+  'cable_schedule': '电缆清册',
+  'protection_diagram': '保护原理图',
+  'panel_layout': '屏位布置图',
+  'monitoring_system': '状态监测',
+  'unknown': '未识别',
+  'unclassified': '未分类',
+  '': '未分类',
+};
+
+function buildDocTreeHtml(nodes, opts) {
+  const autoExpand = opts && opts.autoExpand;
+  if (!nodes.length) return '';
+  let html = '';
+  for (const n of nodes) {
+    if (n.type === 'directory') {
+      html += `<div class="dir-row" data-dir-name="${escHtml(n.name)}">
+        <span class="twisty">${autoExpand ? '▾' : '▸'}</span>
+        <span class="dir-name">${escHtml(n.name)}</span>
+        <span class="cable-cnt">(${n.children.length})</span>
+      </div>`;
+      html += `<div class="children ${autoExpand ? '' : 'collapsed'}" data-children-of="${escHtml(n.name)}">`;
+      html += buildDocTreeHtml(n.children, opts);
+      html += `</div>`;
+    } else {
+      const cls = n.classification_primary || '';
+      const clsLabel = CLS_LABELS[cls] || cls || '未分类';
+      const cableCnt = n.cable_count ? `${n.cable_count}缆` : '无业务';
+      html += `<div class="file-row ${selectedDocHash === n.content_hash ? 'selected' : ''}" data-doc-hash="${n.content_hash}">
+        <span class="twisty"></span>
+        <span class="file-name">${escHtml(n.name)}</span>
+        <span class="cls-badge cls-${escHtml(cls)}">${escHtml(clsLabel)}</span>
+        <span class="cable-cnt">${cableCnt}</span>
+      </div>`;
+    }
+  }
+  return html;
+}
+
+async function renderDocumentTree() {
+  const q = search.value.trim();
+  cableList.innerHTML = '<div class="empty-state">加载中…</div>';
+  const r = await fetch('/api/documents?q=' + encodeURIComponent(q));
+  const data = await r.json();
+  allDocTree = data;
+  const nodes = data.tree || [];
+  if (!nodes.length) {
+    cableList.innerHTML = `<div class="empty-state">没有匹配的图纸<br><span style="font-size:11px;">${q ? '试试其他关键字' : '数据库为空'}</span></div>`;
+    $('stats').textContent = data.total_documents ? `0/${data.total_documents} 份` : '0 份';
+    return;
+  }
+  let html = '<div class="doc-tree">';
+  html += buildDocTreeHtml(nodes, {autoExpand: !!q});
+  html += '</div>';
+  cableList.innerHTML = html;
+  $('stats').textContent = q
+    ? `${data.matching_documents}/${data.total_documents} 份 (匹配) · ${data.with_topology} 有拓扑`
+    : `${data.total_documents} 份图纸 · ${data.with_topology} 有拓扑`;
+
+  wireDocTreeEvents();
+}
+
+function wireDocTreeEvents() {
+  cableList.querySelectorAll('.dir-row').forEach(el => {
+    el.onclick = () => {
+      const dirName = el.dataset.dirName;
+      const child = cableList.querySelector(`[data-children-of="${dirName.replace(/"/g, '\\"')}"]`);
+      if (!child) return;
+      const collapsed = child.classList.toggle('collapsed');
+      const twisty = el.querySelector('.twisty');
+      if (twisty) twisty.textContent = collapsed ? '▸' : '▾';
+    };
+  });
+  cableList.querySelectorAll('.file-row').forEach(el => {
+    el.onclick = () => selectDocument(el.dataset.docHash);
+  });
+}
+
+async function selectDocument(hash) {
+  selectedDocHash = hash;
+  cableList.querySelectorAll('.file-row').forEach(el => {
+    el.classList.toggle('selected', el.dataset.docHash === hash);
+  });
+  const r = await fetch('/api/document/' + encodeURIComponent(hash) + '/topology');
+  if (!r.ok) {
+    detail.innerHTML = '<div class="empty-state">未找到此图纸</div>';
+    return;
+  }
+  const data = await r.json();
+  renderDocumentDetail(data);
+}
+
+function renderDocumentDetail(d) {
+  const doc = d.document || {};
+  const rel = doc.rel_path || doc.content_hash;
+  const cls = doc.classification_primary || '';
+  const clsLabel = CLS_LABELS[cls] || cls || '未分类';
+  const conf = (doc.classification_confidence || 0).toFixed(2);
+  const stLabel = (d.source_types || []).map(s => s === 'terminal_strip' ? '端子排图' : s === 'circuit_loop' ? '回路图' : s).join(' / ') || '--';
+
+  let html = `<div class="doc-summary">
+    <div class="doc-name">${escHtml(doc.rel_path || doc.content_hash)}</div>
+    <div class="doc-meta">
+      类型: ${escHtml(doc.document_type || '--')}
+      &nbsp;|&nbsp; 分类: <span class="cls-badge cls-${escHtml(cls)}">${escHtml(clsLabel)}</span> (${conf})
+      &nbsp;|&nbsp; 大小: ${doc.file_size ? Math.round(doc.file_size / 1024) + ' KB' : '--'}
+    </div>
+    <div class="doc-stats">
+      <span>关联电缆: <strong>${d.cable_count}</strong></span>
+      <span>线芯总数: <strong>${d.conductor_count}</strong></span>
+      <span>业务类型: <strong>${escHtml(stLabel)}</strong></span>
+    </div>
+  </div>`;
+
+  html += `<div class="section">
+    <h3>拓扑记录 (${d.conductor_count})</h3>
+    <button class="preview-btn" style="margin-bottom:8px;padding:4px 14px;" data-hash="${doc.content_hash}" data-name="${escHtml(rel)}">在 flyfish 中预览图纸</button>`;
+  if (!d.conductors.length) {
+    html += '<div class="empty-state">此图纸未产生业务数据</div>';
+  } else {
+    html += '<table style="width:100%;border-collapse:collapse;font-size:12px;">';
+    html += '<tr style="background:#f5f5f5;font-weight:600;"><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">电缆</th><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">线芯</th><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">端子</th><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">对端端子</th><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">回路描述</th><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">回路编号</th><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">本端柜</th><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">对端柜</th></tr>';
+    for (const c of d.conductors) {
+      const no = c.conductor_no != null ? c.conductor_no : '--';
+      const strip = c.strip_name || '--';
+      const tn = c.terminal_no != null ? c.terminal_no : '--';
+      const remote = c.terminal_no_remote || '--';
+      const desc = c.circuit_desc || '--';
+      const loop = c.loop_id || '--';
+      const cab = c.cabinet_name || '--';
+      const cabR = c.cabinet_name_remote || '--';
+      html += `<tr style="border-bottom:1px solid #eee;">
+        <td style="padding:4px 6px;font-family:monospace;cursor:pointer;color:#06c;" class="cable-jump" data-cable="${escHtml(c.cable_id)}">${escHtml(c.cable_id)}</td>
+        <td style="padding:4px 6px;font-family:monospace;">${no}</td>
+        <td style="padding:4px 6px;font-family:monospace;">${escHtml(strip)}:${tn}</td>
+        <td style="padding:4px 6px;font-family:monospace;">${escHtml(remote)}</td>
+        <td style="padding:4px 6px;">${escHtml(desc)}</td>
+        <td style="padding:4px 6px;font-family:monospace;">${escHtml(loop)}</td>
+        <td style="padding:4px 6px;">${escHtml(cab)}</td>
+        <td style="padding:4px 6px;">${escHtml(cabR)}</td>
+      </tr>`;
+    }
+    html += '</table>';
+  }
+  html += `</div>`;
+  detail.innerHTML = html;
+
+  detail.querySelectorAll('.cable-jump').forEach(el => {
+    el.onclick = () => {
+      activeTab = 'cables';
+      document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === 'cables'));
+      search.value = el.dataset.cable;
+      search.placeholder = '过滤电缆…';
+      renderCables();
+      selectCable(el.dataset.cable);
+    };
+  });
+  detail.querySelectorAll('.preview-btn').forEach(el => {
+    el.onclick = () => openFlyfish(el.dataset.hash, el.dataset.name);
+  });
 }
 
 async function renderUnclassified() {
@@ -554,6 +759,22 @@ async def unclassified_handler(request: web.Request) -> web.Response:
     return web.json_response(_viewer(request).list_unclassified_documents(limit=limit))
 
 
+async def documents_tree_handler(request: web.Request) -> web.Response:
+    """V6.5.3: tree of source documents grouped by directory,
+    optionally filtered by a fuzzy match on `rel_path`."""
+    q = request.query.get('q', '').strip()
+    return web.json_response(_viewer(request).list_documents_tree(q))
+
+
+async def document_topology_handler(request: web.Request) -> web.Response:
+    """V6.5.3: cable_topology rows for a single document."""
+    h = request.match_info['hash']
+    data = _viewer(request).get_document_topology(h)
+    if data is None:
+        return web.json_response({'error': f'unknown document: {h!r}'}, status=404)
+    return web.json_response(data)
+
+
 async def healthz_handler(request: web.Request) -> web.Response:
     return web.Response(text='OK', content_type='text/plain')
 
@@ -583,6 +804,8 @@ def make_app(db_path: Path) -> web.Application:
     app.router.add_get('/api/search-cabinets', search_cabinets_handler)
     app.router.add_get('/api/stats', stats_handler)
     app.router.add_get('/api/unclassified', unclassified_handler)
+    app.router.add_get('/api/documents', documents_tree_handler)
+    app.router.add_get('/api/document/{hash}/topology', document_topology_handler)
     app.router.add_get('/healthz', healthz_handler)
     return app
 
