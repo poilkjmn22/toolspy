@@ -473,6 +473,9 @@ class CircuitLoopAnalyzer:
             v66_cabinets.append({
                 'id': ent.id,
                 'name': ent.name,
+                'location': ent.location,
+                'display_name': ent.display_name,
+                'text_label': ent.text_label,
                 'bbox': ent.bbox,
             })
 
@@ -652,24 +655,31 @@ class CircuitLoopAnalyzer:
                 # sharing y=395 with 11003-387: XB:2 belongs to
                 # 11003-387, not 11037-384). NO tags (X4:20, VI:1)
                 # remain shared between cables at the same y.
-                # V6.6: when the WS lives inside a detected cabinet
-                # bbox, restrict the bucket to terminals inside the
-                # SAME cabinet (or those without a known cabinet).
-                # This eliminates the cross-cabinet noise that V6.5.3
-                # patched with a fixed 200-unit share threshold.
-                ws_cabinet = _ws_in_cabinet(wx, wy, v66_cabinets)
+                # V6.6 cabinet-restricted bucket (Phase 8): REMOVED in
+                # V6.6.1 because legitimate cross-cabinet wire pairs
+                # were being filtered out. Example: D0210-15 has WS
+                # `11003-311(1)` at x=286 (in cab_002); its left
+                # terminal `21CD:1` at x=186 is in cab_001 — a
+                # DIFFERENT cabinet from the WS, but legitimately the
+                # wire's left endpoint. The filter rejected 21CD:1,
+                # leaving the cable with an empty left terminal.
+                #
+                # V6.5.3's distance-based NO-tag ownership (200-unit
+                # share threshold) is sufficient for noise removal —
+                # when multiple WSs share a row, NO tags with both
+                # closest + 2nd-closest WS within 200 units are
+                # correctly marked as shared; tags with only one WS
+                # within 200 units are owned by that WS alone.
+                #
+                # The V6.6 spatial data is still used elsewhere:
+                # - cabinet_name / cabinet_name_remote lookups (more
+                #   reliable than the V6.5 _find_cabinet text search)
+                # - viewer UI cabinet-aware tabs
+                # - future V6.7 WireTracer
                 key = round(wy * 2)
                 bucket_tags: list[tuple[float, float, str, str]] = []
                 for dk in (-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5):
-                    for tag in no_tags_by_y.get(key + dk, []):
-                        tx, ty, tval, ttype = tag
-                        if ws_cabinet is not None and v66_terminal_cab is not None:
-                            tc = v66_terminal_cab.get((tx, ty))
-                            # Allow only terminals in the same cabinet
-                            # (or terminals not yet pinned to a cabinet).
-                            if tc is not None and tc != ws_cabinet:
-                                continue
-                        bucket_tags.append(tag)
+                    bucket_tags.extend(no_tags_by_y.get(key + dk, []))
 
                 # Collect every WS x position that lives in this y-bucket
                 # (a cable's WS at the same y belongs to the same row).
@@ -789,14 +799,21 @@ class CircuitLoopAnalyzer:
                 right_terminal_y = right_candidate[1] if right_candidate else None
 
                 # Step 2a: Cabinet detection — once per cable on the
-                # first valid core. Search upward from each terminal
-                # position for text containing 屏/柜/箱.
+                # first valid core. V6.6: prefer the spatial cabinet
+                # lookup (the terminal position is inside a detected
+                # dashed-rectangle cabinet bbox → use its display
+                # name); fall back to the V6.5 text-search when no
+                # spatial cabinet covers the terminal.
                 if i == 0 and left_terminal_y is not None and cabinet_local is None:
-                    cabinet_local = self._find_cabinet(
+                    cabinet_local = _cabinet_for_terminal(
+                        left_terminal_x, left_terminal_y, v66_cabinets,
+                    ) or self._find_cabinet(
                         left_terminal_x, left_terminal_y, attribs,
                     )
                 if i == 0 and right_terminal_y is not None and cabinet_remote is None:
-                    cabinet_remote = self._find_cabinet(
+                    cabinet_remote = _cabinet_for_terminal(
+                        right_terminal_x, right_terminal_y, v66_cabinets,
+                    ) or self._find_cabinet(
                         right_terminal_x, right_terminal_y, attribs,
                     )
 
@@ -1176,3 +1193,22 @@ def _terminal_in_cab(
 ) -> Optional[str]:
     """Same as _ws_in_cabinet but explicitly named for terminals."""
     return _ws_in_cabinet(tx, ty, v66_cabinets)
+
+
+def _cabinet_for_terminal(
+    tx: float,
+    ty: float,
+    v66_cabinets: list[dict],
+) -> Optional[str]:
+    """Return the cabinet's display_name for the cabinet containing
+    (tx, ty), or None when no cabinet covers that point. Used by
+    CircuitLoopAnalyzer's Step 2a to assign `cabinet_name` /
+    `cabinet_name_remote` from spatial geometry (V6.6) rather than
+    the V6.5 text-search `_find_cabinet`."""
+    cab_id = _ws_in_cabinet(tx, ty, v66_cabinets)
+    if cab_id is None:
+        return None
+    for c in v66_cabinets:
+        if c['id'] == cab_id:
+            return c.get('display_name') or None
+    return None
