@@ -458,6 +458,37 @@ class CircuitLoopAnalyzer:
                     'y': y,
                 })
 
+        # V6.6: cabinet-region index from CabinetRegion IR entities
+        # (TopologyStage populates them BEFORE invoking us). When the
+        # array is empty (e.g. an old rescan before V6.6), the
+        # cabinet-restricted filter is a no-op and the bucket +
+        # V6.5.3 200-unit-threshold logic still applies.
+        from ..ir import CabinetRegion as _CabReg_pre
+        v66_cabinets: list[dict] = []
+        for ent in doc.entities:
+            if not isinstance(ent, _CabReg_pre):
+                continue
+            if ent.bbox is None:
+                continue
+            v66_cabinets.append({
+                'id': ent.id,
+                'name': ent.name,
+                'bbox': ent.bbox,
+            })
+
+        # Map each NO/ObjTerm.Name ATTRIB → its cabinet id (based on
+        # bbox containment). Attribs without a containing cabinet
+        # are NOT in this map — the bucket filter still considers them.
+        v66_terminal_cab: dict = {}
+        for a in attribs:
+            if a['tag'] not in ('NO', 'ObjTerm.Name'):
+                continue
+            if ':' not in a['val']:
+                continue
+            cab_id = _ws_in_cabinet(a['x'], a['y'], v66_cabinets)
+            if cab_id is not None:
+                v66_terminal_cab[(a['x'], a['y'])] = cab_id
+
         # Detect cables from WireSerial entries
         cable_cores: dict[str, dict[int, dict]] = {}
         for a in attribs:
@@ -621,10 +652,24 @@ class CircuitLoopAnalyzer:
                 # sharing y=395 with 11003-387: XB:2 belongs to
                 # 11003-387, not 11037-384). NO tags (X4:20, VI:1)
                 # remain shared between cables at the same y.
+                # V6.6: when the WS lives inside a detected cabinet
+                # bbox, restrict the bucket to terminals inside the
+                # SAME cabinet (or those without a known cabinet).
+                # This eliminates the cross-cabinet noise that V6.5.3
+                # patched with a fixed 200-unit share threshold.
+                ws_cabinet = _ws_in_cabinet(wx, wy, v66_cabinets)
                 key = round(wy * 2)
                 bucket_tags: list[tuple[float, float, str, str]] = []
                 for dk in (-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5):
-                    bucket_tags.extend(no_tags_by_y.get(key + dk, []))
+                    for tag in no_tags_by_y.get(key + dk, []):
+                        tx, ty, tval, ttype = tag
+                        if ws_cabinet is not None and v66_terminal_cab is not None:
+                            tc = v66_terminal_cab.get((tx, ty))
+                            # Allow only terminals in the same cabinet
+                            # (or terminals not yet pinned to a cabinet).
+                            if tc is not None and tc != ws_cabinet:
+                                continue
+                        bucket_tags.append(tag)
 
                 # Collect every WS x position that lives in this y-bucket
                 # (a cable's WS at the same y belongs to the same row).
@@ -917,6 +962,41 @@ class TopologyStage(Stage):
 
         self._store.delete_topology_for_document(doc.content_hash)
 
+        # V6.6: cabinet detection runs FIRST so the analyzer sees
+        # CabinetRegion IR entities when traversing the document.
+        # The earlier architecture ran cabinet analysis AFTER the
+        # analyzer, but that left the analyzer without spatial
+        # containment info to gate its terminal search.
+        self._store.delete_cabinets_for_document(doc.content_hash)
+        cabinet_records_pre = _run_cabinet_analyzer(doc)
+        cabinet_terminal_rows_pre = _assign_cabinet_terminals(doc, cabinet_records_pre)
+
+        # Inject CabinetRegion IR entities into the document so the
+        # downstream analyzer (CircuitLoopAnalyzer in particular) can
+        # use them for terminal-restricted search.
+        from ..ir import CabinetRegion as _CabRegion
+        _cab_terminals_by_id: dict[str, list[str]] = {}
+        for cab_id, tid, _k, _x, _y in cabinet_terminal_rows_pre:
+            _cab_terminals_by_id.setdefault(cab_id, []).append(tid)
+        for cr in cabinet_records_pre:
+            bb = cr.boundary.bbox
+            cab_entity = _CabRegion(
+                id=cr.id,
+                source='dwg', page=1, confidence=1.0,
+                bbox=bb,
+                layer=cr.boundary.layer or '',
+                name=cr.name,
+                location=cr.location,
+                display_name=cr.display_name,
+                text_label=cr.text_label,
+                boundary_handle=cr.boundary.handle or '',
+                ltype=cr.boundary.ltype or '',
+                contained_terminal_ids=list(
+                    _cab_terminals_by_id.get(cr.id, [])
+                ),
+            )
+            doc.add_entity(cab_entity)
+
         AnalyzerCls = _ANALYZERS_BY_TYPE.get(classification.primary)
         if AnalyzerCls is None:
             records = []
@@ -944,23 +1024,10 @@ class TopologyStage(Stage):
                     document_hash=doc.content_hash,
                 )
 
-        # V6.6: cabinet-region analysis. Independent of business
-        # classification — dashed cabinet boundaries are positional
-        # geometry that we always want to extract when present.
-        self._store.delete_cabinets_for_document(doc.content_hash)
-        cabinet_records = _run_cabinet_analyzer(doc)
-        cabinet_terminal_rows = _assign_cabinet_terminals(doc, cabinet_records)
-
-        # Persist detected cabinet regions
+        # V6.6: persist the cabinet-region rows computed BEFORE the
+        # analyzer ran (so the analyzer could already use them).
         import json as _json
-        # Build a {cabinet_id: [terminal_ids...]} map so we can attach
-        # the contained list to each CabinetRegion IR entity.
-        terminals_by_cab: dict[str, list[str]] = {}
-        for cab_id, tid, _kind, _x, _y in cabinet_terminal_rows:
-            terminals_by_cab.setdefault(cab_id, []).append(tid)
-
-        from ..ir import CabinetRegion  # V6.6
-        for cr in cabinet_records:
+        for cr in cabinet_records_pre:
             bb = cr.boundary.bbox
             self._store.upsert_cabinet(
                 cabinet_id=cr.id,
@@ -977,26 +1044,7 @@ class TopologyStage(Stage):
                     [[p.x, p.y] for p in (cr.boundary.points or [])]
                 ),
             )
-            # V6.6: also emit a CabinetRegion IR entity into the doc
-            # so downstream stages (Viewer, future DocumentGraph) see
-            # the cabinet as a first-class object alongside TEXT/LINE.
-            cab_entity = CabinetRegion(
-                id=cr.id,
-                source='dwg', page=1, confidence=1.0,
-                bbox=bb,
-                layer=cr.boundary.layer or '',
-                name=cr.name,
-                location=cr.location,
-                display_name=cr.display_name,
-                text_label=cr.text_label,
-                boundary_handle=cr.boundary.handle or '',
-                ltype=cr.boundary.ltype or '',
-                contained_terminal_ids=list(terminals_by_cab.get(cr.id, [])),
-            )
-            doc.add_entity(cab_entity)
-
-        # Persist cabinet→terminal containment rows
-        for cab_id, tid, kind, x, y in cabinet_terminal_rows:
+        for cab_id, tid, kind, x, y in cabinet_terminal_rows_pre:
             self._store.upsert_cabinet_terminal(
                 cabinet_id=cab_id,
                 document_hash=doc.content_hash,
@@ -1007,8 +1055,8 @@ class TopologyStage(Stage):
 
         ctx.result = {
             'cable_topology_count': len(records),
-            'cabinet_count': len(cabinet_records),
-            'cabinet_terminal_count': len(cabinet_terminal_rows),
+            'cabinet_count': len(cabinet_records_pre),
+            'cabinet_terminal_count': len(cabinet_terminal_rows_pre),
             'classification_primary': doc_type,
             'classification_confidence': classification.confidence,
             'classification_secondary': [
@@ -1017,6 +1065,15 @@ class TopologyStage(Stage):
             ],
             'unmatched': AnalyzerCls is None,
         }
+        # V6.6: explicit commit so a concurrent reader (or a sibling
+        # worker with its own connection) sees cabinet + topology rows
+        # before this process's connection closes. Without this,
+        # WAL-mode SQLite occasionally drops the row grouping when
+        # the next worker opens its own connection right after.
+        try:
+            self._store.commit()
+        except Exception:
+            pass
         return ctx
 
 
@@ -1087,3 +1144,35 @@ def _assign_cabinet_terminals(doc, cabinet_records) -> list:
         x, y, _tid, kind = rows[0]
         out.append((cab_id, tid, kind, x, y))
     return out
+
+
+# ---------------------------------------------------------------------------
+# V6.6: Cabinet-restricted helpers used by CircuitLoopAnalyzer.Step 2.
+# ---------------------------------------------------------------------------
+def _ws_in_cabinet(
+    wx: float,
+    wy: float,
+    v66_cabinets: list[dict],
+) -> Optional[str]:
+    """Return the cabinet_id of the cabinet whose bbox contains
+    (wx, wy), or None when no cabinet covers that point. We pick the
+    SMALLEST enclosing cabinet (innermost), consistent with
+    `assign_terminals_to_cabinets`."""
+    if not v66_cabinets:
+        return None
+    containing = [c for c in v66_cabinets
+                  if (c['bbox'].x <= wx <= c['bbox'].x + c['bbox'].w
+                      and c['bbox'].y <= wy <= c['bbox'].y + c['bbox'].h)]
+    if not containing:
+        return None
+    containing.sort(key=lambda c: c['bbox'].w * c['bbox'].h)
+    return containing[0]['id']
+
+
+def _terminal_in_cab(
+    tx: float,
+    ty: float,
+    v66_cabinets: list[dict],
+) -> Optional[str]:
+    """Same as _ws_in_cabinet but explicitly named for terminals."""
+    return _ws_in_cabinet(tx, ty, v66_cabinets)
