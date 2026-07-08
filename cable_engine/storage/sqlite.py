@@ -94,6 +94,46 @@ CREATE TABLE IF NOT EXISTS terminal_strips (
 );
 
 -- ----------------------------------------------------------------------
+-- V6.6: Cabinet regions detected from dashed rectangles.
+-- One row per detected cabinet boundary in a single document.
+-- ----------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS cabinets (
+    id              TEXT PRIMARY KEY,         -- "cab_NNN"
+    document_hash   TEXT NOT NULL,
+    name            TEXT,                     -- short cabinet code (e.g. "ZXW")
+    location        TEXT,                     -- left-prefix (e.g. "11003")
+    display_name    TEXT,                     -- "11003.ZXW" (composed)
+    text_label      TEXT,                     -- descriptive long name
+    bbox_x          REAL,
+    bbox_y          REAL,
+    bbox_w          REAL,
+    bbox_h          REAL,
+    layer           TEXT,
+    boundary_handle TEXT,                     -- DWG handle of dashed polyline
+    ltype           TEXT,                     -- dashed linetype name (e.g. ACAD_ISO10W100)
+    points_json     TEXT                      -- JSON: [["x","y"], ...]
+);
+CREATE INDEX IF NOT EXISTS idx_cabinets_doc ON cabinets(document_hash);
+CREATE INDEX IF NOT EXISTS idx_cabinets_display ON cabinets(display_name);
+
+-- ----------------------------------------------------------------------
+-- V6.6: Containment rows — which terminals (NO/ObjTerm.Name tags)
+-- belong to which cabinet region.
+-- ----------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS cabinet_terminals (
+    id              INTEGER PRIMARY KEY,
+    cabinet_id      TEXT NOT NULL,
+    document_hash   TEXT NOT NULL,
+    terminal_id     TEXT NOT NULL,            -- "9D:13" (the NO tag value)
+    terminal_kind   TEXT NOT NULL,            -- "NO" | "ObjTerm.Name"
+    x               REAL,
+    y               REAL
+);
+CREATE INDEX IF NOT EXISTS idx_cterm_cabinet ON cabinet_terminals(cabinet_id);
+CREATE INDEX IF NOT EXISTS idx_cterm_doc ON cabinet_terminals(document_hash);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_cterm ON cabinet_terminals(cabinet_id, document_hash, terminal_id, terminal_kind);
+
+-- ----------------------------------------------------------------------
 -- Generic scan state bag (replaces state.json)
 -- ----------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS scan_state (
@@ -365,6 +405,122 @@ class CableStore:
         return list(self._conn.execute(
             'SELECT * FROM terminal_strips ORDER BY strip_name'
         ).fetchall())
+
+    # ------------------------------------------------------------------
+    # V6.6: Cabinet regions
+    # ------------------------------------------------------------------
+    def upsert_cabinet(
+        self,
+        cabinet_id: str,
+        document_hash: str,
+        name: Optional[str] = None,
+        location: Optional[str] = None,
+        display_name: Optional[str] = None,
+        text_label: Optional[str] = None,
+        bbox_x: Optional[float] = None,
+        bbox_y: Optional[float] = None,
+        bbox_w: Optional[float] = None,
+        bbox_h: Optional[float] = None,
+        layer: Optional[str] = None,
+        boundary_handle: Optional[str] = None,
+        ltype: Optional[str] = None,
+        points_json: Optional[str] = None,
+    ) -> None:
+        """Idempotent insert for one cabinet region. `points_json` is a
+        stringified JSON array like `[["x","y"], ...]` (kept as TEXT
+        to avoid an extra geometry table for now)."""
+        self._conn.execute(
+            """INSERT INTO cabinets
+                   (id, document_hash, name, location, display_name,
+                    text_label, bbox_x, bbox_y, bbox_w, bbox_h,
+                    layer, boundary_handle, ltype, points_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                   document_hash = excluded.document_hash,
+                   name = excluded.name,
+                   location = excluded.location,
+                   display_name = excluded.display_name,
+                   text_label = excluded.text_label,
+                   bbox_x = excluded.bbox_x,
+                   bbox_y = excluded.bbox_y,
+                   bbox_w = excluded.bbox_w,
+                   bbox_h = excluded.bbox_h,
+                   layer = excluded.layer,
+                   boundary_handle = excluded.boundary_handle,
+                   ltype = excluded.ltype,
+                   points_json = excluded.points_json""",
+            (cabinet_id, document_hash, name, location, display_name,
+             text_label, bbox_x, bbox_y, bbox_w, bbox_h,
+             layer, boundary_handle, ltype, points_json),
+        )
+
+    def upsert_cabinet_terminal(
+        self,
+        cabinet_id: str,
+        document_hash: str,
+        terminal_id: str,
+        terminal_kind: str,
+        x: Optional[float] = None,
+        y: Optional[float] = None,
+    ) -> None:
+        """Idempotent insert for one cabinet→terminal containment row."""
+        self._conn.execute(
+            """INSERT INTO cabinet_terminals
+                   (cabinet_id, document_hash, terminal_id,
+                    terminal_kind, x, y)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(cabinet_id, document_hash, terminal_id, terminal_kind)
+               DO UPDATE SET x = excluded.x, y = excluded.y""",
+            (cabinet_id, document_hash, terminal_id,
+             terminal_kind, x, y),
+        )
+
+    def delete_cabinets_for_document(self, document_hash: str) -> None:
+        """Wipe every cabinet + terminal-containment row for a document.
+        Called by TopologyStage before re-persisting."""
+        self._conn.execute(
+            'DELETE FROM cabinet_terminals WHERE document_hash = ?',
+            (document_hash,),
+        )
+        self._conn.execute(
+            'DELETE FROM cabinets WHERE document_hash = ?',
+            (document_hash,),
+        )
+
+    def list_cabinets(
+        self,
+        document_hash: Optional[str] = None,
+        display_name_query: Optional[str] = None,
+    ) -> list[sqlite3.Row]:
+        """List detected cabinet regions, optionally filtered by
+        document_hash and/or a LIKE match on `display_name`."""
+        sql = 'SELECT * FROM cabinets'
+        params: list[Any] = []
+        wheres: list[str] = []
+        if document_hash:
+            wheres.append('document_hash = ?')
+            params.append(document_hash)
+        if display_name_query:
+            wheres.append('display_name LIKE ?')
+            params.append(f'%{display_name_query}%')
+        if wheres:
+            sql += ' WHERE ' + ' AND '.join(wheres)
+        sql += ' ORDER BY document_hash, bbox_x, bbox_y'
+        return list(self._conn.execute(sql, params).fetchall())
+
+    def get_cabinet_terminals(self, cabinet_id: str) -> list[sqlite3.Row]:
+        return list(self._conn.execute(
+            """SELECT * FROM cabinet_terminals
+               WHERE cabinet_id = ?
+               ORDER BY y, x""",
+            (cabinet_id,),
+        ).fetchall())
+
+    def count_cabinets(self) -> int:
+        row = self._conn.execute(
+            'SELECT COUNT(*) AS n FROM cabinets'
+        ).fetchone()
+        return row['n'] if row else 0
 
     # ------------------------------------------------------------------
     # Scan state (key/value bag)

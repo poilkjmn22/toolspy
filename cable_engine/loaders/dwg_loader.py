@@ -113,14 +113,20 @@ class DWGLoader(BaseLoader):
     def _parse_v5(self, raw: str, doc: Document) -> None:
         """Parse dwgread JSON and emit V5 entities.
 
-        Single linear pass. Each entity is identified by its `"entity":`
-        key. We emit:
-          - TextEntity         for TEXT, MTEXT
-          - AttributeEntity    for ATTRIB
-          - LineGeometry       for LINE, LWPOLYLINE
-          - CircleGeometry     for CIRCLE
-          - ArcGeometry        for ARC
-          - BlockRef           for INSERT (with insert_point + rotation)
+        Two-pass approach:
+          1. Build an ltype-handle → ltype-name map from all LTYPE objects
+             (emitted as standalone objects with `"object": "LTYPE"`,
+             not as `"entity"` rows — so they do not pass `_ENTITY_RE`).
+          2. Single linear pass over `"entity"` rows. Each entity is
+             identified by its `"entity":` key. We emit:
+               - TextEntity         for TEXT, MTEXT
+               - AttributeEntity    for ATTRIB
+               - LineGeometry       for LINE, LWPOLYLINE
+               - CircleGeometry     for CIRCLE
+               - ArcGeometry        for ARC
+               - BlockRef           for INSERT (with insert_point + rotation)
+             LINE / LWPOLYLINE entities also pick up the ltype name via
+             the map (handles like `[5,2,808,808]` → `"ACAD_ISO10W100"`).
 
         Anonymous block expansion (the V5 Q2-A goal) is implemented at
         the GRAPH BUILD stage instead of here. The dwgread JSON's
@@ -131,6 +137,8 @@ class DWGLoader(BaseLoader):
         time). This is simpler and more robust than chasing handles
         across the dwgread JSON format.
         """
+        ltype_map = _build_ltype_map(raw)
+
         for m in _ENTITY_RE.finditer(raw):
             etype = m.group(1)
             block = _extract_object(raw, m.start())
@@ -139,13 +147,18 @@ class DWGLoader(BaseLoader):
             # Skip block definition envelopes (BLOCK / ENDBLK pairs).
             if etype in ('BLOCK', 'ENDBLK'):
                 continue
-            self._emit_model_entity_v5(etype, block, doc)
+            self._emit_model_entity_v5(etype, block, doc, ltype_map)
 
-    def _emit_model_entity_v5(self, etype: str, block: str, doc: Document) -> None:
+    def _emit_model_entity_v5(
+        self, etype: str, block: str, doc: Document,
+        ltype_map: Optional[dict[str, str]] = None,
+    ) -> None:
         """Emit a single V5 entity from a model-space JSON object."""
         layer = _json_str(block, 'layer')
         handle = _json_handle(block)
         eed_values = _parse_eed(block)
+        if ltype_map is None:
+            ltype_map = {}
 
         if etype in ('TEXT', 'MTEXT'):
             text = _json_str(block, 'text_value', 'default_value').strip()
@@ -196,6 +209,7 @@ class DWGLoader(BaseLoader):
                 handle=handle,
                 points=[Point(start[0], start[1]), Point(end[0], end[1])],
             )
+            _maybe_set_ltype(ent, block, ltype_map)
             doc.add_entity(ent)
 
         elif etype == 'LWPOLYLINE':
@@ -211,6 +225,7 @@ class DWGLoader(BaseLoader):
                 closed=_json_int(block, 'flag', 'flags', default=0) & 1 == 1,
             )
             ent.custom_fields = {'eed': eed_values}
+            _maybe_set_ltype(ent, block, ltype_map)
             doc.add_entity(ent)
 
         elif etype == 'CIRCLE':
@@ -529,6 +544,219 @@ def _parse_eed(block: str) -> list[str]:
         if v:
             values.append(v)
     return values
+
+
+# ---------------------------------------------------------------------------
+# Linetype helpers (V6.6 — cabinet boundary detection needs to know which
+# lines are dashed / hidden). dwgread stores linetypes as standalone objects
+# (`"object": "LTYPE"` with `"name": "ACAD_ISO10W100"` etc.) plus a separate
+# LTYPE_CONTROL object whose `entries` field maps name handles to LTYPE
+# object handles. Entities (LINE / LWPOLYLINE) reference their linetype via
+# the `"ltype"` field — a handle array like `[5,2,808,808]` — together with
+# `"ltype_flags"` (0 = BYLAYER, 1 = BYBLOCK, 2 = continuous, 3 = explicit).
+# ---------------------------------------------------------------------------
+def _json_handle_array(block: str, key: str) -> Optional[str]:
+    """Read a JSON `[a, b, c, d]` array field from `block` and return it
+    as a dot-joined string (e.g. `"5.2.808.808"`). Returns None if the
+    field is missing or unparsable."""
+    p = f'"{key}":'
+    i = block.find(p)
+    if i < 0:
+        return None
+    arr_start = block.find('[', i)
+    if arr_start < 0:
+        return None
+    arr_end = block.find(']', arr_start)
+    if arr_end < 0:
+        return None
+    parts = [s.strip() for s in block[arr_start+1:arr_end].split(',')]
+    parts = [p for p in parts if p]
+    if not parts:
+        return None
+    return '.'.join(parts)
+
+
+def _build_ltype_map(raw: str) -> dict[str, str]:
+    """Walk the dwgread JSON once to collect every LTYPE object and
+    return a ltype-handle-dot-string → ltype-name map keyed by the SAME
+    format entities use in their `"ltype"` field.
+
+    dwgread quirk: LTYPE objects emit `"handle": [a, b, c]` (3-element)
+    while entity references use `"ltype": [a, b, c, d]` (4-element),
+    so we can't trivially key on bytes. Instead we walk them in the
+    order dwgread emits them (which matches the LTYPE_CONTROL.entries
+    / byblock / bylayer order) and pair entries to objects
+    positionally. The LTYPE_CONTROL.entries arrays are 4-element, so
+    they DO match what entities store — and we use them as the keys.
+    """
+    # 1. Read LTYPE objects (ordered) — carry (dot_handle_3, name).
+    ltype_objects: list[tuple[str, str]] = []
+    obj_re = re.compile(r'"object":\s*"LTYPE"')
+    for m in obj_re.finditer(raw):
+        start = raw.rfind('{', 0, m.start())
+        if start < 0:
+            continue
+        depth = 0
+        end = None
+        for j in range(start, len(raw)):
+            if raw[j] == '{':
+                depth += 1
+            elif raw[j] == '}':
+                depth -= 1
+                if depth == 0:
+                    end = j
+                    break
+        if end is None:
+            continue
+        block = raw[start:end + 1]
+        handle_arr = _json_handle_array(block, 'handle')
+        name = _json_str(block, 'name')
+        if handle_arr and name:
+            ltype_objects.append((handle_arr, name))
+
+    if not ltype_objects:
+        return {}
+
+    # 2. Read LTYPE_CONTROL's reference list in the same order dwgread
+    #    emits LTYPE objects: byblock, bylayer, then entries[0..n-1].
+    ctl_re = re.compile(r'"object":\s*"LTYPE_CONTROL"')
+    cm = ctl_re.search(raw)
+    ref_handles: list[str] = []
+    if cm:
+        ctl_start = raw.rfind('{', 0, cm.start())
+        if ctl_start >= 0:
+            depth = 0
+            ctl_end = None
+            for j in range(ctl_start, len(raw)):
+                if raw[j] == '{':
+                    depth += 1
+                elif raw[j] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        ctl_end = j
+                        break
+            if ctl_end is not None:
+                ctl_block = raw[ctl_start:ctl_end + 1]
+                for key in ('byblock', 'bylayer'):
+                    h = _json_handle_array(ctl_block, key)
+                    if h:
+                        ref_handles.append(h)
+                # entries: JSON array of [a,b,c,d] handle refs.
+                # Parse the entire substring between outer brackets
+                # by walking character-by-character.
+                entries_idx = ctl_block.find('"entries":')
+                if entries_idx >= 0:
+                    # Find the opening '[' of the entries array (skip
+                    # through optional whitespace).
+                    j = entries_idx
+                    while j < len(ctl_block) and ctl_block[j] != '[':
+                        j += 1
+                    if j < len(ctl_block):
+                        entries_open = j
+                        # Walk to matching close bracket.
+                        depth = 0
+                        entries_close = -1
+                        for k in range(entries_open, len(ctl_block)):
+                            ch = ctl_block[k]
+                            if ch == '[':
+                                depth += 1
+                            elif ch == ']':
+                                depth -= 1
+                                if depth == 0:
+                                    entries_close = k
+                                    break
+                        if entries_close > entries_open:
+                            # Parse the inner array content.
+                            inner_content = ctl_block[entries_open + 1:entries_close]
+                            depth = 0
+                            cur: list[int] = []
+                            for ch in inner_content:
+                                if ch == '[':
+                                    depth += 1
+                                    cur = []
+                                elif ch == ']':
+                                    if cur:
+                                        ref_handles.append('.'.join(str(x) for x in cur))
+                                    cur = []
+                                    depth -= 1
+                                elif ch == ',' or ch.isspace():
+                                    continue
+                                elif ch.isdigit() or (ch == '-' and not cur):
+                                    # Start a new int (negative allowed)
+                                    num_start = len(cur)
+                                    pass
+                                else:
+                                    pass
+                            # Simpler: extract just numbers between brackets
+                            depth = 0
+                            current_digits = ''
+                            for ch in inner_content:
+                                if ch == '[':
+                                    depth += 1
+                                    current_digits = ''
+                                elif ch == ']':
+                                    if depth == 1 and current_digits:
+                                        # current_digits may have multiple numbers
+                                        nums = re.findall(r'-?\d+', current_digits)
+                                        if nums:
+                                            ref_handles.append('.'.join(nums))
+                                    depth -= 1
+                                    current_digits = ''
+                                else:
+                                    if depth == 1:
+                                        current_digits += ch
+
+    # 3. Pair LTYPE objects to ref handles positionally.
+    out: dict[str, str] = {}
+    for i, ref_h in enumerate(ref_handles):
+        if i >= len(ltype_objects):
+            break
+        _, name = ltype_objects[i]
+        out[ref_h] = name
+    return out
+
+
+def _maybe_set_ltype(
+    ent: LineGeometry,
+    block: str,
+    ltype_map: dict[str, str],
+) -> None:
+    """If `block` carries a non-default linetype, attach the resolved
+    ltype name + raw flags onto `ent.custom_fields`.
+
+    The dwgread JSON shape is roughly:
+        "ltype": [5, 2, 808, 808],   // handle (type-code + bytes)
+        "ltype_flags": 3              // 0 BYLAYER | 1 BYBLOCK | 3 explicit
+
+    `ltype_flags` in {2, 3} means the entity references an explicit
+    linetype. We look up the handle in `ltype_map`, but the dwgread
+    type-code byte at the start of the array varies between entity
+    references and LTYPE_CONTROL.entries (e.g. [5,2,...] vs [2,2,...]),
+    so we compare on the trailing bytes too.
+    """
+    flags = _json_int(block, 'ltype_flags', default=0)
+    handle_arr = _json_handle_array(block, 'ltype')
+    if not (handle_arr and flags in (2, 3)):
+        return
+    # Exact-match first, then fall back to a trailing-bytes match
+    # (drop the type-code byte at the front of each 4-element form).
+    ltype_name = ltype_map.get(handle_arr, '')
+    if not ltype_name:
+        def _tail(h: str) -> tuple:
+            parts = h.split('.')
+            return tuple(int(p) for p in parts[1:])
+        target = _tail(handle_arr)
+        for k, v in ltype_map.items():
+            if _tail(k) == target:
+                ltype_name = v
+                break
+    if not ltype_name:
+        return
+    cf = getattr(ent, 'custom_fields', None) or {}
+    cf['ltype'] = ltype_name
+    cf['ltype_handle'] = handle_arr
+    cf['ltype_flags'] = flags
+    ent.custom_fields = cf
 
 
 def _next_id(doc: Document, prefix: str) -> str:

@@ -883,12 +883,17 @@ class TopologyStage(Stage):
 
     Run AFTER the Loader stage.
     Inputs:  ctx.document (Document IR)
-    Outputs: rows in cable_topology (+ terminal_strips).
+    Outputs: rows in cable_topology (+ terminal_strips), plus V6.6
+              cabinet regions in `cabinets` / `cabinet_terminals`.
 
     V6.5: classifies each document with CompositeClassifier
     (keyword + geometry + layout signals) before dispatching.
     Documents whose classification has no analyzer land in the
     "unmatched_documents" view in the viewer.
+
+    V6.6: ALWAYS runs CabinetRegionAnalyzer regardless of business
+    classification — cabinet boundaries are positional and present
+    in many 回路图 drawings regardless of the analyzer dispatch.
     """
 
     name = 'topology_builder'
@@ -939,8 +944,47 @@ class TopologyStage(Stage):
                     document_hash=doc.content_hash,
                 )
 
+        # V6.6: cabinet-region analysis. Independent of business
+        # classification — dashed cabinet boundaries are positional
+        # geometry that we always want to extract when present.
+        self._store.delete_cabinets_for_document(doc.content_hash)
+        cabinet_records = _run_cabinet_analyzer(doc)
+        cabinet_terminal_rows = _assign_cabinet_terminals(doc, cabinet_records)
+
+        # Persist detected cabinet regions
+        import json as _json
+        for cr in cabinet_records:
+            bb = cr.boundary.bbox
+            self._store.upsert_cabinet(
+                cabinet_id=cr.id,
+                document_hash=doc.content_hash,
+                name=cr.name or None,
+                location=cr.location or None,
+                display_name=cr.display_name or None,
+                text_label=cr.text_label or None,
+                bbox_x=bb.x, bbox_y=bb.y, bbox_w=bb.w, bbox_h=bb.h,
+                layer=cr.boundary.layer or None,
+                boundary_handle=cr.boundary.handle or None,
+                ltype=cr.boundary.ltype or None,
+                points_json=_json.dumps(
+                    [[p.x, p.y] for p in (cr.boundary.points or [])]
+                ),
+            )
+
+        # Persist cabinet→terminal containment rows
+        for cab_id, tid, kind, x, y in cabinet_terminal_rows:
+            self._store.upsert_cabinet_terminal(
+                cabinet_id=cab_id,
+                document_hash=doc.content_hash,
+                terminal_id=tid,
+                terminal_kind=kind,
+                x=x, y=y,
+            )
+
         ctx.result = {
             'cable_topology_count': len(records),
+            'cabinet_count': len(cabinet_records),
+            'cabinet_terminal_count': len(cabinet_terminal_rows),
             'classification_primary': doc_type,
             'classification_confidence': classification.confidence,
             'classification_secondary': [
@@ -953,3 +997,69 @@ class TopologyStage(Stage):
 
 
 __all__ = ['TopologyStage']
+
+
+# ---------------------------------------------------------------------------
+# V6.6: cabinet-region wiring
+# ---------------------------------------------------------------------------
+def _run_cabinet_analyzer(doc) -> list:
+    """Run CabinetRegionAnalyzer on doc. Returns a list of CabinetRecord
+    with stable ids. Drops micro-rectangles < 4 units per side."""
+    from .cabinet import CabinetRegionAnalyzer
+    try:
+        analyzer = CabinetRegionAnalyzer()
+        records = analyzer.analyze(doc)
+        keep: list = []
+        for r in records:
+            bb = r.boundary.bbox
+            if bb.w < 4 or bb.h < 4:
+                continue
+            keep.append(r)
+        return keep
+    except Exception:
+        return []
+
+
+def _assign_cabinet_terminals(doc, cabinet_records) -> list:
+    """For every cabinet, find NO / ObjTerm.Name ATTRIBs whose point
+    falls inside its bbox. Returns a flat list of (cabinet_id,
+    terminal_id, terminal_kind, x, y) tuples."""
+    from .cabinet import assign_terminals_to_cabinets
+    from ..ir import AttributeEntity
+
+    terminals: list = []
+    for ent in doc.entities:
+        if not isinstance(ent, AttributeEntity):
+            continue
+        tag = getattr(ent, "tag", "") or ""
+        if tag not in ("NO", "ObjTerm.Name"):
+            continue
+        cf = getattr(ent, "custom_fields", None) or {}
+        x = cf.get("x")
+        y = cf.get("y")
+        if x is None or y is None:
+            continue
+        tid = (getattr(ent, "text", "") or "").strip()
+        if not tid or ":" not in tid:
+            continue
+        terminals.append((float(x), float(y), tid, tag))
+
+    if not cabinet_records or not terminals:
+        return []
+
+    mappings = assign_terminals_to_cabinets(cabinet_records, terminals)
+    if not mappings:
+        return []
+
+    by_tid: dict = {}
+    for t in terminals:
+        by_tid.setdefault(t[2], []).append(t)
+
+    out: list = []
+    for tid, cab_id in mappings.items():
+        if tid not in by_tid:
+            continue
+        rows = sorted(by_tid[tid], key=lambda r: 0 if r[3] == "NO" else 1)
+        x, y, _tid, kind = rows[0]
+        out.append((cab_id, tid, kind, x, y))
+    return out
