@@ -150,6 +150,97 @@ class CableViewer:
             })
         return out
 
+
+    # ------------------------------------------------------------------
+    # V6.6: Cabinet regions (read from `cabinets` table)
+    # ------------------------------------------------------------------
+    def list_cabinets(
+        self,
+        document_hash=None,
+        display_name_query=None,
+        limit: int = 1000,
+    ) -> dict:
+        """Return detected cabinet regions. Optionally filtered by
+        document_hash and/or a LIKE match on `display_name`."""
+        rows = self._store.list_cabinets(
+            document_hash=document_hash,
+            display_name_query=display_name_query,
+        )
+        if limit and len(rows) > limit:
+            rows = rows[:limit]
+
+        flat = []
+        for r in rows:
+            terms = self._store.get_cabinet_terminals(r['id'])
+            doc = self._document_brief(r['document_hash']) if r['document_hash'] else None
+            flat.append({
+                'cabinet_id': r['id'],
+                'document_hash': r['document_hash'],
+                'name': r['name'] or '',
+                'location': r['location'] or '',
+                'display_name': r['display_name'] or '',
+                'text_label': r['text_label'] or '',
+                'bbox_x': r['bbox_x'],
+                'bbox_y': r['bbox_y'],
+                'bbox_w': r['bbox_w'],
+                'bbox_h': r['bbox_h'],
+                'layer': r['layer'] or '',
+                'boundary_handle': r['boundary_handle'] or '',
+                'ltype': r['ltype'] or '',
+                'document': doc,
+                'terminals': [
+                    {
+                        'terminal_id': t['terminal_id'],
+                        'terminal_kind': t['terminal_kind'],
+                        'x': t['x'],
+                        'y': t['y'],
+                    }
+                    for t in terms
+                ],
+                'terminal_count': len(terms),
+            })
+        return {
+            'total_cabinets': len(flat),
+            'documents_with_cabinets': len({c['document_hash'] for c in flat}),
+            'cabinets': flat,
+        }
+
+    def get_cabinet(self, cabinet_id: str):
+        """Return one cabinet region with its terminals, or None."""
+        rows = self._store.list_cabinets()
+        for r in rows:
+            if r['id'] == cabinet_id:
+                terms = self._store.get_cabinet_terminals(cabinet_id)
+                doc = self._document_brief(r['document_hash'])
+                return {
+                    'cabinet_id': r['id'],
+                    'document_hash': r['document_hash'],
+                    'name': r['name'] or '',
+                    'location': r['location'] or '',
+                    'display_name': r['display_name'] or '',
+                    'text_label': r['text_label'] or '',
+                    'bbox_x': r['bbox_x'],
+                    'bbox_y': r['bbox_y'],
+                    'bbox_w': r['bbox_w'],
+                    'bbox_h': r['bbox_h'],
+                    'layer': r['layer'] or '',
+                    'boundary_handle': r['boundary_handle'] or '',
+                    'ltype': r['ltype'] or '',
+                    'points_json': r['points_json'] or '[]',
+                    'document': doc,
+                    'terminals': [
+                        {
+                            'terminal_id': t['terminal_id'],
+                            'terminal_kind': t['terminal_kind'],
+                            'x': t['x'],
+                            'y': t['y'],
+                        }
+                        for t in terms
+                    ],
+                    'terminal_count': len(terms),
+                }
+        return None
+
     # ------------------------------------------------------------------
     # Stats
     # ------------------------------------------------------------------
@@ -310,7 +401,8 @@ class CableViewer:
     def get_document_topology(self, content_hash: str) -> Optional[dict]:
         """All cable_topology rows under one document, plus the
         document's own metadata. `rel_path` is trimmed of the
-        `--input` prefix."""
+        `--input` prefix. V6.6 also returns detected cabinet regions
+        for this document (each with bbox + contained terminals)."""
         doc = self._document_brief(content_hash)
         if doc is None:
             return None
@@ -336,12 +428,36 @@ class CableViewer:
             cable_ids.add(r['cable_id'])
             if r['source_type']:
                 source_types.add(r['source_type'])
+
+        # V6.6: spatial cabinet regions for this document.
+        cabinets_data = self.list_cabinets(document_hash=content_hash)
+        cabinets = [
+            {
+                'cabinet_id': c['cabinet_id'],
+                'name': c['name'],
+                'location': c['location'],
+                'display_name': c['display_name'],
+                'text_label': c['text_label'],
+                'bbox_x': c['bbox_x'],
+                'bbox_y': c['bbox_y'],
+                'bbox_w': c['bbox_w'],
+                'bbox_h': c['bbox_h'],
+                'boundary_handle': c['boundary_handle'],
+                'ltype': c['ltype'],
+                'terminal_count': c['terminal_count'],
+                'terminals': c['terminals'],
+            }
+            for c in cabinets_data['cabinets']
+        ]
+
         return {
             'document': doc,
             'cable_count': len(cable_ids),
             'conductor_count': len(conductors),
             'source_types': sorted(source_types),
             'conductors': sorted(conductors, key=lambda c: (c['cable_id'] or '', c['conductor_no'] or 0)),
+            'cabinet_regions': cabinets,
+            'cabinet_region_count': len(cabinets),
         }
 
 

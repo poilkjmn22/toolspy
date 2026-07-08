@@ -692,6 +692,35 @@ class CableStore:
         except sqlite3.OperationalError:
             out['distinct_cabinets'] = 0
 
+        # V6.6: detected cabinet-region count (from the `cabinets` table).
+        # Distinct from `distinct_cabinets` above, which counts names
+        # in the cable_topology rows. The spatial analysis yields spatial
+        # regions even for documents that produce no cable_topology rows.
+        out['v66_cabinet_regions'] = 0
+        out['v66_cabinet_terminal_rows'] = 0
+        out['v66_documents_with_cabinets'] = 0
+        try:
+            r1 = self._conn.execute(
+                'SELECT COUNT(*) AS n FROM cabinets'
+            ).fetchone()
+            out['v66_cabinet_regions'] = r1['n'] if r1 else 0
+        except sqlite3.OperationalError:
+            pass
+        try:
+            r2 = self._conn.execute(
+                'SELECT COUNT(*) AS n FROM cabinet_terminals'
+            ).fetchone()
+            out['v66_cabinet_terminal_rows'] = r2['n'] if r2 else 0
+        except sqlite3.OperationalError:
+            pass
+        try:
+            r3 = self._conn.execute(
+                'SELECT COUNT(DISTINCT document_hash) AS n FROM cabinets'
+            ).fetchone()
+            out['v66_documents_with_cabinets'] = r3['n'] if r3 else 0
+        except sqlite3.OperationalError:
+            pass
+
         # Total conductors (terminal records)
         try:
             row = self._conn.execute(

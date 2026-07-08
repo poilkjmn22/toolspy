@@ -953,6 +953,13 @@ class TopologyStage(Stage):
 
         # Persist detected cabinet regions
         import json as _json
+        # Build a {cabinet_id: [terminal_ids...]} map so we can attach
+        # the contained list to each CabinetRegion IR entity.
+        terminals_by_cab: dict[str, list[str]] = {}
+        for cab_id, tid, _kind, _x, _y in cabinet_terminal_rows:
+            terminals_by_cab.setdefault(cab_id, []).append(tid)
+
+        from ..ir import CabinetRegion  # V6.6
         for cr in cabinet_records:
             bb = cr.boundary.bbox
             self._store.upsert_cabinet(
@@ -970,6 +977,23 @@ class TopologyStage(Stage):
                     [[p.x, p.y] for p in (cr.boundary.points or [])]
                 ),
             )
+            # V6.6: also emit a CabinetRegion IR entity into the doc
+            # so downstream stages (Viewer, future DocumentGraph) see
+            # the cabinet as a first-class object alongside TEXT/LINE.
+            cab_entity = CabinetRegion(
+                id=cr.id,
+                source='dwg', page=1, confidence=1.0,
+                bbox=bb,
+                layer=cr.boundary.layer or '',
+                name=cr.name,
+                location=cr.location,
+                display_name=cr.display_name,
+                text_label=cr.text_label,
+                boundary_handle=cr.boundary.handle or '',
+                ltype=cr.boundary.ltype or '',
+                contained_terminal_ids=list(terminals_by_cab.get(cr.id, [])),
+            )
+            doc.add_entity(cab_entity)
 
         # Persist cabinet→terminal containment rows
         for cab_id, tid, kind, x, y in cabinet_terminal_rows:

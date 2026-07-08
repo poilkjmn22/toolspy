@@ -38,19 +38,25 @@ class EdgeType:
     INSIDE = 'inside'                   # entity is geometrically inside another (block bbox)
     ON_LAYER = 'on_layer'               # entity is on a layer (degenerate; usually denormalized)
     BETWEEN = 'between'                 # a terminal sits between two lines on the same x/y
+    CONTAINS = 'contains'               # V6.6: cabinet → terminal / device (containment by bbox)
 
 
 # ---------------------------------------------------------------------------
 # Node type vocabulary
 # ---------------------------------------------------------------------------
 class NodeType:
-    """Closed set of node types stored in the graph."""
+    """Closed set of node types stored in the graph.
+
+    V6.6 added `CABINET` for the dashed-rectangle-detected cabinet
+    regions. Each CABINET node carries its full bbox in `properties`
+    so spatial queries don't need a separate index."""
     TEXT = 'text'
     LINE = 'line'
     CIRCLE = 'circle'
     ARC = 'arc'
     BLOCK = 'block'
     ATTRIB = 'attrib'
+    CABINET = 'cabinet'
 
 
 # ---------------------------------------------------------------------------

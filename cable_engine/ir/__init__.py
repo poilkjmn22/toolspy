@@ -16,8 +16,8 @@ Source-agnostic base types:
 """
 
 from .entities import (
-    BBox, Entity, LineEntity, Point, PolylineEntity, SymbolEntity,
-    TextEntity,
+    BBox, CabinetRegion, Entity, LineEntity, Point, PolylineEntity,
+    SymbolEntity, TextEntity,
 )
 from .geometry import (
     GeometryEntity, LineGeometry, CircleGeometry, ArcGeometry,
@@ -30,7 +30,7 @@ from .document import Document, DocumentType
 __all__ = [
     # Source-agnostic
     'Entity', 'TextEntity', 'LineEntity', 'PolylineEntity',
-    'SymbolEntity', 'Point', 'BBox',
+    'SymbolEntity', 'CabinetRegion', 'Point', 'BBox',
     # Source-agnostic (V5 geometry)
     'GeometryEntity', 'LineGeometry', 'CircleGeometry', 'ArcGeometry',
     'BlockRef', 'AttributeEntity',

@@ -98,6 +98,38 @@ class TextEntity(Entity):
         return bool(needle) and needle in self.text
 
 
+# ---------------------------------------------------------------------------
+# V6.6: Cabinet region entity — a first-class IR object derived from
+# detected dashed-rectangle boundaries. The DWG Loader does not emit
+# these directly; the CabinetRegionAnalyzer (cable_engine.graph.cabinet)
+# synthesizes them at graph-build time.
+# ---------------------------------------------------------------------------
+@dataclass
+class CabinetRegion(Entity):
+    """A bounded cabinet region with cabinet-name metadata.
+
+    `name`        — short cabinet code (e.g. "ZXW", "MC").
+    `location`    — optional prefix to the left of the name (e.g.
+                    "11003", "42F") prepended at display time as
+                    "location-name".
+    `display_name`— composed "location-name" string already accounting
+                    for location; convenient for UI consumers.
+    `text_label`  — longer descriptive label (often the line below
+                    the boundary), e.g.
+                    "3号主变110kV电压互感器端子箱".
+    `boundary_handle` — DWG handle of the dashed boundary polyline
+                    (empty for non-DWG sources or fallbacks).
+    `ltype`       — linetype name (e.g. "ACAD_ISO10W100", "HIDDEN").
+    """
+    name: str = ''
+    location: str = ''
+    display_name: str = ''
+    text_label: str = ''
+    boundary_handle: str = ''
+    ltype: str = ''
+    contained_terminal_ids: list[str] = field(default_factory=list)
+
+
 @dataclass
 class LineEntity(Entity):
     """A straight line (DWG LINE) or polyline (DWG LWPOLYLINE)."""
@@ -127,4 +159,5 @@ __all__ = [
     'Point', 'BBox',
     'Entity',
     'TextEntity', 'LineEntity', 'PolylineEntity', 'SymbolEntity',
+    'CabinetRegion',
 ]

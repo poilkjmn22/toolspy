@@ -753,6 +753,34 @@ async def search_cabinets_handler(request: web.Request) -> web.Response:
     return web.json_response(_viewer(request).search_cabinets(q))
 
 
+# V6.6: cabinet regions from the spatial `cabinets` table.
+async def cabinets_handler(request: web.Request) -> web.Response:
+    """List detected cabinet regions; supports:
+      - ?document_hash=<hash>
+      - ?q=<substring>     (LIKE match on display_name)
+      - ?limit=<N>"""
+    document_hash = request.query.get('document_hash')
+    q = request.query.get('q', '').strip() or None
+    try:
+        limit = int(request.query.get('limit', '1000'))
+    except ValueError:
+        limit = 1000
+    return web.json_response(_viewer(request).list_cabinets(
+        document_hash=document_hash,
+        display_name_query=q,
+        limit=limit,
+    ))
+
+
+async def cabinet_handler(request: web.Request) -> web.Response:
+    """One cabinet region with its terminals (V6.6)."""
+    cid = request.match_info['cabinet_id']
+    data = _viewer(request).get_cabinet(cid)
+    if data is None:
+        return web.json_response({'error': f'unknown cabinet: {cid!r}'}, status=404)
+    return web.json_response(data)
+
+
 async def unclassified_handler(request: web.Request) -> web.Response:
     """V6.5: documents whose classification has no analyzer yet."""
     limit = int(request.query.get('limit', '500'))
@@ -802,6 +830,8 @@ def make_app(db_path: Path) -> web.Application:
     app.router.add_get('/api/document/{hash}', document_handler)
     app.router.add_get('/api/document/{hash}/file', document_file_handler)
     app.router.add_get('/api/search-cabinets', search_cabinets_handler)
+    app.router.add_get('/api/cabinets', cabinets_handler)
+    app.router.add_get('/api/cabinet/{cabinet_id}', cabinet_handler)
     app.router.add_get('/api/stats', stats_handler)
     app.router.add_get('/api/unclassified', unclassified_handler)
     app.router.add_get('/api/documents', documents_tree_handler)
