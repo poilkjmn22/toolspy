@@ -164,7 +164,7 @@ After meaningful code changes, refresh the index (verify the exact subcommand wi
 - **V6.5.1 DocumentClassifier** — 7 business types (circuit_loop, terminal_strip, cable_schedule, protection_diagram, panel_layout, monitoring_system, unknown). Coverage 246 → 447 docs (+82%). `_ANALYZERS_BY_TYPE` dict dispatches per type.
 - **V6.5.2 fixes** — shared-bus fix (WS y vs line y), gap-split fix (only when right_of_ws empty), x-distance tiebreaker, bucket widened ±2 → ±5 keys.
 - **V6.5.3 NO-tag ownership filter** — pre-compute closest/2nd-closest WS distances per NO tag; 200-unit share threshold. Resolves 11037-387 cores 3-4 (X4:26-27 / VI:7-8) and 11037-384 cores 1-4 (X4:20-23 / VI:1-4).
-- **V6.6 Cabinet Semantic Layer** (8 phases, all complete):
+- **V6.6 Cabinet Semantic Layer** (8 phases + V6.6.1/2 refinements):
   - **V6.6.1 — DWG linetype extraction** — `DWGLoader` reads `ltype` handle + `ltype_flags` from dwgread JSON; resolves via LTYPE_CONTROL.entries + LTYPE object list (positional pairing).
   - **V6.6.2 — CabinetRegionAnalyzer** (`cable_engine/graph/cabinet.py`) — detects dashed-rectangle boundaries using `ltype ∈ {ACAD_ISO10W100, HIDDEN, DASHED}` + 4-corner axis-aligned check.
   - **V6.6.3 — name matching** — pairs each boundary with the nearest `EquName`/`EQUNAME` text above; sample names: `11003.ZXW-3号主变110kV电压互感器端子箱`, `42F-主变及无功继电器小室同步向量采集柜`, `4G-500kV第7串断路器测控柜`.
@@ -172,11 +172,15 @@ After meaningful code changes, refresh the index (verify the exact subcommand wi
   - **V6.6.5 — schema + persistence** — `cabinets` + `cabinet_terminals` tables; `TopologyStage` runs cabinet analysis BEFORE the analyzer and persists at the end.
   - **V6.6.6 — IR + GraphNode** — `CabinetRegion` is now a first-class IR entity; `NodeType.CABINET`, `EdgeType.CONTAINS` added.
   - **V6.6.7 — viewer APIs** — `/api/cabinets`, `/api/cabinet/{id}`, plus `get_document_topology()` now includes `cabinet_regions[]` for the cabinet-aware 图纸 tab.
-  - **V6.6.8 — cabinet-restricted terminal search** — `CircuitLoopAnalyzer` rejects terminals in a different cabinet than the WS. Preserves V6.5.3 fixes; adds bbox containment as a stronger signal than the 200-unit share threshold.
-  - **Critical fix**: cabinet id collision (`cab_001` collision across docs) — fixed by prefixing with `doc.content_hash[:12]`.
-
-### In Progress
-- (none currently)
+  - **V6.6.8 (Phase 8) — cabinet-restricted terminal search** — REMOVED in V6.6.1 because legitimate cross-cabinet wire pairs were being filtered out. Example: D0210-15 has WS `11003-311(1)` at x=286 (in cab_002); its left terminal `21CD:1` at x=186 is in cab_001 — different cabinet from the WS, but legitimately the wire's left endpoint. Filter rejected it → empty terminal.
+  - **V6.6.1 fix**: cabinet id collision (`cab_001` collision across docs) — fixed by prefixing with `doc.content_hash[:12]`. Also: removed Phase 8 cabinet bbox gate from terminal bucket; V6.5.3's 200-unit distance threshold is sufficient for noise removal. Spatial cabinet data still used for cabinet_name lookups (V6.6 spatial → V6.5 text-search fallback).
+- **V6.6.2 same-side cabinet constraint** — re-introduces cabinet filter on terminal pairing at a different granularity: per-cable per-side, NOT per-WS. Two user axioms for 回路图:
+  - Every terminal on the LEFT (or RIGHT) of a single cable's WS belongs to the same cabinet.
+  - WS itself is sandwiched between the two endpoint cabinets and belongs to neither.
+  Implementation tracks `left_side_cabinet` / `right_side_cabinet` separately per cable. Once the first core finds a terminal on a side, subsequent cores' same-side candidates must be in the same cabinet (or unknown-cabinet, see V6.6.2b). Two subtleties:
+  - **Gap-split aware**: in the gap-split branch (no right-side tags), the cabinet filter is applied SEPARATELY to `local_side` and `remote_side` after the split, NOT on the raw `left_of_ws` pool. Otherwise a left-cabinet filter would wrongly drop candidates that are actually right-side terminals in a different cabinet (e.g. 11003-381 core 5 at x=449 has X1:10 in `left_of_ws` at x=429).
+  - **V6.6.2b tolerance**: a candidate whose cabinet is UNKNOWN (`_ws_in_cabinet` returns None because the point sits in a geometric gap between detected cabinet bboxes) is ACCEPTED, not filtered. V6.6 detection is geometrically imperfect — terminal labels often sit in narrow gaps between adjacent cabinet rectangles (e.g. X5:8 at y=156 sits 9 units above cab_007's top edge). Filtering those candidates would falsely reject valid terminals; accepting them is safer per user preference "empty > wrong" (we don't know which outcome is "wrong" so accept).
+  - Results on D0210-{15,16,35,36} (202 cable-core rows): only 1 regression (3B-380 core 1's `remote='IV:31'` filtered because core 4's `remote='III:28'` is in a different V6.6-detected cabinet). This is a user axiom-1 violation (3B-380 physically connects to multiple cabinets on the same side: `11037.MC` and `11003.ZXW`). All V6.5.3 noise fixes preserved (11037-387 cores 3-4 X4:26-27/VI:7-8, 11037-384 cores 1-4 X4:20-23/VI:1-4).
 
 ### In Progress
 - (none currently)

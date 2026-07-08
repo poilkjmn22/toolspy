@@ -582,6 +582,24 @@ class CircuitLoopAnalyzer:
             # Compute once using the first core that has valid terminals.
             cabinet_local: Optional[str] = None
             cabinet_remote: Optional[str] = None
+            # V6.6.2: per-cable per-side cabinet tracking. Two facts:
+            #   1. Every terminal on a given side (LEFT or RIGHT of WS)
+            #      of a cable belongs to the same cabinet.
+            #   2. WS itself is "sandwiched between" the two cabinets
+            #      and does NOT belong to either one — it just connects
+            #      them. (This is why V6.6 Phase 8's "WS in same cabinet
+            #      as terminal" gate was wrong: WS is in neither.)
+            # Once the first core finds a left/right terminal, the
+            # cabinet for that side is locked. Subsequent cores of the
+            # same cable on the same side must find their terminal in
+            # the SAME cabinet. This prevents the y-bucket search from
+            # picking up a left terminal from a neighboring cable when
+            # V6.5.3's 200-unit ownership threshold doesn't cleanly
+            # separate them (e.g. several cables on the same row whose
+            # left X4:N tags are all clustered within 200 units of
+            # each other in the same cabinet).
+            left_side_cabinet: Optional[str] = None
+            right_side_cabinet: Optional[str] = None
 
             for i, (core, info) in enumerate(core_order):
                 wx = info['x']
@@ -675,7 +693,27 @@ class CircuitLoopAnalyzer:
                 # - cabinet_name / cabinet_name_remote lookups (more
                 #   reliable than the V6.5 _find_cabinet text search)
                 # - viewer UI cabinet-aware tabs
+                # - V6.6.2 same-side cabinet constraint (this section)
                 # - future V6.7 WireTracer
+                #
+                # V6.6.2 reintroduces a CABINET constraint — but per
+                # cable per side, NOT per WS. Per user axioms:
+                #   1. Every terminal on a given side (LEFT or RIGHT
+                #      of WS) of a cable belongs to the same cabinet.
+                #   2. WS is sandwiched between the two cabinets and
+                #      belongs to neither.
+                # So tracking is per-cable, per-side: the first core
+                # that finds a left terminal locks the cable's
+                # left-side cabinet id; subsequent cores of the same
+                # cable on the same side must have their terminals in
+                # that cabinet. This is implemented just below the
+                # `_tag_owned_by_current` filter (see the
+                # `if left_side_cabinet is not None and left_of_ws`
+                # block) and prevents the y-bucket from picking up a
+                # neighboring cable's left terminal when V6.5.3's
+                # 200-unit ownership threshold doesn't cleanly
+                # separate them. Empty records are preferred over
+                # wrong ones per user requirement.
                 key = round(wy * 2)
                 bucket_tags: list[tuple[float, float, str, str]] = []
                 for dk in (-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5):
@@ -735,29 +773,105 @@ class CircuitLoopAnalyzer:
                         if t[0] > wx and _tag_owned_by_current(t[0], t[1], t[2], t[3])
                     ]
 
-                    # V6.5.2 fix: split_x filter only applies when WS
-                    # is at the far right (no right-side tags). When
-                    # WS has tags on BOTH sides, the standard
-                    # "closest on each side" rule is correct — the
-                    # previous code was filtering out the correct
-                    # left terminal whenever a large gap existed
-                    # among the left tags (e.g. 11003-383 core 2:
-                    # tags at x=65/226/312 with split_x=146 filtered
-                    # out X5:10 at x=312, leaving only X1:13 at x=65).
+                    # V6.6.2: same-side cabinet constraint. Once any
+                    # core of this cable has established the cabinet
+                    # for the LEFT or RIGHT side, restrict subsequent
+                    # same-side terminal candidates to that cabinet.
+                    # Cross-side is unaffected (left cabinet != right
+                    # cabinet by user axiom 2), so cross-cabinet wire
+                    # pairs still match. The WS itself is OUTSIDE any
+                    # single cabinet (it's between the two endpoint
+                    # cabinets), which is why per-cable per-side is
+                    # the right granularity — not "WS's cabinet".
+                    #
+                    # When the side cabinet is unknown (first core, or
+                    # no terminal found on this side yet), no filter
+                    # is applied — fall through to the V6.5.3 closest-
+                    # ownership logic. This means:
+                    #   - The first core of every cable uses the
+                    #     existing V6.5.3 logic (no degradation).
+                    #   - Subsequent cores of the same cable get an
+                    #     extra cabinet filter on top of V6.5.3.
+                    #   - L/Z-shaped terminals at a different y
+                    #     (already unfindable by the ±5 y-bucket) get
+                    #     term=None — empty records are preferred
+                    #     over wrong ones per user requirement.
+                    #
+                    # IMPORTANT: the filter is applied per-side AFTER
+                    # the gap-split (in the gap-split branch), not on
+                    # the raw left_of_ws pool. Reason: in the gap-
+                    # split case, the same pool contains both LOCAL
+                    # (will become left) and REMOTE (will become
+                    # right) candidates. Filtering the whole pool
+                    # against `left_side_cabinet` would wrongly remove
+                    # candidates that are actually right-side terminals
+                    # in a different cabinet (e.g. core 5 of 11003-381
+                    # at x=449 has X1:10 in left_of_ws at x=429 — gap-
+                    # split promotes it to right, but a left-cabinet
+                    # filter on the raw pool would drop it).
+                    #
+                    # V6.6.2b tolerance: a candidate whose cabinet is
+                    # UNKNOWN (`_ws_in_cabinet` returns None because
+                    # it sits in a geometric gap between detected
+                    # cabinet bboxes) is ACCEPTED, not filtered. The
+                    # V6.6 cabinet detection is geometrically imperfect
+                    # — terminal labels often sit in narrow gaps
+                    # between two adjacent cabinet rectangles. Filtering
+                    # those candidates against a specific cabinet id
+                    # would falsely reject valid terminals (e.g.
+                    # 11003-383 core 4's X5:8 at y=156 sits 9 units
+                    # above cab_007's top edge and not in any other
+                    # cabinet). Accepting the unknown-cabinet candidate
+                    # is safer than rejecting it, per user preference
+                    # ("empty > wrong" — but here we don't know which
+                    # outcome is "wrong", so accept and let downstream
+                    # use it).
+                    def _passes_cab_filter(
+                        tag_x: float, tag_y: float, side_cab: Optional[str],
+                    ) -> bool:
+                        if side_cab is None:
+                            return True
+                        tag_cab = _ws_in_cabinet(tag_x, tag_y, v66_cabinets)
+                        if tag_cab is None:
+                            # Cabinet detection didn't see this point.
+                            # Don't filter — accept.
+                            return True
+                        return tag_cab == side_cab
                     if right_of_ws:
                         # Standard layout: closest on each side.
+                        # Apply cabinet filter per-side on the already-
+                        # split left/right pools.
+                        if left_of_ws:
+                            left_of_ws = [
+                                t for t in left_of_ws
+                                if _passes_cab_filter(
+                                    t[0], t[1], left_side_cabinet,
+                                )
+                            ]
+                        if right_of_ws:
+                            right_of_ws = [
+                                t for t in right_of_ws
+                                if _passes_cab_filter(
+                                    t[0], t[1], right_side_cabinet,
+                                )
+                            ]
                         if left_of_ws:
                             left_candidate = min(
                                 left_of_ws, key=lambda t: abs(t[0] - wx)
                             )
-                        right_candidate = min(
-                            right_of_ws, key=lambda t: abs(t[0] - wx)
-                        )
+                        if right_of_ws:
+                            right_candidate = min(
+                                right_of_ws, key=lambda t: abs(t[0] - wx)
+                            )
                     else:
                         # WS at far right: split left tags by largest
                         # x-gap into a local cluster (closer to WS)
                         # and a remote cluster (further away). Local
                         # = left terminal; remote = right terminal.
+                        # V6.6.2: apply cabinet filters SEPARATELY to
+                        # local_side and remote_side (after the split),
+                        # not on the raw left_of_ws pool — see the
+                        # comment above for why.
                         if len(left_of_ws) >= 2:
                             st = sorted(left_of_ws, key=lambda t: t[0])
                             mg = 0.0
@@ -771,6 +885,21 @@ class CircuitLoopAnalyzer:
                                 split_x = (st[mg_idx][0] + st[mg_idx-1][0]) / 2
                                 local_side = [t for t in st if t[0] <= split_x]
                                 remote_side = [t for t in st if t[0] > split_x]
+                                # Per-side cabinet filter
+                                if local_side:
+                                    local_side = [
+                                        t for t in local_side
+                                        if _passes_cab_filter(
+                                            t[0], t[1], left_side_cabinet,
+                                        )
+                                    ]
+                                if remote_side:
+                                    remote_side = [
+                                        t for t in remote_side
+                                        if _passes_cab_filter(
+                                            t[0], t[1], right_side_cabinet,
+                                        )
+                                    ]
                                 if local_side:
                                     left_candidate = min(
                                         local_side, key=lambda t: abs(t[0] - wx)
@@ -790,6 +919,20 @@ class CircuitLoopAnalyzer:
                                 left_of_ws, key=lambda t: abs(t[0] - wx)
                             )
 
+                # V6.6.2: record side cabinet from the first terminal
+                # found on that side. Once established, it gates all
+                # subsequent same-side terminal searches for this cable.
+                # Only recorded when the candidate is non-None AND the
+                # side cabinet is still unknown (first core wins).
+                if left_candidate is not None and left_side_cabinet is None:
+                    left_side_cabinet = _ws_in_cabinet(
+                        left_candidate[0], left_candidate[1], v66_cabinets,
+                    )
+                if right_candidate is not None and right_side_cabinet is None:
+                    right_side_cabinet = _ws_in_cabinet(
+                        right_candidate[0], right_candidate[1], v66_cabinets,
+                    )
+
                 left_terminal = left_candidate[2] if left_candidate else None
                 left_terminal_x = left_candidate[0] if left_candidate else None
                 left_terminal_y = left_candidate[1] if left_candidate else None
@@ -799,18 +942,22 @@ class CircuitLoopAnalyzer:
                 right_terminal_y = right_candidate[1] if right_candidate else None
 
                 # Step 2a: Cabinet detection — once per cable on the
-                # first valid core. V6.6: prefer the spatial cabinet
+                # first core that has a valid terminal. V6.6.2:
+                # updated to accept ANY core with a valid terminal,
+                # not just i==0 (if core 1's left terminal was empty
+                # but core 2's wasn't, cabinet_local was previously
+                # stuck at None). V6.6: prefer the spatial cabinet
                 # lookup (the terminal position is inside a detected
                 # dashed-rectangle cabinet bbox → use its display
                 # name); fall back to the V6.5 text-search when no
                 # spatial cabinet covers the terminal.
-                if i == 0 and left_terminal_y is not None and cabinet_local is None:
+                if left_terminal_y is not None and cabinet_local is None:
                     cabinet_local = _cabinet_for_terminal(
                         left_terminal_x, left_terminal_y, v66_cabinets,
                     ) or self._find_cabinet(
                         left_terminal_x, left_terminal_y, attribs,
                     )
-                if i == 0 and right_terminal_y is not None and cabinet_remote is None:
+                if right_terminal_y is not None and cabinet_remote is None:
                     cabinet_remote = _cabinet_for_terminal(
                         right_terminal_x, right_terminal_y, v66_cabinets,
                     ) or self._find_cabinet(

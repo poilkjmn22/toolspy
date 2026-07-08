@@ -275,6 +275,93 @@ The V6.6 spatial cabinet data is still used for:
 `_ws_in_cabinet()` and `_cabinet_for_terminal()` are kept as helpers
 for these non-terminal-pairing uses.
 
+### 6.3.4a Same-side cabinet constraint (V6.6.2)
+
+V6.6.2 reintroduces a cabinet-based filter on terminal pairing — but
+per-cable per-side, not per-WS (which is why Phase 8 failed).
+
+**User axioms (回路图):**
+
+1. Every terminal on a given side (LEFT or RIGHT of WS) of a single
+   cable belongs to the same cabinet.
+2. WS itself sits BETWEEN the two endpoint cabinets and is not in
+   any single cabinet — it just bridges them.
+
+This means the right granularity for the filter is per-cable per-side,
+tracking `left_side_cabinet` and `right_side_cabinet` separately as
+each side's first terminal is found. The WS's own position is
+irrelevant (it's in neither cabinet).
+
+**Implementation** (`CircuitLoopAnalyzer.analyze`):
+
+```python
+# Per-cable, per-side state
+left_side_cabinet: Optional[str] = None
+right_side_cabinet: Optional[str] = None
+
+for core in cable_cores:
+    # 1. Run V6.5.3 bucket + ownership filter as before.
+    # 2. For each side's filtered candidates, apply the cabinet
+    #    constraint with tolerance for V6.6 detection imperfection.
+    # 3. Pick the closest survivor.
+    # 4. Record the chosen cabinet for that side (for the NEXT core).
+```
+
+**Filter predicate** (`_passes_cab_filter`):
+
+```python
+def _passes_cab_filter(tag_x, tag_y, side_cab):
+    if side_cab is None:                 # first core, no side cab yet
+        return True
+    tag_cab = _ws_in_cabinet(tag_x, tag_y, v66_cabinets)
+    if tag_cab is None:                  # tag sits in a geometric gap
+        return True                      # accept (don't filter)
+    return tag_cab == side_cab           # must match the side cabinet
+```
+
+The `tag_cab is None → accept` branch is the **V6.6.2b tolerance** for
+V6.6 cabinet detection imperfection. V6.6 detects cabinet rectangles
+from 4-corner axis-aligned dashed lines; the bboxes are sometimes
+slightly tighter than the actual cabinet extent, and terminal labels
+often sit in narrow gaps between adjacent cabinet rectangles (e.g.
+X5:8 at y=156 sits 9 units above cab_007's top edge in D0210-16).
+Filtering such candidates against a specific cabinet id would falsely
+reject them; instead we accept them and rely on the V6.5.3 ownership
+filter for noise removal.
+
+**Gap-split aware**: in the gap-split branch (when WS is at the far
+right with no right-side tags), the same `left_of_ws` pool contains
+both LOCAL (will become `left_candidate`) and REMOTE (will become
+`right_candidate`) candidates. The cabinet filter is applied
+**separately** to `local_side` and `remote_side` after the split —
+NOT on the raw `left_of_ws` pool. Otherwise a left-cabinet filter
+would wrongly drop candidates that are actually right-side terminals
+in a different cabinet (e.g. core 5 of 11003-381 at x=449 has X1:10
+in `left_of_ws` at x=429; gap-split promotes it to the right side,
+but a left-cabinet filter on the raw pool would drop it).
+
+**Results on the D0210-{15,16,35,36} test set (202 cable-core rows):**
+
+| Cable | V6.6.1 empty rows | V6.6.2 empty rows | Delta |
+|-------|-------------------|-------------------|-------|
+| 11003-311 | 0 | 0 | — |
+| 11003-381 | 0 | 0 | — |
+| 11003-382 | 0 | 0 | — |
+| 110037-381 | 0 | 0 | — |
+| 110037-382 | 0 | 0 | — |
+| 11037-381 | 0 | 0 | — |
+| 11037-382 | 0 | 0 | — |
+| 11037-387 cores 3-4 (V6.5.3 noise test) | X4:26-27 / VI:7-8 ✓ | X4:26-27 / VI:7-8 ✓ | preserved |
+| 11037-384 cores 1-4 (V6.5.3 noise test) | X4:20-23 / VI:1-4 ✓ | X4:20-23 / VI:1-4 ✓ | preserved |
+| 3B-380 | 2 | 3 | +1 (axiom-1 violation: cores connect to multiple cabinets on the same side) |
+
+Total: 1 row lost (3B-380 core 1's `remote='IV:31'` filtered out
+because core 4's `remote='III:28'` is in a different V6.6-detected
+cabinet). This is consistent with user axiom 1 ("same cabinet"); the
+3B-380 cable physically violates that axiom (cores connect to two
+different cabinets on the right side: `11037.MC` and `11003.ZXW`).
+Per user preference "empty > wrong", this is the intended trade-off.
+
 ### 6.3.5 Documents WITHOUT cabinet detection
 
 The detector fires whenever the LineGeometry carries a `ltype` in
