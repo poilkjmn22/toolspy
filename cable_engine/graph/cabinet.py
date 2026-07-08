@@ -204,9 +204,16 @@ class CabinetRegionAnalyzer:
         boundaries = self._find_dashed_rectangles(doc)
         # Stable id order: by (x_min, y_min) ascending.
         boundaries.sort(key=lambda b: (round(b.bbox.x, 2), round(b.bbox.y, 2)))
-        # Re-assign ids in the sorted order so callers see a stable list.
+        # Re-assign ids in the sorted order so callers see a stable
+        # list. V6.6: prefix with the document's content_hash so the
+        # ids are globally unique across the database — the per-row
+        # `cabinets.id PRIMARY KEY` lookup must not collide between
+        # documents (cab_001 in DWG A is a different cabinet than
+        # cab_001 in DWG B). The 12-char hash prefix leaves room for
+        # the existing cab_NNN naming that user-facing tools rely on.
+        doc_prefix = (doc.content_hash or '')[:12] or 'doc'
         for i, b in enumerate(boundaries):
-            object.__setattr__(b, 'id', f'cab_{i + 1:03d}')
+            object.__setattr__(b, 'id', f'cab_{doc_prefix}_{i + 1:03d}')
 
         # Build text refs ONCE for the matcher pass.
         texts = self._collect_texts(doc)
