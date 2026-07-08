@@ -157,12 +157,26 @@ After meaningful code changes, refresh the index (verify the exact subcommand wi
 ### Done
 - **V5 big-bang release** (replaces V4 cable_engine/rules + match + stages + V4 viewer):
   - **Unified Document IR** — `cable_engine/ir/` with `Document`, `TextEntity`, `LineGeometry`, `CircleGeometry`, `ArcGeometry`, `BlockRef`, `AttributeEntity`. DWG Loader emits all of them via dwgread -O JSON.
-  - **DocumentGraph as first-class artifact** — `cable_engine/graph/types.py:DocumentGraph` with pre-built indices (`by_type`, `by_layer`, neighbors, spatial). Built once at scan time, persisted to `graph_nodes_v5` + `graph_edges_v5`.
-  - **GraphBuilderStage** (`cable_engine/graph/builder.py`) — converts Document IR → DocumentGraph; emits typed edges (`NEAR`, `SHARES_ENDPOINT`, `INSIDE`, `ATTRIB_OF`). Anonymous-block resolution via spatial proximity (`INSIDE` edges).
-  - **V5 SQLite schema** — `documents`, `graph_nodes_v5`, `graph_edges_v5`, `cables`, `terminals`, `cable_terminals`, `loops`, `cable_loops`, `scan_state`. V4 tables removed.
-  - **V5 minimal viewer** (`tools/cable_match_viewer/`) — two-pane UI (cable list + cable detail) + bottom file preview. On-demand graph traversal at query time (per user spec: "不要扫描的时候全量构建这种业务知识，只做在线查询").
+  - **DocumentGraph as first-class artifact** — `cable_engine/graph/types.py:DocumentGraph` with pre-built indices (`by_type`, `by_layer`, neighbors, spatial).
+  - **V5 SQLite schema** — `documents`, `cables`, `terminals`, `cable_topology`, `terminal_strips`, `scan_state`. V4 tables removed.
+  - **V5 minimal viewer** (`tools/cable_match_viewer/`) — two-pane UI (cable list + cable detail) + bottom file preview. On-demand graph traversal at query time.
   - **Python 3.12** baseline (`myenv312/`).
-  - **No full topology build at scan time** — the viewer's `CableViewer._traverse_cable_neighborhood` does a 3-hop BFS from each cable label node to collect terminals/loops at query time.
+- **V6.5.1 DocumentClassifier** — 7 business types (circuit_loop, terminal_strip, cable_schedule, protection_diagram, panel_layout, monitoring_system, unknown). Coverage 246 → 447 docs (+82%). `_ANALYZERS_BY_TYPE` dict dispatches per type.
+- **V6.5.2 fixes** — shared-bus fix (WS y vs line y), gap-split fix (only when right_of_ws empty), x-distance tiebreaker, bucket widened ±2 → ±5 keys.
+- **V6.5.3 NO-tag ownership filter** — pre-compute closest/2nd-closest WS distances per NO tag; 200-unit share threshold. Resolves 11037-387 cores 3-4 (X4:26-27 / VI:7-8) and 11037-384 cores 1-4 (X4:20-23 / VI:1-4).
+- **V6.6 Cabinet Semantic Layer** (8 phases, all complete):
+  - **V6.6.1 — DWG linetype extraction** — `DWGLoader` reads `ltype` handle + `ltype_flags` from dwgread JSON; resolves via LTYPE_CONTROL.entries + LTYPE object list (positional pairing).
+  - **V6.6.2 — CabinetRegionAnalyzer** (`cable_engine/graph/cabinet.py`) — detects dashed-rectangle boundaries using `ltype ∈ {ACAD_ISO10W100, HIDDEN, DASHED}` + 4-corner axis-aligned check.
+  - **V6.6.3 — name matching** — pairs each boundary with the nearest `EquName`/`EQUNAME` text above; sample names: `11003.ZXW-3号主变110kV电压互感器端子箱`, `42F-主变及无功继电器小室同步向量采集柜`, `4G-500kV第7串断路器测控柜`.
+  - **V6.6.4 — containment** — `assign_terminals_to_cabinets()` maps NO/ObjTerm.Name ATTRIBs to smallest enclosing cabinet bbox.
+  - **V6.6.5 — schema + persistence** — `cabinets` + `cabinet_terminals` tables; `TopologyStage` runs cabinet analysis BEFORE the analyzer and persists at the end.
+  - **V6.6.6 — IR + GraphNode** — `CabinetRegion` is now a first-class IR entity; `NodeType.CABINET`, `EdgeType.CONTAINS` added.
+  - **V6.6.7 — viewer APIs** — `/api/cabinets`, `/api/cabinet/{id}`, plus `get_document_topology()` now includes `cabinet_regions[]` for the cabinet-aware 图纸 tab.
+  - **V6.6.8 — cabinet-restricted terminal search** — `CircuitLoopAnalyzer` rejects terminals in a different cabinet than the WS. Preserves V6.5.3 fixes; adds bbox containment as a stronger signal than the 200-unit share threshold.
+  - **Critical fix**: cabinet id collision (`cab_001` collision across docs) — fixed by prefixing with `doc.content_hash[:12]`.
+
+### In Progress
+- (none currently)
 
 ### In Progress
 - (none currently)
@@ -178,8 +192,11 @@ After meaningful code changes, refresh the index (verify the exact subcommand wi
 - **Loop index over-matches** — `M1` / `M2` / `10D` / `-OF-12` are classified as loops because they match the broad `_LOOP_TEXT_PATTERN`. Better filtering (reject `M\d+`, `-…`, etc.) is a future tightening; doesn't affect the cable↔terminal chain that the viewer renders.
 
 ### Next Steps
-- **Anonymous block expansion** in `DWGLoader._parse_v5` (the data availability root cause for D0210-35 `110351-311` and D0210-38 GY6-136's missing terminals).
+- **V6.7 WireTracer** — now that V6.6 gives us Cabinet containment as a spatial index, run DFS for wire tracing INSIDE cabinet bboxes (not the whole document). Reduces search complexity and false-positive rate.
+- **Cabinet graph viewer UI** — in the viewer "柜体" tab, click a cabinet to highlight its dashed boundary + contained terminals in the Flyfish CAD viewer.
+- **CableScheduleAnalyzer** (电缆清册) — currently a stub. With V6.6's spatial index, the table parser is the next priority.
+- **Anonymous block expansion** in `DWGLoader._parse_v5` — the data-availability root cause for D0210-35 `110351-311` and D0210-38 `GY6-136`'s missing terminals.
 - **PDF support (V5 P1)** — add `RasterizeStage` (PDF → PNG) and `OcrStage` (PNG → TextEntity via Tesseract/PaddleOCR). Reuse the V5 GraphBuilder + viewer.
 - **Knowledge merge (V5 P2)** — `knowledge_nodes` / `knowledge_sources` / `knowledge_edges` tables for cross-document "Cable B3-463 ↔ Terminal X4:3 ↔ Cabinet XX01" queries. Stubbed in the schema but not implemented.
-- **Larger batch test** — run on a directory of 1000+ DWG files to validate performance (current: ~3-5s per file on Mac M1).
+- **Larger batch test** — run on a directory of 1000+ DWG files to validate performance (current: ~3-5s per file on Mac M1; 89 D0202 files completed in 55s).
 - **Tighten loop-id regex** — exclude `M\d+`, `-prefix`, `DK\d+`, `M\d+`, block-name candidates from the loop index.
