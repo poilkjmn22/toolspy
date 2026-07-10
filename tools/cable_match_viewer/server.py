@@ -105,6 +105,9 @@ INDEX_HTML = """<!DOCTYPE html>
   .doc-tree .children { margin-left: 14px; }
   .doc-tree .children.collapsed { display: none; }
   .doc-tree .empty-state { padding: 14px; color: #999; font-size: 12px; text-align: center; }
+  .doc-tree.text-search-results .file-row { border-bottom: 1px solid #f0f0f0; }
+  #search-mode { margin-top: 2px; }
+  #search-mode label { cursor: pointer; user-select: none; }
   #detail .doc-summary { background: #f5f5f5; border-radius: 4px; padding: 10px 14px; margin-bottom: 12px; font-size: 12px; }
   #detail .doc-summary .doc-name { font-family: "SF Mono", Menlo, monospace; font-size: 14px; font-weight: 600; margin-bottom: 6px; word-break: break-all; }
   #detail .doc-summary .doc-meta { color: #666; line-height: 1.6; }
@@ -124,7 +127,7 @@ INDEX_HTML = """<!DOCTYPE html>
       <div class="tab" data-tab="stats">统计</div>
     </div>
     <div id="stats">加载中…</div>
-    <div id="search"><input id="search-input" placeholder="过滤电缆…"></div>
+    <div id="search"><input id="search-input" placeholder="过滤电缆…"><div id="search-mode" style="display:none;font-size:10px;color:#888;padding:2px 0 0 0;"><label><input type="checkbox" id="search-text-mode"> 全文搜索</label></div></div>
     <div id="cable-list"><div class="empty">加载中…</div></div>
   </div>
   <div id="right">
@@ -178,6 +181,8 @@ document.querySelectorAll('.tab').forEach(el => {
       : activeTab === 'unclassified' ? '过滤文件路径…'
       : '搜索柜体(名称/位置/路径)…';
     search.style.display = (activeTab === 'stats' || activeTab === 'unclassified') ? 'none' : '';
+    const modeToggle = $('search-mode');
+    if (modeToggle) modeToggle.style.display = activeTab === 'documents' ? '' : 'none';
     if (activeTab === 'cables') {
       renderCables();
       $('stats').textContent = `共 ${allCables.length} 条电缆`;
@@ -628,6 +633,12 @@ search.oninput = () => {
   else if (activeTab === 'unclassified') renderUnclassified();
 };
 
+// Text-search mode toggle
+setTimeout(() => {
+  const modeChk = $('search-text-mode');
+  if (modeChk) modeChk.onchange = () => { if (activeTab === 'documents') renderDocumentTree(); };
+}, 100);
+
 function escHtml(s) {
   if (!s) return s;
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -682,6 +693,59 @@ function buildDocTreeHtml(nodes, opts) {
 
 async function renderDocumentTree() {
   const q = search.value.trim();
+  const textMode = $('search-text-mode') && $('search-text-mode').checked;
+
+  if (textMode && q) {
+    // Full-text search mode
+    cableList.innerHTML = '<div class="empty-state">搜索中…</div>';
+    const r = await fetch('/api/search-text?q=' + encodeURIComponent(q));
+    const data = await r.json();
+    const results = data.results || [];
+    if (!results.length) {
+      cableList.innerHTML = `<div class="empty-state">未找到匹配的文本<br><span style="font-size:11px;">试试其他关键字</span></div>`;
+      $('stats').textContent = `0 条匹配`;
+      return;
+    }
+    // Group by document
+    const byDoc = {};
+    for (const res of results) {
+      if (!byDoc[res.document_hash]) {
+        byDoc[res.document_hash] = { hash: res.document_hash, path: res.rel_path || res.document_hash, cls: res.classification_primary || '', hits: [] };
+      }
+      byDoc[res.document_hash].hits.push(res);
+    }
+    const docKeys = Object.keys(byDoc);
+    let html = '<div class="doc-tree text-search-results">';
+    html += `<div style="padding:4px 14px;font-size:11px;color:#888;">全文搜索 "${escHtml(q)}" — ${data.count} 条匹配, ${docKeys.length} 份图纸</div>`;
+    for (const dh of docKeys) {
+      const grp = byDoc[dh];
+      const clsLabel = CLS_LABELS[grp.cls] || grp.cls || '未分类';
+      html += `<div class="file-row" data-doc-hash="${grp.hash}">
+        <span class="twisty"></span>
+        <span class="file-name">${escHtml(grp.path.split('/').pop())}</span>
+        <span class="cls-badge cls-${escHtml(grp.cls)}">${escHtml(clsLabel)}</span>
+        <span class="cable-cnt">${grp.hits.length}条</span>
+      </div>`;
+      // Show a few text snippets
+      const snippetCount = Math.min(grp.hits.length, 3);
+      for (let i = 0; i < snippetCount; i++) {
+        const h = grp.hits[i];
+        const snippet = h.text.length > 60 ? h.text.substring(0, 60) + '…' : h.text;
+        html += `<div style="padding:1px 14px 1px 28px;font-size:11px;color:#666;font-family:monospace;">${escHtml(snippet)}</div>`;
+      }
+    }
+    html += '</div>';
+    cableList.innerHTML = html;
+    $('stats').textContent = `${data.count} 条匹配 · ${docKeys.length} 份图纸`;
+
+    // Wire clicks
+    cableList.querySelectorAll('.file-row').forEach(el => {
+      el.onclick = () => selectDocument(el.dataset.docHash);
+    });
+    return;
+  }
+
+  // Path-based search (default)
   cableList.innerHTML = '<div class="empty-state">加载中…</div>';
   const r = await fetch('/api/documents?q=' + encodeURIComponent(q));
   const data = await r.json();
@@ -1086,6 +1150,16 @@ async def document_topology_handler(request: web.Request) -> web.Response:
     return web.json_response(data)
 
 
+async def search_text_handler(request: web.Request) -> web.Response:
+    """V6.7+: full-text search across all text entities."""
+    q = request.query.get('q', '').strip()
+    limit = int(request.query.get('limit', '200'))
+    if not q:
+        return web.json_response({'results': [], 'query': q})
+    results = _viewer(request).search_document_text(q, limit=limit)
+    return web.json_response({'results': results, 'query': q, 'count': len(results)})
+
+
 async def healthz_handler(request: web.Request) -> web.Response:
     return web.Response(text='OK', content_type='text/plain')
 
@@ -1119,6 +1193,7 @@ def make_app(db_path: Path) -> web.Application:
     app.router.add_get('/api/unclassified', unclassified_handler)
     app.router.add_get('/api/documents', documents_tree_handler)
     app.router.add_get('/api/document/{hash}/topology', document_topology_handler)
+    app.router.add_get('/api/search-text', search_text_handler)
     app.router.add_get('/healthz', healthz_handler)
     return app
 

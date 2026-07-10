@@ -242,6 +242,32 @@ class CableViewer:
         return None
 
     # ------------------------------------------------------------------
+    # Text search (V6.7+)
+    # ------------------------------------------------------------------
+    def search_document_text(self, query: str, limit: int = 200) -> list[dict]:
+        """Full-text search across all stored text entities.
+
+        Returns a flat list of matching text snippets, each with
+        document info. The viewer groups them by document_hash.
+        """
+        rows = self._store.search_text(query, limit=limit)
+        out: list[dict] = []
+        seen_hashes: set[str] = set()
+        for r in rows:
+            dh = r['document_hash']
+            seen_hashes.add(dh)
+            out.append({
+                'document_hash': dh,
+                'rel_path': self._strip_scan_root(r['rel_path'] or '') or r['rel_path'],
+                'text': r['text'],
+                'entity_type': r['entity_type'],
+                'x': r['x'],
+                'y': r['y'],
+                'classification_primary': r['classification_primary'] or '',
+            })
+        return out
+
+    # ------------------------------------------------------------------
     # Stats
     # ------------------------------------------------------------------
     def stats(self) -> dict:

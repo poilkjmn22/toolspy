@@ -134,6 +134,23 @@ CREATE INDEX IF NOT EXISTS idx_cterm_doc ON cabinet_terminals(document_hash);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_cterm ON cabinet_terminals(cabinet_id, document_hash, terminal_id, terminal_kind);
 
 -- ----------------------------------------------------------------------
+-- V6.7+: Text entities for full-text search across documents.
+-- Every TEXT/MTEXT/ATTRIB entity is persisted here during scanning.
+-- ----------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS text_entities (
+    id              INTEGER PRIMARY KEY,
+    document_hash   TEXT NOT NULL,
+    text            TEXT NOT NULL,
+    entity_type     TEXT NOT NULL,             -- 'TEXT', 'MTEXT', 'ATTRIB'
+    x               REAL,
+    y               REAL,
+    page            INTEGER DEFAULT 1,
+    source          TEXT DEFAULT 'dwg'
+);
+CREATE INDEX IF NOT EXISTS idx_text_doc ON text_entities(document_hash);
+CREATE INDEX IF NOT EXISTS idx_text_content ON text_entities(text);
+
+-- ----------------------------------------------------------------------
 -- Generic scan state bag (replaces state.json)
 -- ----------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS scan_state (
@@ -346,6 +363,27 @@ class CableStore:
              document_hash, source_type),
         )
 
+    def bulk_upsert_cable_topology(
+        self,
+        rows: list[tuple],
+    ) -> None:
+        """Batch ``executemany`` equivalent of ``upsert_cable_topology``.
+        Each tuple has 11 elements matching the column order::
+
+            (cable_id, conductor_no, strip_name, terminal_no,
+             terminal_no_remote, cabinet_name, cabinet_name_remote,
+             circuit_desc, loop_id, document_hash, source_type)
+        """
+        self._conn.executemany(
+            """INSERT INTO cable_topology
+                   (cable_id, conductor_no, strip_name, terminal_no,
+                    terminal_no_remote, cabinet_name, cabinet_name_remote,
+                    circuit_desc, loop_id,
+                    document_hash, source_type)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            rows,
+        )
+
     def list_cable_topology(
         self,
         cable_id: Optional[str] = None,
@@ -380,6 +418,56 @@ class CableStore:
             (pattern, pattern),
         ).fetchall())
 
+    # ------------------------------------------------------------------
+    # V6.7+: Text entities for full-text search
+    # ------------------------------------------------------------------
+    def bulk_upsert_text_entities(
+        self,
+        rows: list[tuple],
+    ) -> None:
+        """Batch insert text entities. Each tuple has 5 elements::
+
+            (document_hash, text, entity_type, x, y)
+        """
+        self._conn.executemany(
+            """INSERT INTO text_entities
+                   (document_hash, text, entity_type, x, y)
+               VALUES (?, ?, ?, ?, ?)""",
+            rows,
+        )
+
+    def delete_text_entities_for_document(self, document_hash: str) -> None:
+        """Wipe every text entity row for a document."""
+        self._conn.execute(
+            "DELETE FROM text_entities WHERE document_hash = ?",
+            (document_hash,),
+        )
+
+    def search_text(
+        self,
+        query: str,
+        limit: int = 200,
+    ) -> list[sqlite3.Row]:
+        """Full-text search across all text entities using LIKE.
+
+        Returns up to `limit` rows with matching text, joined with
+        document metadata for display.
+        """
+        q = (query or '').strip().lower()
+        if not q:
+            return []
+        pattern = f'%{q}%'
+        return list(self._conn.execute(
+            """SELECT te.document_hash, te.text, te.entity_type,
+                      te.x, te.y, d.rel_path, d.classification_primary
+               FROM text_entities te
+               JOIN documents d ON d.content_hash = te.document_hash
+               WHERE LOWER(te.text) LIKE ?
+               ORDER BY te.document_hash, te.rowid
+               LIMIT ?""",
+            (pattern, limit),
+        ).fetchall())
+
     def delete_topology_for_document(self, document_hash: str) -> None:
         self._conn.execute(
             'DELETE FROM cable_topology WHERE document_hash = ?',
@@ -399,6 +487,24 @@ class CableStore:
                    chinese_name = COALESCE(terminal_strips.chinese_name,
                                            excluded.chinese_name)""",
             (strip_name, chinese_name, document_hash),
+        )
+
+    def bulk_upsert_terminal_strips(
+        self,
+        rows: list[tuple],
+    ) -> None:
+        """Batch ``executemany`` equivalent of ``upsert_terminal_strip``.
+        Each tuple has 3 elements::
+
+            (strip_name, chinese_name, document_hash)
+        """
+        self._conn.executemany(
+            """INSERT INTO terminal_strips (strip_name, chinese_name, document_hash)
+               VALUES (?, ?, ?)
+               ON CONFLICT(strip_name) DO UPDATE SET
+                   chinese_name = COALESCE(terminal_strips.chinese_name,
+                                           excluded.chinese_name)""",
+            rows,
         )
 
     def list_terminal_strips(self) -> list[sqlite3.Row]:
@@ -454,6 +560,40 @@ class CableStore:
              layer, boundary_handle, ltype, points_json),
         )
 
+    def bulk_upsert_cabinets(
+        self,
+        rows: list[tuple],
+    ) -> None:
+        """Batch ``executemany`` equivalent of ``upsert_cabinet``.
+        Each tuple has 14 elements matching the column order::
+
+            (cabinet_id, document_hash, name, location, display_name,
+             text_label, bbox_x, bbox_y, bbox_w, bbox_h,
+             layer, boundary_handle, ltype, points_json)
+        """
+        self._conn.executemany(
+            """INSERT INTO cabinets
+                   (id, document_hash, name, location, display_name,
+                    text_label, bbox_x, bbox_y, bbox_w, bbox_h,
+                    layer, boundary_handle, ltype, points_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                   document_hash = excluded.document_hash,
+                   name = excluded.name,
+                   location = excluded.location,
+                   display_name = excluded.display_name,
+                   text_label = excluded.text_label,
+                   bbox_x = excluded.bbox_x,
+                   bbox_y = excluded.bbox_y,
+                   bbox_w = excluded.bbox_w,
+                   bbox_h = excluded.bbox_h,
+                   layer = excluded.layer,
+                   boundary_handle = excluded.boundary_handle,
+                   ltype = excluded.ltype,
+                   points_json = excluded.points_json""",
+            rows,
+        )
+
     def upsert_cabinet_terminal(
         self,
         cabinet_id: str,
@@ -473,6 +613,26 @@ class CableStore:
                DO UPDATE SET x = excluded.x, y = excluded.y""",
             (cabinet_id, document_hash, terminal_id,
              terminal_kind, x, y),
+        )
+
+    def bulk_upsert_cabinet_terminals(
+        self,
+        rows: list[tuple],
+    ) -> None:
+        """Batch ``executemany`` equivalent of ``upsert_cabinet_terminal``.
+        Each tuple has 6 elements::
+
+            (cabinet_id, document_hash, terminal_id,
+             terminal_kind, x, y)
+        """
+        self._conn.executemany(
+            """INSERT INTO cabinet_terminals
+                   (cabinet_id, document_hash, terminal_id,
+                    terminal_kind, x, y)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(cabinet_id, document_hash, terminal_id, terminal_kind)
+               DO UPDATE SET x = excluded.x, y = excluded.y""",
+            rows,
         )
 
     def delete_cabinets_for_document(self, document_hash: str) -> None:

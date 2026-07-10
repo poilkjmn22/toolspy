@@ -607,10 +607,85 @@ def assign_terminals_to_cabinets(
     return out
 
 
+# ---------------------------------------------------------------------------
+# Grid spatial index for fast cabinet lookup.
+# ---------------------------------------------------------------------------
+class CabinetGridIndex:
+    """Flat-grid spatial index for cabinet bbox containment queries.
+
+    Build once per document, then ``lookup(x, y)`` is O(1) — find which
+    cabinet (if any) contains the given point, returning the smallest
+    enclosing cabinet (matching ``_ws_in_cabinet`` semantics).
+
+    Usage::
+
+        idx = CabinetGridIndex(v66_cabinets, cell_size=50)
+        cab_id = idx.lookup(x, y)          # → str | None
+        cab_name = idx.lookup_name(x, y)   # → str | None
+
+    The grid cell size should be roughly half the smallest cabinet
+    dimension so that each bbox spans at least one full cell.
+    """
+
+    def __init__(
+        self,
+        cabinets: list[dict],
+        cell_size: float = 50.0,
+    ):
+        self._cell_size = cell_size
+        self._bboxes: dict[str, BBox] = {}  # cab_id → BBox
+        self._names: dict[str, str] = {}     # cab_id → display_name
+        # grid[ (cx, cy) ] = list of (cab_id, area) sorted ascending
+        self._grid: dict[tuple[int, int], list[tuple[str, float]]] = {}
+
+        for c in cabinets:
+            cab_id: str = c['id']
+            bbox: BBox = c['bbox']
+            area = bbox.w * bbox.h
+            self._bboxes[cab_id] = bbox
+            self._names[cab_id] = c.get('display_name') or ''
+
+            cx0 = int(bbox.x // cell_size)
+            cy0 = int(bbox.y // cell_size)
+            cx1 = int((bbox.x + bbox.w) // cell_size)
+            cy1 = int((bbox.y + bbox.h) // cell_size)
+            for cx in range(cx0, cx1 + 1):
+                for cy in range(cy0, cy1 + 1):
+                    self._grid.setdefault((cx, cy), []).append((cab_id, area))
+
+        # Sort each cell's list by area — smallest first.
+        for cell_list in self._grid.values():
+            cell_list.sort(key=lambda x: x[1])
+
+    def lookup(self, x: float, y: float) -> Optional[str]:
+        """Return the **smallest** cabinet id whose bbox contains (x,y),
+        or None when no cabinet covers that point. O(1) typical."""
+        cx = int(x // self._cell_size)
+        cy = int(y // self._cell_size)
+        candidates = self._grid.get((cx, cy))
+        if not candidates:
+            return None
+        for cab_id, _area in candidates:
+            bbox = self._bboxes.get(cab_id)
+            if bbox is None:
+                continue
+            if bbox.x <= x <= bbox.x + bbox.w and bbox.y <= y <= bbox.y + bbox.h:
+                return cab_id
+        return None
+
+    def lookup_name(self, x: float, y: float) -> Optional[str]:
+        """Like ``lookup`` but returns the cabinet's display_name."""
+        cab_id = self.lookup(x, y)
+        if cab_id is None:
+            return None
+        return self._names.get(cab_id) or None
+
+
 __all__ = [
     'CabinetBoundary',
     'CabinetRecord',
     'CabinetRegionAnalyzer',
+    'CabinetGridIndex',
     'is_dashed_ltype',
     'assign_terminals_to_cabinets',
 ]

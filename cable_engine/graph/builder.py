@@ -464,6 +464,7 @@ class CircuitLoopAnalyzer:
         # cabinet-restricted filter is a no-op and the bucket +
         # V6.5.3 200-unit-threshold logic still applies.
         from ..ir import CabinetRegion as _CabReg_pre
+        from .cabinet import CabinetGridIndex
         v66_cabinets: list[dict] = []
         for ent in doc.entities:
             if not isinstance(ent, _CabReg_pre):
@@ -478,6 +479,8 @@ class CircuitLoopAnalyzer:
                 'text_label': ent.text_label,
                 'bbox': ent.bbox,
             })
+        # V6.7: spatial grid index for O(1) cabinet lookup.
+        cabinet_grid = CabinetGridIndex(v66_cabinets)
 
         # Map each NO/ObjTerm.Name ATTRIB → its cabinet id (based on
         # bbox containment). Attribs without a containing cabinet
@@ -488,7 +491,7 @@ class CircuitLoopAnalyzer:
                 continue
             if ':' not in a['val']:
                 continue
-            cab_id = _ws_in_cabinet(a['x'], a['y'], v66_cabinets)
+            cab_id = cabinet_grid.lookup(a['x'], a['y'])
             if cab_id is not None:
                 v66_terminal_cab[(a['x'], a['y'])] = cab_id
 
@@ -507,7 +510,10 @@ class CircuitLoopAnalyzer:
                         'y': a['y'],
                     }
 
-        # Pre-scan: collect horizontal LINE/LWPOLYLINE for core-line detection
+        # Pre-scan: collect horizontal LINE/LWPOLYLINE for core-line detection.
+        # V6.7: pre-sort by y so each per-core search is O(log L + window)
+        # instead of O(L).
+        import bisect as _bisect
         core_lines: list[dict] = []
         for e in doc.entities:
             if not isinstance(e, LineGeometry):
@@ -524,6 +530,8 @@ class CircuitLoopAnalyzer:
                 'x_min': min(xs),
                 'x_max': max(xs),
             })
+        core_lines.sort(key=lambda cl: cl['y'])
+        _core_ys = [cl['y'] for cl in core_lines]
 
         # Group NO tags and cable-level ATTRIB by y position.
         # Store (x, y, val, tag) tuples so we know the tag type for the
@@ -564,13 +572,16 @@ class CircuitLoopAnalyzer:
                 tx, ty, tval, ttype = tag
                 if ttype != 'NO':
                     continue
-                distances: list[float] = []
+                closest_d: Optional[float] = None
+                second_d: Optional[float] = None
                 for dk in (-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5):
                     for ws_x in ws_x_by_y.get(tag_key + dk, set()):
-                        distances.append(abs(tx - ws_x))
-                distances.sort()
-                closest_d = distances[0] if distances else None
-                second_d = distances[1] if len(distances) >= 2 else None
+                        d = abs(tx - ws_x)
+                        if closest_d is None or d < closest_d:
+                            second_d = closest_d
+                            closest_d = d
+                        elif second_d is None or d < second_d:
+                            second_d = d
                 no_tag_ownership[(tx, ty, tval)] = (closest_d, second_d)
 
         records: list[dict] = []
@@ -609,19 +620,20 @@ class CircuitLoopAnalyzer:
                 # within ±30mm of WireSerial y. Prefer a line that
                 # spans wx (typical WS-on-left layout); if none,
                 # fall back to the closest line in the core area
-                # (x_min >= 250) — this picks the main core line
-                # even when WS is placed to its right
-                # (e.g. 110037-381(5) at x=449 vs line x_max=414)
-                # while excluding narrow formatting lines.
+                # (x_min >= 200 and span >= 50mm). V6.7: uses bisect
+                # to avoid scanning every core_line per core.
                 _CORE_LINE_TOLERANCE = 30.0
                 core_y = wy
                 best_cl: Optional[dict] = None
                 best_dy = float('inf')
+                lo = _bisect.bisect_left(_core_ys, wy - _CORE_LINE_TOLERANCE)
+                hi = _bisect.bisect_right(_core_ys, wy + _CORE_LINE_TOLERANCE)
+                window = core_lines[lo:hi]
                 # Pass 1: find closest line that spans wx
-                for cl in core_lines:
+                for cl in window:
                     if cl['x_min'] <= wx <= cl['x_max']:
                         dy = abs(cl['y'] - wy)
-                        if dy < best_dy and dy <= _CORE_LINE_TOLERANCE:
+                        if dy < best_dy:
                             best_dy = dy
                             best_cl = cl
                 # Pass 2: if no spanning line, find closest line that
@@ -631,13 +643,13 @@ class CircuitLoopAnalyzer:
                 # excluding left-side formatting lines (x < 200) and
                 # right-side tick marks (span < 50mm).
                 if best_cl is None:
-                    for cl in core_lines:
+                    for cl in window:
                         if (
                             cl['x_min'] >= 200
                             and cl['x_max'] - cl['x_min'] >= 50.0
                         ):
                             dy = abs(cl['y'] - wy)
-                            if dy < best_dy and dy <= _CORE_LINE_TOLERANCE:
+                            if dy < best_dy:
                                 best_dy = dy
                                 best_cl = cl
                 core_line_x_min = best_cl['x_min'] if best_cl else None
@@ -831,7 +843,7 @@ class CircuitLoopAnalyzer:
                     ) -> bool:
                         if side_cab is None:
                             return True
-                        tag_cab = _ws_in_cabinet(tag_x, tag_y, v66_cabinets)
+                        tag_cab = cabinet_grid.lookup(tag_x, tag_y)
                         if tag_cab is None:
                             # Cabinet detection didn't see this point.
                             # Don't filter — accept.
@@ -925,12 +937,12 @@ class CircuitLoopAnalyzer:
                 # Only recorded when the candidate is non-None AND the
                 # side cabinet is still unknown (first core wins).
                 if left_candidate is not None and left_side_cabinet is None:
-                    left_side_cabinet = _ws_in_cabinet(
-                        left_candidate[0], left_candidate[1], v66_cabinets,
+                    left_side_cabinet = cabinet_grid.lookup(
+                        left_candidate[0], left_candidate[1],
                     )
                 if right_candidate is not None and right_side_cabinet is None:
-                    right_side_cabinet = _ws_in_cabinet(
-                        right_candidate[0], right_candidate[1], v66_cabinets,
+                    right_side_cabinet = cabinet_grid.lookup(
+                        right_candidate[0], right_candidate[1],
                     )
 
                 left_terminal = left_candidate[2] if left_candidate else None
@@ -952,14 +964,14 @@ class CircuitLoopAnalyzer:
                 # name); fall back to the V6.5 text-search when no
                 # spatial cabinet covers the terminal.
                 if left_terminal_y is not None and cabinet_local is None:
-                    cabinet_local = _cabinet_for_terminal(
-                        left_terminal_x, left_terminal_y, v66_cabinets,
+                    cabinet_local = cabinet_grid.lookup_name(
+                        left_terminal_x, left_terminal_y,
                     ) or self._find_cabinet(
                         left_terminal_x, left_terminal_y, attribs,
                     )
                 if right_terminal_y is not None and cabinet_remote is None:
-                    cabinet_remote = _cabinet_for_terminal(
-                        right_terminal_x, right_terminal_y, v66_cabinets,
+                    cabinet_remote = cabinet_grid.lookup_name(
+                        right_terminal_x, right_terminal_y,
                     ) or self._find_cabinet(
                         right_terminal_x, right_terminal_y, attribs,
                     )
@@ -1028,31 +1040,181 @@ class CircuitLoopAnalyzer:
 
 
 # ===================================================================
-# CableScheduleAnalyzer (电缆清册 / 接线表) — minimal stub for V6.5.1
+# CableScheduleAnalyzer (电缆清册 / 接线表) — V6.7 enhanced
 # ===================================================================
 class CableScheduleAnalyzer:
     """Analyzer for cable schedules (电缆清册 / 接线表 / 电缆联系图).
 
     These drawings are typically tabular: each row is a cable, columns
     carry cable_id, conductor_no, terminal_from, terminal_to, etc.
-    The V6.5.1 release ships a *minimal* stub: it counts how many
-    cable-id-shaped strings the document contains so the classification
-    rate improves (even if no rows are persisted). The full table
-    parser lands in V6.6.
+
+    Strategy (V6.7):
+      1. Group text entities by Y-coordinate (row detection).
+      2. Within each row, sort by X (column detection).
+      3. Detect header row via known Chinese keywords.
+      4. Parse data rows into topology records.
+
+    If table parsing fails (no header detected), falls back to simple
+    cable-ID extraction.
     """
 
-    #: Matches strings like "11003-311", "GY6-136", "ZL-307ZF"
+    #: Cable-ID regex for fallback
     _CABLE_ID_LIKE = re.compile(r'\b([A-Za-z0-9]{2,8}-[A-Za-z0-9]{1,8})\b')
 
+    #: Y-tolerance for grouping into the same row (document units)
+    _ROW_TOL = 3.0
+
+    #: Known Chinese column headers in cable schedule tables.
+    #: Each entry: (keyword, target_field, is_cable_id, is_conductor)
+    _HEADERS: list[tuple[re.Pattern, str, bool, bool]] = [
+        # 电缆编号 / 编号 / 序号 -> cable_id
+        (re.compile(r'电缆编号|电缆编[号碼]|编[号號]|序号|序號|电缆(?:名称|ID|编号)'), 'cable_id', True, False),
+        # 电缆型号 / 型号 / 规格 -> cable_type (stored as circuit_desc)
+        (re.compile(r'电缆型号|型号|规格|电[缆线]型号'), 'circuit_desc', False, False),
+        # 起点 / 起点柜 / 起点端子 -> strip_name
+        (re.compile(r'起点(?:柜|端子)?|起始|始端|来源|來[源渊]|本端'), 'strip_name', False, False),
+        # 终点 / 终点柜 / 终点端子 -> terminal_no_remote
+        (re.compile(r'终点(?:柜|端子)?|終点|末端|目标|目的|对端'), 'terminal_no_remote', False, False),
+        # 芯数 / 线芯 -> conductor_no
+        (re.compile(r'芯数|线芯|线[芯心]数|芯线数|缆芯'), 'conductor_no', False, True),
+        # 回路编号 / 回路 -> loop_id
+        (re.compile(r'回路(?:编号|编[号號])?|回[路線]编号'), 'loop_id', False, False),
+        # 备注 -> circuit_desc (if not cable_type)
+        (re.compile(r'备注|注|说明|說[明文]'), 'circuit_desc', False, False),
+        # 柜体 / 柜 / 机柜 -> cabinet_name
+        (re.compile(r'柜体|机柜|安装位置|所在柜|所属柜'), 'cabinet_name', False, False),
+    ]
+
     def analyze(self, doc: Document) -> list[dict]:
-        # Stub: identify distinct cable IDs visible in the document text.
-        # Persist a synthetic "cable-level" record per unique ID so the
-        # viewer surfaces it (with terminal_no=None to indicate no
-        # detailed analysis yet).
-        seen: set[str] = set()
-        for e in doc.entities:
-            if not isinstance(e, (TextEntity, AttributeEntity)):
+        text_entities = [
+            e for e in doc.entities
+            if isinstance(e, (TextEntity, AttributeEntity)) and (e.text or '').strip()
+        ]
+        if not text_entities:
+            return []
+
+        # Step 1: Try table-based parsing
+        records = self._parse_table(text_entities)
+        if records:
+            return records
+
+        # Step 2: Fallback — extract distinct cable IDs
+        return self._extract_cable_ids(text_entities)
+
+    def _parse_table(self, entities: list) -> list[dict]:
+        """Attempt to detect and parse a cable schedule table.
+
+        Returns records if successful, empty list otherwise.
+        """
+        # Group entities by Y coordinate
+        rows: dict[float, list] = {}
+        for e in entities:
+            x, y = self._entity_xy(e)
+            if x is None or y is None:
                 continue
+            bucket = round(y / self._ROW_TOL) * self._ROW_TOL
+            rows.setdefault(bucket, []).append((x, y, e.text.strip()))
+
+        if not rows:
+            return []
+
+        # Sort rows by Y (descending = top to bottom in CAD), sort cells by X
+        sorted_rows: list[list[tuple[float, str]]] = []
+        for y_bucket in sorted(rows.keys(), reverse=True):
+            cells = sorted(rows[y_bucket], key=lambda c: c[0])
+            sorted_rows.append([(c[0], c[2]) for c in cells])
+
+        if len(sorted_rows) < 2:
+            return []
+
+        # Detect header row — look for Chinese column keywords
+        header_idx = None
+        header_by_x: list[str] = []
+        for i, row in enumerate(sorted_rows):
+            texts = [t for _, t in row]
+            joined = ' '.join(texts)
+            # Check if any header keyword matches
+            for pat, field, _, _ in self._HEADERS:
+                if pat.search(joined):
+                    header_idx = i
+                    header_by_x = [t for _, t in row]
+                    break
+            if header_idx is not None:
+                break
+
+        if header_idx is None:
+            return []  # No table header detected
+
+        # Map column positions to topology fields
+        col_map: list[tuple[int, str, bool, bool]] = []  # (col_idx, field, is_cable_id, is_conductor)
+        for ci, header_text in enumerate(header_by_x):
+            for pat, field, is_cid, is_cond in self._HEADERS:
+                if pat.search(header_text):
+                    col_map.append((ci, field, is_cid, is_cond))
+                    break
+
+        if not col_map:
+            return []
+
+        # Find cable_id column — required
+        cid_col = next((c for c in col_map if c[2]), None)
+        if cid_col is None:
+            return []
+
+        # Parse data rows (everything after header)
+        records: list[dict] = []
+        for row in sorted_rows[header_idx + 1:]:
+            cell_texts = [t for _, t in row]
+            cid = cell_texts[cid_col[0]] if cid_col[0] < len(cell_texts) else ''
+            cid = cid.strip()
+            if not cid or not self._CABLE_ID_LIKE.fullmatch(cid):
+                continue
+
+            rec: dict = {
+                'cable_id': cid,
+                'conductor_no': None,
+                'strip_name': None,
+                'terminal_no': None,
+                'terminal_no_remote': None,
+                'cabinet_name': None,
+                'cabinet_name_remote': None,
+                'circuit_desc': None,
+                'loop_id': None,
+                'source_type': 'cable_schedule',
+            }
+
+            for col_idx, field, is_cid, is_cond in col_map:
+                if is_cid:
+                    continue  # already set
+                val = cell_texts[col_idx].strip() if col_idx < len(cell_texts) else ''
+                if not val:
+                    continue
+                if is_cond:
+                    # Try to parse as integer
+                    try:
+                        rec['conductor_no'] = int(val)
+                    except ValueError:
+                        rec['circuit_desc'] = (rec.get('circuit_desc') or '') + f' {val}'
+                elif field == 'strip_name':
+                    rec['strip_name'] = val
+                elif field == 'terminal_no_remote':
+                    rec['terminal_no_remote'] = val
+                elif field == 'cabinet_name':
+                    rec['cabinet_name'] = val
+                elif field == 'loop_id':
+                    rec['loop_id'] = val
+                elif field == 'circuit_desc':
+                    existing = rec.get('circuit_desc') or ''
+                    rec['circuit_desc'] = (existing + ' ' + val).strip()
+
+            records.append(rec)
+
+        return records
+
+    def _extract_cable_ids(self, entities: list) -> list[dict]:
+        """Fallback: extract distinct cable IDs from text."""
+        seen: set[str] = set()
+        for e in entities:
             t = (e.text or '').strip()
             for m in self._CABLE_ID_LIKE.finditer(t):
                 seen.add(m.group(1))
@@ -1071,6 +1233,15 @@ class CableScheduleAnalyzer:
             }
             for cid in sorted(seen)
         ]
+
+    @staticmethod
+    def _entity_xy(e) -> tuple[Optional[float], Optional[float]]:
+        cf = getattr(e, 'custom_fields', None) or {}
+        x = cf.get('x') if isinstance(cf, dict) else None
+        y = cf.get('y') if isinstance(cf, dict) else None
+        if x is not None and y is not None:
+            return (float(x), float(y))
+        return (None, None)
 
 
 # ===================================================================
@@ -1126,96 +1297,120 @@ class TopologyStage(Stage):
 
         self._store.delete_topology_for_document(doc.content_hash)
 
-        # V6.6: cabinet detection runs FIRST so the analyzer sees
-        # CabinetRegion IR entities when traversing the document.
-        # The earlier architecture ran cabinet analysis AFTER the
-        # analyzer, but that left the analyzer without spatial
-        # containment info to gate its terminal search.
         self._store.delete_cabinets_for_document(doc.content_hash)
-        cabinet_records_pre = _run_cabinet_analyzer(doc)
-        cabinet_terminal_rows_pre = _assign_cabinet_terminals(doc, cabinet_records_pre)
 
-        # Inject CabinetRegion IR entities into the document so the
-        # downstream analyzer (CircuitLoopAnalyzer in particular) can
-        # use them for terminal-restricted search.
-        from ..ir import CabinetRegion as _CabRegion
-        _cab_terminals_by_id: dict[str, list[str]] = {}
-        for cab_id, tid, _k, _x, _y in cabinet_terminal_rows_pre:
-            _cab_terminals_by_id.setdefault(cab_id, []).append(tid)
-        for cr in cabinet_records_pre:
-            bb = cr.boundary.bbox
-            cab_entity = _CabRegion(
-                id=cr.id,
-                source='dwg', page=1, confidence=1.0,
-                bbox=bb,
-                layer=cr.boundary.layer or '',
-                name=cr.name,
-                location=cr.location,
-                display_name=cr.display_name,
-                text_label=cr.text_label,
-                boundary_handle=cr.boundary.handle or '',
-                ltype=cr.boundary.ltype or '',
-                contained_terminal_ids=list(
-                    _cab_terminals_by_id.get(cr.id, [])
-                ),
-            )
-            doc.add_entity(cab_entity)
+        cabinet_records_pre: list = []
+        cabinet_terminal_rows_pre: list = []
 
         AnalyzerCls = _ANALYZERS_BY_TYPE.get(classification.primary)
         if AnalyzerCls is None:
-            records = []
+            records: list = []
         else:
+            # V6.7: cabinet analysis runs BEFORE the analyzer so the
+            # CircuitLoopAnalyzer sees CabinetRegion IR entities with
+            # spatial containment info. Only 回路图 use cabinet rules;
+            # other document types skip it entirely for performance.
+            if classification.primary == BusinessType.CIRCUIT_LOOP:
+                cabinet_records_pre = _run_cabinet_analyzer(doc)
+                cabinet_terminal_rows_pre = _assign_cabinet_terminals(
+                    doc, cabinet_records_pre,
+                )
+
+                # Inject CabinetRegion IR entities into the document.
+                from ..ir import CabinetRegion as _CabRegion
+                _cab_terminals_by_id: dict[str, list[str]] = {}
+                for cab_id, tid, _k, _x, _y in cabinet_terminal_rows_pre:
+                    _cab_terminals_by_id.setdefault(cab_id, []).append(tid)
+                for cr in cabinet_records_pre:
+                    bb = cr.boundary.bbox
+                    cab_entity = _CabRegion(
+                        id=cr.id,
+                        source='dwg', page=1, confidence=1.0,
+                        bbox=bb,
+                        layer=cr.boundary.layer or '',
+                        name=cr.name,
+                        location=cr.location,
+                        display_name=cr.display_name,
+                        text_label=cr.text_label,
+                        boundary_handle=cr.boundary.handle or '',
+                        ltype=cr.boundary.ltype or '',
+                        contained_terminal_ids=list(
+                            _cab_terminals_by_id.get(cr.id, [])
+                        ),
+                    )
+                    doc.add_entity(cab_entity)
+
             analyzer = AnalyzerCls()
             records = analyzer.analyze(doc)
 
+        # V6.7: batch all writes via executemany.
+        import json as _json
+        _topo_rows: list[tuple] = []
+        _strip_rows: list[tuple] = []
         for rec in records:
-            self._store.upsert_cable_topology(
-                cable_id=rec['cable_id'],
-                conductor_no=rec['conductor_no'],
-                strip_name=rec['strip_name'],
-                terminal_no=rec['terminal_no'],
-                terminal_no_remote=rec.get('terminal_no_remote'),
-                cabinet_name=rec.get('cabinet_name'),
-                cabinet_name_remote=rec.get('cabinet_name_remote'),
-                circuit_desc=rec['circuit_desc'],
-                loop_id=rec['loop_id'],
-                document_hash=doc.content_hash,
-                source_type=rec['source_type'],
-            )
+            _topo_rows.append((
+                rec['cable_id'], rec['conductor_no'], rec['strip_name'],
+                rec['terminal_no'], rec.get('terminal_no_remote'),
+                rec.get('cabinet_name'), rec.get('cabinet_name_remote'),
+                rec['circuit_desc'], rec['loop_id'],
+                doc.content_hash, rec['source_type'],
+            ))
             if rec['strip_name']:
-                self._store.upsert_terminal_strip(
-                    rec['strip_name'],
-                    document_hash=doc.content_hash,
-                )
+                _strip_rows.append((
+                    rec['strip_name'], None, doc.content_hash,
+                ))
+        if _topo_rows:
+            self._store.bulk_upsert_cable_topology(_topo_rows)
+        if _strip_rows:
+            self._store.bulk_upsert_terminal_strips(_strip_rows)
 
         # V6.6: persist the cabinet-region rows computed BEFORE the
         # analyzer ran (so the analyzer could already use them).
-        import json as _json
+        _cab_rows: list[tuple] = []
         for cr in cabinet_records_pre:
             bb = cr.boundary.bbox
-            self._store.upsert_cabinet(
-                cabinet_id=cr.id,
-                document_hash=doc.content_hash,
-                name=cr.name or None,
-                location=cr.location or None,
-                display_name=cr.display_name or None,
-                text_label=cr.text_label or None,
-                bbox_x=bb.x, bbox_y=bb.y, bbox_w=bb.w, bbox_h=bb.h,
-                layer=cr.boundary.layer or None,
-                boundary_handle=cr.boundary.handle or None,
-                ltype=cr.boundary.ltype or None,
-                points_json=_json.dumps(
+            _cab_rows.append((
+                cr.id,
+                doc.content_hash,
+                cr.name or None,
+                cr.location or None,
+                cr.display_name or None,
+                cr.text_label or None,
+                bb.x, bb.y, bb.w, bb.h,
+                cr.boundary.layer or None,
+                cr.boundary.handle or None,
+                cr.boundary.ltype or None,
+                _json.dumps(
                     [[p.x, p.y] for p in (cr.boundary.points or [])]
                 ),
-            )
-        for cab_id, tid, kind, x, y in cabinet_terminal_rows_pre:
-            self._store.upsert_cabinet_terminal(
-                cabinet_id=cab_id,
-                document_hash=doc.content_hash,
-                terminal_id=tid,
-                terminal_kind=kind,
-                x=x, y=y,
-            )
+            ))
+        if _cab_rows:
+            self._store.bulk_upsert_cabinets(_cab_rows)
+        _ct_rows: list[tuple] = [
+            (cab_id, doc.content_hash, tid, kind, x, y)
+            for cab_id, tid, kind, x, y in cabinet_terminal_rows_pre
+        ]
+        if _ct_rows:
+            self._store.bulk_upsert_cabinet_terminals(_ct_rows)
+
+        # V6.7+: persist text entities for full-text search
+        self._store.delete_text_entities_for_document(doc.content_hash)
+        _text_rows: list[tuple] = []
+        for e in doc.entities:
+            if isinstance(e, TextEntity):
+                cf = getattr(e, 'custom_fields', {}) or {}
+                _text_rows.append((
+                    doc.content_hash, e.text, 'TEXT',
+                    cf.get('x'), cf.get('y'),
+                ))
+            elif isinstance(e, AttributeEntity):
+                cf = getattr(e, 'custom_fields', {}) or {}
+                _text_rows.append((
+                    doc.content_hash, e.text, 'ATTRIB',
+                    cf.get('x'), cf.get('y'),
+                ))
+        if _text_rows:
+            self._store.bulk_upsert_text_entities(_text_rows)
 
         ctx.result = {
             'cable_topology_count': len(records),
@@ -1302,51 +1497,6 @@ def _assign_cabinet_terminals(doc, cabinet_records) -> list:
 
 
 # ---------------------------------------------------------------------------
-# V6.6: Cabinet-restricted helpers used by CircuitLoopAnalyzer.Step 2.
+# (V6.6 helpers _ws_in_cabinet / _terminal_in_cab / _cabinet_for_terminal
+# have been replaced by CabinetGridIndex for O(1) lookup, Q3 2025.)
 # ---------------------------------------------------------------------------
-def _ws_in_cabinet(
-    wx: float,
-    wy: float,
-    v66_cabinets: list[dict],
-) -> Optional[str]:
-    """Return the cabinet_id of the cabinet whose bbox contains
-    (wx, wy), or None when no cabinet covers that point. We pick the
-    SMALLEST enclosing cabinet (innermost), consistent with
-    `assign_terminals_to_cabinets`."""
-    if not v66_cabinets:
-        return None
-    containing = [c for c in v66_cabinets
-                  if (c['bbox'].x <= wx <= c['bbox'].x + c['bbox'].w
-                      and c['bbox'].y <= wy <= c['bbox'].y + c['bbox'].h)]
-    if not containing:
-        return None
-    containing.sort(key=lambda c: c['bbox'].w * c['bbox'].h)
-    return containing[0]['id']
-
-
-def _terminal_in_cab(
-    tx: float,
-    ty: float,
-    v66_cabinets: list[dict],
-) -> Optional[str]:
-    """Same as _ws_in_cabinet but explicitly named for terminals."""
-    return _ws_in_cabinet(tx, ty, v66_cabinets)
-
-
-def _cabinet_for_terminal(
-    tx: float,
-    ty: float,
-    v66_cabinets: list[dict],
-) -> Optional[str]:
-    """Return the cabinet's display_name for the cabinet containing
-    (tx, ty), or None when no cabinet covers that point. Used by
-    CircuitLoopAnalyzer's Step 2a to assign `cabinet_name` /
-    `cabinet_name_remote` from spatial geometry (V6.6) rather than
-    the V6.5 text-search `_find_cabinet`."""
-    cab_id = _ws_in_cabinet(tx, ty, v66_cabinets)
-    if cab_id is None:
-        return None
-    for c in v66_cabinets:
-        if c['id'] == cab_id:
-            return c.get('display_name') or None
-    return None
