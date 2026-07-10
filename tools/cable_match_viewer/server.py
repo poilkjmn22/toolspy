@@ -58,6 +58,7 @@ INDEX_HTML = """<!DOCTYPE html>
   .cable-row .cnt { color: #888; font-size: 11px; }
   .cab-row { padding: 6px 14px; border-bottom: 1px solid #f0f0f0; cursor: pointer; }
   .cab-row:hover { background: #f0f7ff; }
+  .cab-row.selected { background: #d0e8ff; font-weight: 600; }
   .cab-row .cab-name { font-size: 12px; font-weight: 600; }
   .cab-row .cab-meta { font-size: 11px; color: #888; margin-top: 2px; }
   .cab-row .cab-doc { font-size: 10px; color: #999; margin-top: 1px; }
@@ -80,7 +81,8 @@ INDEX_HTML = """<!DOCTYPE html>
   #flyfish-modal-header { padding: 8px 16px; background: #1a1a2e; color: white; display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; }
   #flyfish-modal-header .title { font-size: 13px; }
   #flyfish-modal-header .close-btn { cursor: pointer; color: #ff6b6b; font-size: 18px; line-height: 1; padding: 0 4px; }
-  #flyfish-modal-body { flex: 1; min-height: 0; }
+  #flyfish-modal-body { flex: 1; min-height: 0; position: relative; }
+  #flyfish-overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 10; }
   flyfish-file-viewer { width: 100%; height: 100%; display: block; }
 
   /* Documents tree (V6.5.3) */
@@ -145,6 +147,9 @@ INDEX_HTML = """<!DOCTYPE html>
       theme="light"
       toolbar-position="bottom-right"
     ></flyfish-file-viewer>
+    <div id="flyfish-overlay" style="display:none;">
+      <svg id="cabinet-overlay-svg" width="100%" height="100%" style="position:absolute;top:0;left:0;"></svg>
+    </div>
   </div>
 </div>
 <script>
@@ -171,8 +176,8 @@ document.querySelectorAll('.tab').forEach(el => {
       : activeTab === 'stats' ? ''
       : activeTab === 'documents' ? '过滤图纸路径…'
       : activeTab === 'unclassified' ? '过滤文件路径…'
-      : '搜索柜体(区域-名称)…';
-    search.style.display = (activeTab === 'stats') ? 'none' : '';
+      : '搜索柜体(名称/位置/路径)…';
+    search.style.display = (activeTab === 'stats' || activeTab === 'unclassified') ? 'none' : '';
     if (activeTab === 'cables') {
       renderCables();
       $('stats').textContent = `共 ${allCables.length} 条电缆`;
@@ -183,9 +188,8 @@ document.querySelectorAll('.tab').forEach(el => {
     } else if (activeTab === 'unclassified') {
       renderUnclassified();
       search.style.display = 'none';
-    } else {
-      cableList.innerHTML = '<div class="empty">输入关键字搜索柜体</div>';
-      $('stats').textContent = '柜体搜索';
+    } else if (activeTab === 'cabinets') {
+      loadCabinets();
     }
   };
 });
@@ -219,6 +223,281 @@ function renderCables() {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Cabinet tab (V6.6.3)
+// ---------------------------------------------------------------------------
+let allCabinets = [];
+let selectedCabinet = null;
+
+async function loadCabinets() {
+  cableList.innerHTML = '<div class="empty">加载中…</div>';
+  try {
+    const r = await fetch('/api/cabinets?limit=1000');
+    const data = await r.json();
+    allCabinets = data.cabinets || [];
+  } catch(e) {
+    allCabinets = [];
+    cableList.innerHTML = '<div class="empty">柜体数据加载失败</div>';
+    $('stats').textContent = '加载失败';
+    return;
+  }
+  renderCabinets();
+}
+
+function renderCabinets() {
+  const q = search.value.trim().toLowerCase();
+  const filtered = q
+    ? allCabinets.filter(c =>
+        (c.display_name || '').toLowerCase().includes(q) ||
+        (c.name || '').toLowerCase().includes(q) ||
+        (c.location || '').toLowerCase().includes(q) ||
+        (c.document && (c.document.rel_path || '').toLowerCase().includes(q)))
+    : allCabinets;
+
+  if (!filtered.length) {
+    cableList.innerHTML = '<div class="empty">' + (q ? '没有匹配的柜体' : '数据库中没有柜体数据') + '</div>';
+    $('stats').textContent = allCabinets.length ? `0/${allCabinets.length} 个` : '0 个柜体';
+    return;
+  }
+
+  // Group by document for readability
+  const byDoc = {};
+  for (const c of filtered) {
+    const docKey = c.document ? (c.document.rel_path || c.document.content_hash) : 'unknown';
+    if (!byDoc[docKey]) byDoc[docKey] = [];
+    byDoc[docKey].push(c);
+  }
+
+  let html = '';
+  for (const [docKey, cabinets] of Object.entries(byDoc)) {
+    const fileName = docKey.split('/').pop() || docKey;
+    html += `<div style="padding:4px 10px;font-size:11px;color:#888;font-weight:600;border-bottom:1px solid #eee;background:#fafafa;">${escHtml(fileName)}</div>`;
+    for (const c of cabinets) {
+      const name = c.display_name || c.name || c.cabinet_id;
+      const sel = selectedCabinet === c.cabinet_id;
+      html += `<div class="cab-row ${sel ? 'selected' : ''}" data-cabinet-id="${c.cabinet_id}">
+        <div class="cab-name">${escHtml(name)}</div>
+        <div class="cab-meta">${c.terminal_count} 端子 · ${Math.round(c.bbox_w)}×${Math.round(c.bbox_h)}</div>
+      </div>`;
+    }
+  }
+  cableList.innerHTML = html;
+  $('stats').textContent = q
+    ? `${filtered.length}/${allCabinets.length} 个 (匹配)`
+    : `${filtered.length} 个柜体`;
+
+  cableList.querySelectorAll('.cab-row').forEach(el => {
+    el.onclick = () => selectCabinet(el.dataset.cabinetId);
+  });
+}
+
+async function selectCabinet(cabinetId) {
+  selectedCabinet = cabinetId;
+  renderCabinets();
+  const r = await fetch('/api/cabinet/' + encodeURIComponent(cabinetId));
+  if (!r.ok) {
+    detail.innerHTML = '<div class="empty-state">未找到此柜体</div>';
+    return;
+  }
+  const data = await r.json();
+  renderCabinetDetail(data);
+}
+
+function renderCabinetDetail(c) {
+  const name = c.display_name || c.name || c.cabinet_id;
+  const doc = c.document || {};
+  const docName = doc.rel_path || doc.content_hash || '--';
+
+  let html = `<div class="cable-id">${escHtml(name)}</div>`;
+
+  // Cabinet info
+  html += `<div class="doc-summary">
+    <div class="doc-meta">
+      位置: ${escHtml(c.location || '--')}
+      &nbsp;|&nbsp; 名称: ${escHtml(c.name || '--')}
+      ${c.text_label ? '&nbsp;|&nbsp; 标签: ' + escHtml(c.text_label) : ''}
+    </div>
+    <div class="doc-meta" style="margin-top:4px;">
+      图层: ${c.layer || '--'}
+      &nbsp;|&nbsp; 线型: ${c.ltype || '--'}
+    </div>
+    <div class="doc-stats">
+      <span>原点: <strong>(${Math.round(c.bbox_x)}, ${Math.round(c.bbox_y)})</strong></span>
+      <span>尺寸: <strong>${Math.round(c.bbox_w)} × ${Math.round(c.bbox_h)}</strong></span>
+      <span>端子: <strong>${c.terminal_count}</strong></span>
+    </div>
+  </div>`;
+
+  // View in CAD button
+  const cabB64 = btoa(unescape(encodeURIComponent(JSON.stringify(c))));
+  html += `<div class="section">
+    <button class="preview-btn" style="padding:6px 16px;font-size:13px;margin-bottom:10px;"
+      data-hash="${doc.content_hash}" data-name="${escHtml(docName)}"
+      data-cabinet-b64="${cabB64}">
+      在图纸中查看
+    </button>
+    <span style="font-size:11px;color:#888;margin-left:8px;">${escHtml(docName)}</span>
+  </div>`;
+
+  // Terminals table
+  html += `<div class="section"><h3>包含端子 (${c.terminal_count})</h3>`;
+  if (!c.terminals || !c.terminals.length) {
+    html += '<div class="empty-state">无关联端子</div>';
+  } else {
+    html += '<table style="width:100%;border-collapse:collapse;font-size:12px;">';
+    html += '<tr style="background:#f5f5f5;font-weight:600;"><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">端子 ID</th><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">类型</th><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">X</th><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">Y</th></tr>';
+    for (const t of c.terminals) {
+      html += `<tr style="border-bottom:1px solid #eee;">
+        <td style="padding:4px 6px;font-family:monospace;">${escHtml(t.terminal_id)}</td>
+        <td style="padding:4px 6px;">${escHtml(t.terminal_kind)}</td>
+        <td style="padding:4px 6px;font-family:monospace;">${Math.round(t.x)}</td>
+        <td style="padding:4px 6px;font-family:monospace;">${Math.round(t.y)}</td>
+      </tr>`;
+    }
+    html += '</table>';
+  }
+  html += `</div>`;
+
+  // Boundary vertices
+  if (c.points_json && c.points_json !== '[]') {
+    html += `<div class="section"><h3>边界顶点</h3>`;
+    try {
+      const pts = JSON.parse(c.points_json);
+      html += '<table style="width:100%;border-collapse:collapse;font-size:12px;">';
+      html += '<tr style="background:#f5f5f5;font-weight:600;"><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">#</th><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">X</th><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">Y</th></tr>';
+      pts.forEach((p, i) => {
+        html += `<tr style="border-bottom:1px solid #eee;">
+          <td style="padding:4px 6px;">${i + 1}</td>
+          <td style="padding:4px 6px;font-family:monospace;">${Math.round(p[0])}</td>
+          <td style="padding:4px 6px;font-family:monospace;">${Math.round(p[1])}</td>
+        </tr>`;
+      });
+      html += '</table>';
+    } catch(e) {}
+    html += `</div>`;
+  }
+
+  detail.innerHTML = html;
+
+  detail.querySelectorAll('.preview-btn').forEach(el => {
+    el.onclick = () => {
+      let cab = null;
+      try { cab = JSON.parse(decodeURIComponent(escape(atob(el.dataset.cabinetB64)))); } catch(e) {}
+      openFlyfishWithCabinet(el.dataset.hash, el.dataset.name, cab);
+    };
+  });
+}
+
+// Extended Flyfish with cabinet zoom + overlay
+function openFlyfishWithCabinet(hash, name, cabinet) {
+  flyfishTitle.textContent = name || hash;
+  flyfishViewer.setAttribute('src', '/api/document/' + encodeURIComponent(hash) + '/file');
+  flyfishViewer.setAttribute('filename', name || 'preview.dwg');
+  flyfishViewer._cabinetHighlight = cabinet;
+  flyfishModal.classList.add('open');
+
+  if (cabinet) {
+    // Wait for CAD to render, then zoom + overlay
+    setTimeout(() => zoomToCabinet(cabinet), 1500);
+  }
+}
+
+function zoomToCabinet(cabinet) {
+  try {
+    const viewer = flyfishViewer;
+    if (typeof viewer.applyViewState !== 'function') return;
+    const cx = cabinet.bbox_x + cabinet.bbox_w / 2;
+    const cy = cabinet.bbox_y + cabinet.bbox_h / 2;
+    viewer.applyViewState({ centerX: cx, centerY: cy, scale: 3 });
+    setTimeout(() => drawCabinetOverlay(cabinet), 600);
+  } catch(e) {
+    console.warn('zoomToCabinet error:', e);
+  }
+}
+
+function drawCabinetOverlay(cabinet) {
+  try {
+    const viewer = flyfishViewer;
+    if (typeof viewer.getViewState !== 'function') return;
+    const vs = viewer.getViewState();
+    if (!vs) return;
+
+    const body = $('flyfish-modal-body');
+    const overlay = document.getElementById('flyfish-overlay');
+    if (!overlay) return;
+
+    const cw = body.clientWidth;
+    const ch = body.clientHeight;
+
+    // world-to-screen conversion (mirrors CAD renderer's formula)
+    const w2s = (wx, wy) => ({
+      x: cw / 2 + (wx - vs.centerX) * vs.scale,
+      y: ch / 2 - (wy - vs.centerY) * vs.scale,
+    });
+
+    const svg = document.getElementById('cabinet-overlay-svg');
+    if (!svg) return;
+
+    let pts = [];
+    try { pts = JSON.parse(cabinet.points_json || '[]'); } catch(e) {}
+
+    let pathD = '';
+    if (pts.length >= 2) {
+      const first = w2s(pts[0][0], pts[0][1]);
+      pathD = 'M ' + first.x + ' ' + first.y;
+      for (let i = 1; i < pts.length; i++) {
+        const p = w2s(pts[i][0], pts[i][1]);
+        pathD += ' L ' + p.x + ' ' + p.y;
+      }
+      if (pts.length >= 4) pathD += ' Z';
+    }
+
+    svg.innerHTML = '';
+    if (pathD) {
+      const ns = 'http://www.w3.org/2000/svg';
+      const path = document.createElementNS(ns, 'path');
+      path.setAttribute('d', pathD);
+      path.setAttribute('stroke', '#ff6b6b');
+      path.setAttribute('stroke-width', '3');
+      path.setAttribute('fill', 'rgba(255, 107, 107, 0.1)');
+      path.setAttribute('stroke-dasharray', '8,4');
+      svg.appendChild(path);
+    }
+
+    // Terminal markers
+    if (cabinet.terminals) {
+      const ns = 'http://www.w3.org/2000/svg';
+      for (const t of cabinet.terminals) {
+        const sp = w2s(t.x, t.y);
+        const circle = document.createElementNS(ns, 'circle');
+        circle.setAttribute('cx', sp.x);
+        circle.setAttribute('cy', sp.y);
+        circle.setAttribute('r', '5');
+        circle.setAttribute('fill', '#4caf50');
+        circle.setAttribute('stroke', '#fff');
+        circle.setAttribute('stroke-width', '2');
+        svg.appendChild(circle);
+
+        if (t.terminal_id) {
+          const text = document.createElementNS(ns, 'text');
+          text.setAttribute('x', sp.x + 8);
+          text.setAttribute('y', sp.y - 8);
+          text.setAttribute('fill', '#fff');
+          text.setAttribute('font-size', '11');
+          text.setAttribute('font-weight', 'bold');
+          text.setAttribute('style', 'text-shadow: 1px 1px 2px rgba(0,0,0,0.8);');
+          text.textContent = t.terminal_id;
+          svg.appendChild(text);
+        }
+      }
+    }
+
+    overlay.style.display = 'block';
+  } catch(e) {
+    console.warn('drawCabinetOverlay error:', e);
+  }
+}
+
 async function searchCabinets() {
   const q = search.value.trim();
   if (!q) {
@@ -248,7 +527,6 @@ async function searchCabinets() {
   cableList.querySelectorAll('.cab-row').forEach(el => {
     el.onclick = () => {
       const name = el.dataset.cabinet;
-      // Switch to cable tab and search for related cables
       const cables = data.find(d => (d.cabinet_name || '') === name || (d.cabinet_name_remote || '') === name);
       if (cables && cables.cable_ids) {
         activeTab = 'cables';
@@ -336,11 +614,16 @@ flyfishClose.onclick = () => {
   flyfishModal.classList.remove('open');
   flyfishViewer.removeAttribute('src');
   flyfishViewer.removeAttribute('filename');
+  flyfishViewer._cabinetHighlight = null;
+  const overlay = document.getElementById('flyfish-overlay');
+  if (overlay) overlay.style.display = 'none';
+  const svg = document.getElementById('cabinet-overlay-svg');
+  if (svg) svg.innerHTML = '';
 };
 
 search.oninput = () => {
   if (activeTab === 'cables') renderCables();
-  else if (activeTab === 'cabinets') searchCabinets();
+  else if (activeTab === 'cabinets') renderCabinets();
   else if (activeTab === 'documents') renderDocumentTree();
   else if (activeTab === 'unclassified') renderUnclassified();
 };

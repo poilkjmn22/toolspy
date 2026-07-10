@@ -30,6 +30,8 @@ Anonymous block expansion:
 from __future__ import annotations
 
 import hashlib
+import json
+import math
 import re
 import subprocess
 from pathlib import Path
@@ -113,41 +115,172 @@ class DWGLoader(BaseLoader):
     def _parse_v5(self, raw: str, doc: Document) -> None:
         """Parse dwgread JSON and emit V5 entities.
 
-        Two-pass approach:
-          1. Build an ltype-handle → ltype-name map from all LTYPE objects
-             (emitted as standalone objects with `"object": "LTYPE"`,
-             not as `"entity"` rows — so they do not pass `_ENTITY_RE`).
-          2. Single linear pass over `"entity"` rows. Each entity is
-             identified by its `"entity":` key. We emit:
-               - TextEntity         for TEXT, MTEXT
-               - AttributeEntity    for ATTRIB
-               - LineGeometry       for LINE, LWPOLYLINE
-               - CircleGeometry     for CIRCLE
-               - ArcGeometry        for ARC
-               - BlockRef           for INSERT (with insert_point + rotation)
-             LINE / LWPOLYLINE entities also pick up the ltype name via
-             the map (handles like `[5,2,808,808]` → `"ACAD_ISO10W100"`).
-
-        Anonymous block expansion (the V5 Q2-A goal) is implemented at
-        the GRAPH BUILD stage instead of here. The dwgread JSON's
-        `block_header` field references the BLOCK TABLE RECORD via a
-        composite handle that doesn't directly match the BLOCK entity's
-        own handle; we resolve it via spatial proximity at graph build
-        time (resolved spatially by the TerminalStripAnalyzer at query
-        time). This is simpler and more robust than chasing handles
-        across the dwgread JSON format.
+        Three-pass approach:
+          1. Build an ltype-handle → ltype-name map from all LTYPE objects.
+          2. Build a BLOCK_HEADER entity map to determine which entities are
+             inside block definitions (via ownerhandle → BLOCK_HEADER).
+          3. Linear pass over `"entity"` rows. Model-space entities are
+             emitted directly. Entities belonging to any BLOCK_HEADER are
+             buffered by BLOCK_HEADER handle, NOT emitted.
+             INSERT entities pick up their block name from a pre-built
+             block_header → block_name lookup (dwgread JSON does not
+             include `"name"` in INSERT entities).
+          4. Post-pass: for each INSERT (BlockRef) referencing an anonymous
+             block, resolve its BLOCK_HEADER and expand the buffered
+             entities into model space with coordinates transformed by the
+             INSERT's ins_pt / rotation / scale and the BLOCK_HEADER's
+             base_pt offset.
         """
         ltype_map = _build_ltype_map(raw)
+        block_name_map = _build_block_header_name_map(raw)
+
+        # Build BLOCK_HEADER entity map to know which entities are block-internal
+        bh_entity_map = _build_block_header_entity_map(raw)
+        block_internal_handles: set[int] = set()
+        entity_to_bh: dict[int, int] = {}
+        for bh_handle, bh_data in bh_entity_map.items():
+            bh_name = bh_data['name']
+            if bh_name in ('*Model_Space', '*Paper_Space'):
+                continue
+            for h in bh_data['entities']:
+                block_internal_handles.add(h)
+                entity_to_bh[h] = bh_handle
+
+        # Phase 2: buffer anonymous block entities, emit model-space entities
+        block_buffers: dict[int, list[tuple[str, str]]] = {}
 
         for m in _ENTITY_RE.finditer(raw):
             etype = m.group(1)
+
+            if etype in ('BLOCK', 'ENDBLK'):
+                continue
+
             block = _extract_object(raw, m.start())
             if block is None:
                 continue
-            # Skip block definition envelopes (BLOCK / ENDBLK pairs).
-            if etype in ('BLOCK', 'ENDBLK'):
+
+            # Inject block name into INSERT JSON for model-space entities
+            if etype == 'INSERT' and block_name_map:
+                try:
+                    blk_obj = json.loads(block)
+                    bh = blk_obj.get('block_header', [])
+                    if len(bh) >= 3:
+                        bbytes = bh[1]
+                        handle_key = tuple(bh[2:2 + bbytes])
+                        if handle_key in block_name_map:
+                            blk_obj['name'] = block_name_map[handle_key]
+                            block = json.dumps(blk_obj, indent=2)
+                except (json.JSONDecodeError, IndexError):
+                    pass
+
+            # Check if this entity belongs to a block definition
+            handle = _json_handle_value(block)
+            if handle in block_internal_handles:
+                bh_handle = entity_to_bh[handle]
+                block_buffers.setdefault(bh_handle, []).append((etype, block))
                 continue
+
             self._emit_model_entity_v5(etype, block, doc, ltype_map)
+
+        # Phase 3: expand anonymous block references via BLOCK_HEADER
+        inserts: list[BlockRef] = [
+            e for e in doc.entities
+            if isinstance(e, BlockRef) and e.name
+            and e.name.startswith('*U') and e.insert_point is not None
+        ]
+
+        # Build reverse mapping: BLOCK entity handle → BLOCK_HEADER handle
+        be_to_bh: dict[int, int] = {}
+        for bh_handle, bh_data in bh_entity_map.items():
+            be = bh_data['block_entity_handle']
+            if be:
+                be_to_bh[be] = bh_handle
+
+        block_name_to_handle = _build_block_name_handle_map(raw)
+
+        for ins in inserts:
+            blk_handle = block_name_to_handle.get(ins.name, 0)
+            bh_handle = be_to_bh.get(blk_handle, 0)
+            if not bh_handle:
+                continue
+            buf = block_buffers.get(bh_handle, [])
+            if not buf:
+                continue
+            base_pt = bh_entity_map[bh_handle]['base_pt']
+            self._emit_anonymous_block(ins, buf, doc, ltype_map, base_pt)
+
+    def _emit_anonymous_block(
+        self,
+        ins: BlockRef,
+        buf: list[tuple[str, str]],
+        doc: Document,
+        ltype_map: dict[str, str],
+        base_pt: list[float] | None = None,
+    ) -> None:
+        """Expand one anonymous block reference into model-space entities.
+
+        The BLOCK_HEADER's base_pt defines the block's origin. Block-local
+        entity coordinates are relative to this base_pt, so we subtract it
+        before applying the INSERT transform.
+        """
+        ix = ins.insert_point.x
+        iy = ins.insert_point.y
+        cos_r = math.cos(ins.rotation)
+        sin_r = math.sin(ins.rotation)
+        sx = ins.scale_x
+        sy = ins.scale_y
+        bx0 = base_pt[0] if base_pt else 0.0
+        by0 = base_pt[1] if base_pt else 0.0
+
+        def tx(bx: float, by: float) -> tuple[float, float]:
+            dx = bx - bx0
+            dy = by - by0
+            mx = ix + dx * sx * cos_r - dy * sy * sin_r
+            my = iy + dx * sx * sin_r + dy * sy * cos_r
+            return (mx, my)
+
+        for etype, orig_block in buf:
+            self._emit_transformed_block(etype, orig_block, doc, ltype_map, tx)
+
+    def _emit_transformed_block(
+        self,
+        etype: str,
+        orig_block: str,
+        doc: Document,
+        ltype_map: dict[str, str],
+        tx: object,  # Callable[[float, float], tuple[float, float]]
+    ) -> None:
+        """Emit one block-internal entity with coordinates transformed."""
+        if etype in ('INSERT', 'BLOCK', 'ENDBLK', 'ATTDEF'):
+            return
+
+        obj = json.loads(orig_block)
+
+        def transform_point(bx: float, by: float) -> list[float]:
+            mx, my = tx(bx, by)  # type: ignore[operator]
+            return [mx, my]
+
+        def transform_dict_point(p: dict) -> None:
+            if 'x' in p and 'y' in p:
+                mx, my = tx(float(p['x']), float(p['y']))
+                p['x'] = mx
+                p['y'] = my
+
+        for key in ('ins_pt', 'start', 'end', 'center'):
+            val = obj.get(key)
+            if isinstance(val, list) and len(val) >= 2:
+                obj[key] = transform_point(float(val[0]), float(val[1]))
+
+        if 'points' in obj:
+            pts = obj['points']
+            for i, pt in enumerate(pts):
+                if isinstance(pt, list) and len(pt) >= 2:
+                    pts[i] = transform_point(float(pt[0]), float(pt[1]))
+                elif isinstance(pt, dict):
+                    transform_dict_point(pt)
+
+        new_block = json.dumps(obj, indent=2)
+        self._emit_model_entity_v5(etype, new_block, doc, ltype_map)
 
     def _emit_model_entity_v5(
         self, etype: str, block: str, doc: Document,
@@ -713,6 +846,184 @@ def _build_ltype_map(raw: str) -> dict[str, str]:
             break
         _, name = ltype_objects[i]
         out[ref_h] = name
+    return out
+
+
+def _build_block_header_name_map(raw: str) -> dict[tuple[int, ...], str]:
+    """Build a map from INSERT.block_header handle-value → block name.
+
+    dwgread JSON does not include a `"name"` key in INSERT entities.
+    Instead each INSERT carries a `"block_header"` handle reference
+    (e.g. `[5, 2, 990, 990]`). We resolve it via the BLOCK_CONTROL
+    object, whose `entries` array lists the same handles positioned in
+    the same order as the corresponding BLOCK entities appear in the
+    JSON output (after in-model-space *Model_Space / *Paper_Space).
+
+    Returns a dict keyed by the trailing handle bytes (e.g. `(990, 990)`)
+    so callers can look up `block_header[2:2+block_header[1]]`.
+    """
+    # 1. Read BLOCK_CONTROL entries.
+    obj_re = re.compile(r'"object":\s*"BLOCK_CONTROL"')
+    entries: list[list[int]] = []
+    for m in obj_re.finditer(raw):
+        start = raw.rfind('{', 0, m.start())
+        if start < 0:
+            continue
+        depth = 0
+        end = None
+        for j in range(start, len(raw)):
+            if raw[j] == '{':
+                depth += 1
+            elif raw[j] == '}':
+                depth -= 1
+                if depth == 0:
+                    end = j
+                    break
+        if end is None:
+            continue
+        obj = json.loads(raw[start:end + 1])
+        entries = obj.get('entries', [])
+        break
+
+    if not entries:
+        return {}
+
+    # 2. Collect BLOCK names in appearance order, skipping *Model_Space
+    #    and *Paper_Space (which the `entries` array does NOT reference).
+    block_names: list[str] = []
+    for m in _ENTITY_RE.finditer(raw):
+        if m.group(1) != 'BLOCK':
+            continue
+        start = raw.rfind('{', 0, m.start())
+        if start < 0:
+            continue
+        depth = 0
+        end = None
+        for j in range(start, len(raw)):
+            if raw[j] == '{':
+                depth += 1
+            elif raw[j] == '}':
+                depth -= 1
+                if depth == 0:
+                    end = j
+                    break
+        if end is None:
+            continue
+        obj = json.loads(raw[start:end + 1])
+        name = obj.get('name', '')
+        if name not in ('*Model_Space', '*Paper_Space'):
+            block_names.append(name)
+
+    # 3. Pair entries to block names positionally, keyed by handle
+    #    value (last `bytes` elements from each 4-element entry).
+    out: dict[tuple[int, ...], str] = {}
+    for i, entry in enumerate(entries):
+        if len(entry) < 3:
+            continue
+        ebytes = entry[1]
+        handle_key = tuple(entry[2:2 + ebytes])
+        if i < len(block_names):
+            out[handle_key] = block_names[i]
+    return out
+
+
+def _json_handle_value(block: str) -> int:
+    """Extract the numeric handle value (last element of handle array) from a JSON block string."""
+    p = '"handle":'
+    i = block.find(p)
+    if i < 0:
+        return 0
+    val_start = block.find('[', i)
+    if val_start < 0:
+        return 0
+    val_end = block.find(']', val_start)
+    if val_end < 0:
+        return 0
+    parts = block[val_start + 1:val_end].split(',')
+    try:
+        return int(parts[-1].strip())
+    except (ValueError, IndexError):
+        return 0
+
+
+def _build_block_header_entity_map(raw: str) -> dict[int, dict]:
+    """Build a map from BLOCK_HEADER handle to its entity metadata.
+
+    dwgread JSON stores block-internal entities in the OBJECTS array with
+    an `ownerhandle` pointing to the BLOCK_HEADER, NOT nested between
+    BLOCK/ENDBLK markers. This function reads those BLOCK_HEADER objects
+    and returns each handle's entity list.
+
+    Returns: {handle: {entities: [int, ...], hasattrs: bool,
+                       base_pt: [x,y,z], block_entity_handle: int, name: str}}
+    """
+    out: dict[int, dict] = {}
+    obj_re = re.compile(r'"object":\s*"BLOCK_HEADER"')
+    for m in obj_re.finditer(raw):
+        start = raw.rfind('{', max(0, m.start() - 4000), m.start())
+        if start < 0:
+            continue
+        depth = 0
+        end = None
+        for j in range(start, len(raw)):
+            if raw[j] == '{':
+                depth += 1
+            elif raw[j] == '}':
+                depth -= 1
+                if depth == 0:
+                    end = j
+                    break
+        if end is None:
+            continue
+        block = raw[start:end + 1]
+        try:
+            obj = json.loads(block)
+        except json.JSONDecodeError:
+            continue
+        handle_arr = obj.get('handle', [])
+        if len(handle_arr) < 3:
+            continue
+        bh_handle = handle_arr[-1]
+
+        entity_handles: list[int] = []
+        for ent_ref in obj.get('entities', []):
+            if isinstance(ent_ref, list) and ent_ref:
+                entity_handles.append(ent_ref[-1])
+
+        be_ref = obj.get('block_entity', [])
+        be_handle = be_ref[-1] if isinstance(be_ref, list) and be_ref else 0
+
+        out[bh_handle] = {
+            'entities': entity_handles,
+            'hasattrs': bool(obj.get('hasattrs', 0)),
+            'base_pt': obj.get('base_pt', [0, 0, 0]),
+            'block_entity_handle': be_handle,
+            'name': obj.get('name', ''),
+        }
+    return out
+
+
+def _build_block_name_handle_map(raw: str) -> dict[str, int]:
+    """Build a map from BLOCK entity name to its handle value.
+
+    Used in Phase 3 to resolve an INSERT's block name (e.g. '*U28') to
+    the BLOCK entity's handle, which is then mapped to a BLOCK_HEADER.
+    """
+    out: dict[str, int] = {}
+    for m in _ENTITY_RE.finditer(raw):
+        if m.group(1) != 'BLOCK':
+            continue
+        block = _extract_object(raw, m.start())
+        if block is None:
+            continue
+        try:
+            obj = json.loads(block)
+            name = obj.get('name', '')
+            handle_arr = obj.get('handle', [])
+            if name and len(handle_arr) >= 3:
+                out[name] = handle_arr[-1]
+        except json.JSONDecodeError:
+            pass
     return out
 
 

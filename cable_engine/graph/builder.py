@@ -1268,7 +1268,13 @@ def _run_cabinet_analyzer(doc) -> list:
 def _assign_cabinet_terminals(doc, cabinet_records) -> list:
     """For every cabinet, find NO / ObjTerm.Name ATTRIBs whose point
     falls inside its bbox. Returns a flat list of (cabinet_id,
-    terminal_id, terminal_kind, x, y) tuples."""
+    terminal_id, terminal_kind, x, y) tuples.
+
+    The flat list preserves ALL containment relationships: the same
+    terminal_id may appear at multiple positions (e.g. duplicate
+    cabinet copies at different y), producing one row per occurrence.
+    The caller / storage layer deduplicates by
+    (cabinet_id, document_hash, terminal_id, terminal_kind)."""
     from .cabinet import assign_terminals_to_cabinets
     from ..ir import AttributeEntity
 
@@ -1292,22 +1298,7 @@ def _assign_cabinet_terminals(doc, cabinet_records) -> list:
     if not cabinet_records or not terminals:
         return []
 
-    mappings = assign_terminals_to_cabinets(cabinet_records, terminals)
-    if not mappings:
-        return []
-
-    by_tid: dict = {}
-    for t in terminals:
-        by_tid.setdefault(t[2], []).append(t)
-
-    out: list = []
-    for tid, cab_id in mappings.items():
-        if tid not in by_tid:
-            continue
-        rows = sorted(by_tid[tid], key=lambda r: 0 if r[3] == "NO" else 1)
-        x, y, _tid, kind = rows[0]
-        out.append((cab_id, tid, kind, x, y))
-    return out
+    return assign_terminals_to_cabinets(cabinet_records, terminals)
 
 
 # ---------------------------------------------------------------------------

@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import math
 import re
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Iterable, Optional
 
@@ -56,12 +57,33 @@ from ..ir.entities import BBox, Point
 # actually use for cabinet-boundary boxes. Adding more is a one-line
 # change once we see a new one in the field.
 _DASHED_LTYPES: frozenset[str] = frozenset({
-    'ACAD_ISO10W100',    # ISO long-dash-dot pattern, very common
-    'HIDDEN',            # Standard "hidden line" dashed pattern
+    # Core patterns — seen in practice on shengli DWGs
+    'ACAD_ISO10W100',    # ISO long-dash-dot
+    'HIDDEN',            # Standard "hidden line" dashed
     'DASHED',            # Generic dash
-    'DASH',              # Aliases seen in some dwgread outputs
-    'DOTTED',            # Sometimes used for imaginary elements
-    'DASHDOT',           # Dash + dot (rare for cabinets)
+    'DASH',              # Alias
+    'DOTTED',            # Dot pattern (sometimes used)
+    'DASHDOT',           # Dash + dot
+    # Scaled variants — common in Chinese CAD
+    'DASHED2',           # 0.5× DASHED
+    'HIDDEN2',           # 0.5× HIDDEN
+    'DASHEDX2',          # 2× DASHED
+    'HIDDENX2',          # 2× HIDDEN
+    'DOT2',              # 0.5× DOTTED
+    'DASHDOT2',          # 0.5× DASHDOT
+    'DOT',               # DOT alias
+    # ISO pattern family — all ISO 128 linetypes
+    'ACAD_ISO02W100',    # ISO dot
+    'ACAD_ISO03W100',    # ISO dash-dot
+    'ACAD_ISO04W100',    # ISO long-dash
+    'ACAD_ISO05W100',    # ISO long-dash-dot
+    'ACAD_ISO06W100',    # ISO long-dash-double-dot
+    'ACAD_ISO07W100',    # ISO double-dash-dot
+    'ACAD_ISO08W100',    # ISO double-dash-double-dot
+    'ACAD_ISO09W100',    # ISO dash-triple-dot
+    # User-defined variants used in some project DWGs
+    'BATTING',
+    'BATTING2',
 })
 
 
@@ -285,7 +307,111 @@ class CabinetRegionAnalyzer:
         # output never had overlapping dashed rectangles because each
         # cabinet defines its own region. If nesting ever shows up, the
         # caller can post-filter via the contains() method).
+
+        # --- Pass 2: multi-segment LINE rectangles --------------------
+        # Some drawings represent cabinet boundaries as 4 separate LINE
+        # entities (2 points each) instead of a single LWPOLYLINE. We
+        # detect those here by grouping dashed 2-pt LINE segments that
+        # form a closed 4-segment chain.
+        self._find_multi_segment_rects(doc, out)
+
         return out
+
+    def _find_multi_segment_rects(
+        self,
+        doc: Document,
+        out: list[CabinetBoundary],
+    ) -> None:
+        """Append dashed-rectangle boundaries formed by 4 separate LINE
+        segments to *out*."""
+        _ROUND = 2
+
+        def _r(pt: Point) -> tuple[float, float]:
+            return (round(pt.x, _ROUND), round(pt.y, _ROUND))
+
+        # Collect all dashed 2-pt LINE segments.
+        segs: list[dict] = []
+        for ent in doc.entities:
+            if not isinstance(ent, LineGeometry):
+                continue
+            pts = list(ent.points or [])
+            if len(pts) != 2:
+                continue
+            cf = getattr(ent, 'custom_fields', None) or {}
+            ltype = cf.get('ltype', '')
+            if not is_dashed_ltype(ltype):
+                continue
+            segs.append({
+                'pts': pts,
+                'layer': ent.layer or '',
+                'handle': ent.handle or '',
+                'ltype': ltype,
+            })
+
+        if len(segs) < 4:
+            return
+
+        # Build endpoint → segment index.
+        ep_to_idxs: dict[tuple[float, float], list[int]] = defaultdict(list)
+        for i, seg in enumerate(segs):
+            for pt in seg['pts']:
+                ep_to_idxs[_r(pt)].append(i)
+
+        def other_key(seg_idx: int, key: tuple[float, float]) -> tuple[float, float]:
+            seg = segs[seg_idx]
+            k1, k2 = _r(seg['pts'][0]), _r(seg['pts'][1])
+            return k2 if k1 == key else k1
+
+        used: set[int] = set()
+        for start_i in range(len(segs)):
+            if start_i in used:
+                continue
+            seg0 = segs[start_i]
+            p1, p2 = _r(seg0['pts'][0]), _r(seg0['pts'][1])
+            if len(ep_to_idxs.get(p1, [])) != 2 or len(ep_to_idxs.get(p2, [])) != 2:
+                continue
+
+            # Trace forward from p1 → p2.
+            chain = [start_i]
+            cur_key = p2
+            ok = True
+            for _ in range(3):
+                cands = ep_to_idxs.get(cur_key, [])
+                nxt = next((c for c in cands if c not in chain), None)
+                if nxt is None:
+                    ok = False
+                    break
+                chain.append(nxt)
+                cur_key = other_key(nxt, cur_key)
+            if not ok or cur_key != p1:
+                continue
+
+            # Collect the 4 unique corner points.
+            corners = [_r(segs[chain[0]]['pts'][0])]
+            for idx in chain:
+                k = _r(segs[idx]['pts'][1])
+                if k != corners[-1]:
+                    corners.append(k)
+            if len(corners) != 4:
+                continue
+
+            corner_pts = [Point(x, y) for x, y in corners]
+            bbox = self._rect_bbox(corner_pts)
+            if bbox is None:
+                continue
+
+            bid = f'line_rect_{len(out)}'
+            out.append(CabinetBoundary(
+                id=bid,
+                document_hash=doc.content_hash,
+                bbox=bbox,
+                points=corner_pts,
+                layer=segs[start_i]['layer'],
+                handle='',
+                ltype=segs[start_i]['ltype'],
+                closed=True,
+            ))
+            used.update(chain)
 
     def _rect_bbox(self, pts: list[Point]) -> Optional[BBox]:
         """Return the axis-aligned bbox of `pts` if and only if the
@@ -353,10 +479,11 @@ class CabinetRegionAnalyzer:
 
         # Pre-filter candidates by y-range (above or near the boundary).
         bx_top = b.bbox.y + b.bbox.h
+        bbox_cx = b.bbox.x + b.bbox.w / 2
         candidates_above: list[_TextRef] = []
         candidates_below: list[_TextRef] = []
         for t in texts:
-            if b.bbox.x - 50 <= t.x <= b.bbox.x + b.bbox.w + 200:
+            if b.bbox.x - 50 <= t.x <= b.bbox.x + b.bbox.w + 80:
                 if t.y > bx_top and t.y - bx_top <= self.NAME_ABOVE_DY:
                     candidates_above.append(t)
                 elif t.y < b.bbox.y and b.bbox.y - t.y <= self.LABEL_BELOW_DY + 200:
@@ -364,27 +491,39 @@ class CabinetRegionAnalyzer:
 
         # --- name: prefer text above containing a keyword; else closest
         #     short-code-looking token above the boundary.
+        #     Primary: vertical distance to boundary top (smaller = better).
+        #     Tie-break: texts within SAME_ROW_TOL units vertically are
+        #     considered same-row; pick the closer one horizontally.
+        SAME_ROW_TOL = 3.0
         name_pick: Optional[_TextRef] = None
         name_dy = float('inf')
+        name_dx = float('inf')
         for t in candidates_above:
             if any(kw in t.text for kw in _NAME_KEYWORDS):
-                if t.y < name_dy:
-                    name_dy = t.y
+                d = abs(t.y - bx_top)
+                if d < name_dy - SAME_ROW_TOL or (abs(d - name_dy) <= SAME_ROW_TOL and abs(t.x - bbox_cx) < name_dx):
+                    name_dy = d
+                    name_dx = abs(t.x - bbox_cx)
                     name_pick = t
         if name_pick is None:
+            name_dx = float('inf')
+            name_dy = float('inf')
             for t in candidates_above:
                 if _SHORT_NAME.match(t.text):
-                    if t.y < name_dy:
-                        name_dy = t.y
+                    d = abs(t.y - bx_top)
+                    if d < name_dy - SAME_ROW_TOL or (abs(d - name_dy) <= SAME_ROW_TOL and abs(t.x - bbox_cx) < name_dx):
+                        name_dy = d
+                        name_dx = abs(t.x - bbox_cx)
                         name_pick = t
 
         if name_pick is not None:
             rec.name = name_pick.text
             rec.name_text_id = name_pick.text_id
 
-            # --- location: text immediately to the left on the SAME y row.
+            # --- location: closest text to the left on the SAME y row.
             key = round(name_pick.y * 2)
             nearby = by_y.get(key) or by_y.get(key + 1) or by_y.get(key - 1) or []
+            best_dx = float('inf')
             for t in nearby:
                 if t.text_id == name_pick.text_id:
                     continue
@@ -395,9 +534,10 @@ class CabinetRegionAnalyzer:
                 dx = name_pick.x - t.x
                 if dx > self.LOCATION_NAME_DX:
                     continue
-                rec.location = t.text
-                rec.location_text_id = t.text_id
-                break
+                if dx < best_dx:
+                    best_dx = dx
+                    rec.location = t.text
+                    rec.location_text_id = t.text_id
 
             rec.display_name = (
                 f'{rec.location}-{rec.name}' if rec.location else rec.name
@@ -427,6 +567,16 @@ class CabinetRegionAnalyzer:
                 rec.display_name = (
                     f'{rec.location}-{rec.name}' if rec.location else rec.name
                 )
+            elif not any(kw in rec.name for kw in _NAME_KEYWORDS):
+                # Above-boundary name is a short code (not a keyword),
+                # but we found a descriptive keyword text below the
+                # boundary. Prefer the keyword text as the name.
+                rec.name = label_pick.text
+                rec.text_label = ''
+                rec.label_text_id = ''
+                rec.display_name = (
+                    f'{rec.location}-{rec.name}' if rec.location else rec.name
+                )
 
         return rec
 
@@ -441,21 +591,19 @@ def assign_terminals_to_cabinets(
     records: list[CabinetRecord],
     terminals: Iterable[tuple[float, float, str, str]],
     pad: float = 0.0,
-) -> dict[str, str]:
-    """Return {terminal_id: cabinet_id} for every terminal whose
-    point lies inside at least one cabinet boundary. If multiple
-    cabinets contain the point (nested rectangles), we pick the
-    smallest-area enclosing cabinet (the innermost)."""
+) -> list[tuple[str, str, str, float, float]]:
+    """Return [(cabinet_id, terminal_id, kind, x, y)] for every
+    containment match.  The same terminal_id may appear in multiple
+    rows if the terminal lies inside several cabinet bboxes (e.g. a
+    cabinet that is duplicated at different y positions, or overlapping
+    cabinets).  The caller / storage layer deduplicates by
+    (cabinet_id, terminal_id, kind) if needed."""
     recs = sorted(records, key=lambda r: r.boundary.area)
-    out: dict[str, str] = {}
-    for x, y, tid, _kind in terminals:
-        assigned: Optional[CabinetRecord] = None
+    out: list[tuple[str, str, str, float, float]] = []
+    for x, y, tid, kind in terminals:
         for r in recs:
             if r.boundary.contains(x, y, pad=pad):
-                assigned = r
-                break  # recs are sorted ascending by area: smallest first wins
-        if assigned is not None:
-            out[tid] = assigned.id
+                out.append((r.id, tid, kind, x, y))
     return out
 
 
