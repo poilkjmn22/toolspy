@@ -21,61 +21,11 @@ python -m tools.cable_match_viewer.server \
 A bash wrapper at the repo root `./toolspy` does the same as `python -m tools`
 but auto-locates `myenv/bin/python` and errors out with a setup hint if `myenv/` is missing.
 
-## Architecture (V5)
+## Architecture (V7.0)
 
-V5 is a **big-bang replacement** of the V4 cable_engine pipeline. The
-core shift: the IR is now graph-first, not text-first.
+See `docs/cable_engine_architecture.md` (English) / `docs/cable_engine_architecture_zh.md` (中文).
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  cable_engine.cli scan                                          │
-│                                                                 │
-│   DWG file                                                       │
-│     │                                                           │
-│     ▼                                                           │
-│   DWGLoader (dwgread -O JSON)                                   │
-│     │                                                           │
-│     ▼                                                           │
-│   Document IR                                                   │
-│     ├─ TextEntity                                               │
-│     ├─ LineGeometry                                             │
-│     ├─ CircleGeometry / ArcGeometry                             │
-│     ├─ BlockRef                                                 │
-│     └─ AttributeEntity                                           │
-│                                                                 │
-│     ▼                                                           │
-│   GraphBuilderStage                                             │
-│     ├─ 1 node per entity (in graph_nodes_v5)                    │
-│     ├─ Edges: NEAR / SHARES_ENDPOINT / INSIDE / ATTRIB_OF       │
-│     └─ Cable / terminal / loop STRING INDICES (for fast lookup)  │
-│                                                                 │
-│     ▼                                                           │
-│   cable.db (SQLite)                                             │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-
-Viewer (separate process, port 8003):
-
-GET /                        — minimal HTML page
-GET /api/cables              — list every cable (string index)
-GET /api/cable/{id}          — on-demand graph traversal: terminal/loop
-                              associations for this cable via 3-hop BFS
-GET /api/document/{hash}     — document metadata
-GET /api/document/{hash}/file — raw DWG (browser downloads)
-
-**Viewer text search (V6.6.5):**
-GET /api/search-text?q=xxx  — fuzzy search across ALL DWG text entities
-                            (TEXT/ATTRIB), returned grouped by document
-UI checkbox "全文搜索" in 图纸 tab enables this mode
-```
-
-**Source-agnostic IR.** PDF support is V5 P1; DWG is the V5 P0 focus
-because DWG geometry is the actual data (lines, connections, blocks,
-layers, coordinates, topology) that OCR can never recover.
-
-**Graph IS the data.** The viewer never builds full topology at scan
-time — it traverses the graph on demand when the user clicks a cable
-(see `tools.cable_match_viewer/store.py:CableViewer._traverse_cable_neighborhood`).
+Key change from V5/V6: V7.0 replaces all V6 fallback methods (icon y-bucket, geometry U-top tracing, circle search, endpoint fallback, icon grouping, text y-bucket) with a single `_cabinet_path_trace()` algorithm that uses cabinet vertical edges as references for horizontal bus detection.
 
 ## Layout
 
@@ -88,18 +38,17 @@ time — it traverses the graph on demand when the user clicks a cable
     - `document.py` — Document, DocumentType
   - `loaders/` — DWGLoader (dwgread -O JSON + ezdxf fallback)
   - `pipeline/` — Context + Stage + Pipeline
-  - `graph/` — V5 DocumentGraph
-    - `types.py` — GraphNode, GraphEdge, DocumentGraph (with
-      indices: by_type, by_layer, neighbors, in_neighbors, nodes_within)
-    - `spatial.py` — uniform-grid spatial index for radius queries
-    - `builder.py` — `GraphBuilderStage` (the V5 centerpiece)
+  - `graph/` — V7.0 TopologyStage (replaces V5 GraphBuilderStage)
+    - `builder.py` — `TopologyStage` + `CircuitLoopAnalyzer` with `_cabinet_path_trace`
+    - `cabinet.py` — `CabinetRegionAnalyzer` + `CabinetGridIndex`
+    - `types.py` — Legacy DocumentGraph (kept for reference)
+    - `spatial.py` — Legacy spatial index (kept for reference)
   - `storage/` — single `cable.db` (CableStore + ensure_schema)
 - `tools/cable_match_viewer/` — V5 minimal viewer
   - `server.py` — aiohttp app (one file, ~250 lines including HTML)
   - `store.py` — read-only CableViewer facade (does on-demand graph traversal)
-- `docs/cable_engine_architecture.md` — V4 architecture reference
-  (kept for history; V5 supersedes it). See `docs/v5_architecture.md`
-  (TODO when written) for the new doc.
+- `docs/cable_engine_architecture.md` — V7.0 architecture reference
+- `docs/cable_engine_architecture_zh.md` — V7.0 architecture reference (中文)
 
 ## Registered tools
 
@@ -135,7 +84,6 @@ time — it traverses the graph on demand when the user clicks a cable
 
 - `http_server.py` — older standalone version of `text-sync`, no `main()`, not wired into the CLI.
 - `src/main.py` — older version of `docx-merger`, not wired into the CLI.
-- `docs/cable_engine_architecture.md` — V4 architecture doc (superseded by V5 but kept for history).
 - Other `docs/*` — reference material (React/TS snippets), not project docs.
 
 ## Code graph
@@ -157,57 +105,17 @@ After meaningful code changes, refresh the index (verify the exact subcommand wi
 - Each tool uses `argparse` and is independently runnable (`python tools/<name>/...`).
 - `myenv/`, `myenv312/`, `__pycache__/`, `*.pyc`, `*.docx`, `cable.db*` are gitignored.
 
-## Progress
-
-### Done
-- **V5 big-bang release** (replaces V4 cable_engine/rules + match + stages + V4 viewer):
-  - **Unified Document IR** — `cable_engine/ir/` with `Document`, `TextEntity`, `LineGeometry`, `CircleGeometry`, `ArcGeometry`, `BlockRef`, `AttributeEntity`. DWG Loader emits all of them via dwgread -O JSON.
-  - **DocumentGraph as first-class artifact** — `cable_engine/graph/types.py:DocumentGraph` with pre-built indices (`by_type`, `by_layer`, neighbors, spatial).
-  - **V5 SQLite schema** — `documents`, `cables`, `terminals`, `cable_topology`, `terminal_strips`, `scan_state`. V4 tables removed.
-  - **V5 minimal viewer** (`tools/cable_match_viewer/`) — two-pane UI (cable list + cable detail) + bottom file preview. On-demand graph traversal at query time.
-  - **Python 3.12** baseline (`myenv312/`).
-- **V6.5.1 DocumentClassifier** — 7 business types (circuit_loop, terminal_strip, cable_schedule, protection_diagram, panel_layout, monitoring_system, unknown). Coverage 246 → 447 docs (+82%). `_ANALYZERS_BY_TYPE` dict dispatches per type.
-- **V6.5.2 fixes** — shared-bus fix (WS y vs line y), gap-split fix (only when right_of_ws empty), x-distance tiebreaker, bucket widened ±2 → ±5 keys.
-- **V6.5.3 NO-tag ownership filter** — pre-compute closest/2nd-closest WS distances per NO tag; 200-unit share threshold. Resolves 11037-387 cores 3-4 (X4:26-27 / VI:7-8) and 11037-384 cores 1-4 (X4:20-23 / VI:1-4).
-- **V6.6 Cabinet Semantic Layer** (8 phases + V6.6.1/2 refinements):
-  - **V6.6.1 — DWG linetype extraction** — `DWGLoader` reads `ltype` handle + `ltype_flags` from dwgread JSON; resolves via LTYPE_CONTROL.entries + LTYPE object list (positional pairing).
-  - **V6.6.2 — CabinetRegionAnalyzer** (`cable_engine/graph/cabinet.py`) — detects dashed-rectangle boundaries using `ltype ∈ {ACAD_ISO10W100, HIDDEN, DASHED}` + 4-corner axis-aligned check.
-  - **V6.6.3 — name matching** — pairs each boundary with the nearest `EquName`/`EQUNAME` text above; sample names: `11003.ZXW-3号主变110kV电压互感器端子箱`, `42F-主变及无功继电器小室同步向量采集柜`, `4G-500kV第7串断路器测控柜`.
-  - **V6.6.4 — containment** — `assign_terminals_to_cabinets()` maps NO/ObjTerm.Name ATTRIBs to smallest enclosing cabinet bbox.
-  - **V6.6.5 — schema + persistence** — `cabinets` + `cabinet_terminals` tables; `TopologyStage` runs cabinet analysis BEFORE the analyzer and persists at the end.
-  - **V6.6.6 — IR + GraphNode** — `CabinetRegion` is now a first-class IR entity; `NodeType.CABINET`, `EdgeType.CONTAINS` added.
-  - **V6.6.7 — viewer APIs** — `/api/cabinets`, `/api/cabinet/{id}`, plus `get_document_topology()` now includes `cabinet_regions[]` for the cabinet-aware 图纸 tab.
-  - **V6.6.8 (Phase 8) — cabinet-restricted terminal search** — REMOVED in V6.6.1 because legitimate cross-cabinet wire pairs were being filtered out. Example: D0210-15 has WS `11003-311(1)` at x=286 (in cab_002); its left terminal `21CD:1` at x=186 is in cab_001 — different cabinet from the WS, but legitimately the wire's left endpoint. Filter rejected it → empty terminal.
-  - **V6.6.1 fix**: cabinet id collision (`cab_001` collision across docs) — fixed by prefixing with `doc.content_hash[:12]`. Also: removed Phase 8 cabinet bbox gate from terminal bucket; V6.5.3's 200-unit distance threshold is sufficient for noise removal. Spatial cabinet data still used for cabinet_name lookups (V6.6 spatial → V6.5 text-search fallback).
-- **V6.6.2 same-side cabinet constraint** — re-introduces cabinet filter on terminal pairing at a different granularity: per-cable per-side, NOT per-WS. Two user axioms for 回路图:
-  - Every terminal on the LEFT (or RIGHT) of a single cable's WS belongs to the same cabinet.
-  - WS itself is sandwiched between the two endpoint cabinets and belongs to neither.
-  Implementation tracks `left_side_cabinet` / `right_side_cabinet` separately per cable. Once the first core finds a terminal on a side, subsequent cores' same-side candidates must be in the same cabinet (or unknown-cabinet, see V6.6.2b). Two subtleties:
-  - **Gap-split aware**: in the gap-split branch (no right-side tags), the cabinet filter is applied SEPARATELY to `local_side` and `remote_side` after the split, NOT on the raw `left_of_ws` pool. Otherwise a left-cabinet filter would wrongly drop candidates that are actually right-side terminals in a different cabinet (e.g. 11003-381 core 5 at x=449 has X1:10 in `left_of_ws` at x=429).
-  - **V6.6.2b tolerance**: a candidate whose cabinet is UNKNOWN (`_ws_in_cabinet` returns None because the point sits in a geometric gap between detected cabinet bboxes) is ACCEPTED, not filtered. V6.6 detection is geometrically imperfect — terminal labels often sit in narrow gaps between adjacent cabinet rectangles (e.g. X5:8 at y=156 sits 9 units above cab_007's top edge). Filtering those candidates would falsely reject valid terminals; accepting them is safer per user preference "empty > wrong" (we don't know which outcome is "wrong" so accept).
-  - Results on D0210-{15,16,35,36} (202 cable-core rows): only 1 regression (3B-380 core 1's `remote='IV:31'` filtered because core 4's `remote='III:28'` is in a different V6.6-detected cabinet). This is a user axiom-1 violation (3B-380 physically connects to multiple cabinets on the same side: `11037.MC` and `11003.ZXW`). All V6.5.3 noise fixes preserved (11037-387 cores 3-4 X4:26-27/VI:7-8, 11037-384 cores 1-4 X4:20-23/VI:1-4).
-
-### In Progress
-- (none currently)
-
-### Done (this session)
-- **V6.6.3 Cabinet viewer UI** — 柜体 tab now shows all detected cabinets grouped by document, with search/filter by name/location/path. Clicking a cabinet opens detail in the right panel (cabinet info, bbox, contained terminals table, boundary vertices). "在图纸中查看" button opens the document in Flyfish CAD viewer, zoomed to the cabinet's bbox (3x scale), with an SVG overlay showing the dashed boundary (red dashed line) and terminal markers (green circles with labels). The overlay is cleared when the Flyfish modal is closed. Known limitation: overlay position is calculated once on open and does not update on pan/zoom (reopen to refresh).
-- **V6.6.4 Anonymous block expansion (BLOCK_HEADER-based)** — rewrote `DWGLoader._parse_v5` to use BLOCK_HEADER entity lists instead of BLOCK/ENDBLK nesting. Added `_build_block_header_entity_map`, `_build_block_name_handle_map`, `_json_handle_value`. Three-phase approach: Phase 1 filters model-space entities normally; Phase 2 buffers entities whose handle is in a non-Model_Space BLOCK_HEADER's `entities` array; Phase 3 resolves INSERT → BLOCK entity → BLOCK_HEADER, then emits buffered entities with coordinate transform. Also: `_emit_anonymous_block` accepts `base_pt`; `_emit_transformed_block` skips ATTDEF; `json.dumps` calls use `indent=2` to maintain compatibility with newline-based JSON helpers (`_json_int`, `_json_str`, `_json_first_float`). Result: D0210-16.dwg now detects 16 cabinets (up from 0 at same x-positions), including previously-missing 3B.DZX at x≈50, x≈290, and x≈805.
-- **TEXT/ATTRIB anonymous block verification** — tested D0210-35/D0210-38; ATTRIB entities (e.g. `110351-311`, `GY6-136`) are emitted by dwgread as standalone objects with model-space coordinates, NOT as BLOCK_HEADER child entities. The loader already handles them correctly. The AGENTS.md "BLOCK_HEADER expansion is geometric-only" known issue was incorrect — TEXT/ATTRIB inside anonymous blocks are already captured.
-- **Nested anonymous block issue identified** — anonymous blocks `*U16`/`*U23` contain INSERT references to other blocks; `_emit_transformed_block` skips INSERT entities (line 277 `if e.entity_type == 'INSERT': continue`). This prevents nested content from appearing. However, in D0210-35/D0210-38 the nested blocks only contain LWPOLYLINE (no TEXT), so this doesn't cause text loss. Not fixing unless a document with nested TEXT is found.
-- **CableScheduleAnalyzer enhanced** — `cable_engine/graph/builder.py` `CableScheduleAnalyzer` upgraded from stub to full table parser: `_parse_table()` groups rows by Y-coordinate (`_ROW_TOL=3.0`), sorts columns by X, matches Chinese headers (`电缆编号/起点/终点/芯数/回路/备注/柜体` via `_HEADERS` and `_HEADER_PATTERNS`), extracts data rows. Falls back to cable ID extraction if table parsing fails.
-- **Viewer text search** — `cable_engine/storage/sqlite.py`: new `text_entities` table (`document_hash, text, entity_type, x, y`); `bulk_upsert_text_entities()`, `search_text()` (LIKE fuzzy), `delete_text_entities_for_document()`. `TopologyStage.run()` persists TextEntity/AttributeEntity text at scan end. `/api/search-text?q=xxx` endpoint returns results grouped by document. UI checkbox "全文搜索" in 图纸 tab — when checked, search hits `/api/search-text` and shows matched documents with snippet count + top-3 summaries.
 
 ### Known Issues
-- **Nested anonymous block INSERT skipping** — `_emit_transformed_block` (`builder.py:277`) skips INSERT entities; anonymous blocks containing INSERT→other-block references have those nested entities dropped. So far only LWPOLYLINE content is missing (no TEXT loss in tested docs). Fix requires recursive expansion.
 - **V5 P0 only handles DWG**, not PDF. The PDF Loader exists but the pipeline skips it. PDF support returns in V5 P1 when the IR + GraphBuilder are extended for OCR-detected text.
 - **`3T-YW` cable label not in `cables` index** — only `3T-YW-B+` / `3T-YW-B-` / `3T-YW-C+` / `3T-YW-C-` (the per-core labels) appear as TEXT entities. The bare `3T-YW` label is inside an anonymous block. V5's pattern (`[A-Za-z0-9]{2,8}-[A-Za-z0-9]{1,8}`) is correctly stricter than V4's, so this is correct behavior, not a bug.
 - **Loop index over-matches** — `M1` / `M2` / `10D` / `-OF-12` are classified as loops because they match the broad `_LOOP_TEXT_PATTERN`. Better filtering (reject `M\d+`, `-…`, etc.) is a future tightening; doesn't affect the cable↔terminal chain that the viewer renders.
+- **Short bus segments** — when the horizontal bus line does not span the full distance, the far-side terminal may not be found (lies beyond x_tol).
 
 ### Next Steps
-- **V6.7 WireTracer** — now that V6.6 gives us Cabinet containment as a spatial index, run DFS for wire tracing INSIDE cabinet bboxes (not the whole document). Reduces search complexity and false-positive rate.
-- **Full repo scan** — run `cable_engine.cli scan` on the full Shengli repo to populate `text_entities` table for all 447+ docs; validate text search performance.
+- **Full repo scan** — run `cable_engine.cli scan` on the full Shengli repo to validate V7.0 results at scale.
+- **Improve bus detection** — handle WS columns other than x=-349.3 (the only column where `_cabinet_path_trace` currently finds bus lines in 30-unit range).
+- **Handle short bus segments** — when only a short segment is detected, relax x_tol or trace the neighbor cabinet.
 - **PDF support (V5 P1)** — add `RasterizeStage` (PDF → PNG) and `OcrStage` (PNG → TextEntity via Tesseract/PaddleOCR). Reuse the V5 GraphBuilder + viewer.
 - **Knowledge merge (V5 P2)** — `knowledge_nodes` / `knowledge_sources` / `knowledge_edges` tables for cross-document "Cable B3-463 ↔ Terminal X4:3 ↔ Cabinet XX01" queries. Stubbed in the schema but not implemented.
-- **Larger batch test** — run on a directory of 1000+ DWG files to validate performance (current: ~3-5s per file on Mac M1; 89 D0202 files completed in 55s).
 - **Tighten loop-id regex** — exclude `M\d+`, `-prefix`, `DK\d+`, `M\d+`, block-name candidates from the loop index.

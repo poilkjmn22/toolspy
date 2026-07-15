@@ -72,6 +72,9 @@ def _classify_document(path: str, doc: Optional[Document] = None) -> str:
 # ---------------------------------------------------------------------------
 # Geometry helpers (used by TerminalStripAnalyzer)
 # ---------------------------------------------------------------------------
+
+
+
 _CORRIDOR = 3.0
 
 
@@ -441,22 +444,252 @@ class CircuitLoopAnalyzer:
             return f"{location}-{cab_name}"
         return cab_name
 
+    # ------------------------------------------------------------------
+    # V6.7 Geometry path tracing — finds terminals by following 90° wire
+    # paths from the WS position along the U-top, ray-casting for
+    # terminal circles and ignoring cabinet-boundary crossings.
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _nearest_tag_near(
+        tx: float, ty: float,
+        no_tags_by_y: dict[int, list[tuple[float, float, str, str]]],
+        side: str, ws_x: float,
+        y_range: int = 30,
+        x_tol: float = 50.0,
+    ) -> Optional[tuple[float, float, str, str]]:
+        """Find the nearest terminal text tag near position (tx, ty).
+
+        Searches ±y_range keys (±15 y-units with default 2x key)* and
+        returns the closest NO tag within x_tol of tx. Only returns tags
+        on the correct side of wx.
+        """
+        best: Optional[tuple[float, float, str, str]] = None
+        best_dist = float('inf')
+        key = round(ty * 2)
+        for dk in range(-y_range, y_range + 1):
+            for tag in no_tags_by_y.get(key + dk, []):
+                tag_x, tag_y, tag_val, tag_type = tag
+                if ':' not in tag_val:
+                    continue
+                if side == 'left' and tag_x >= ws_x:
+                    continue
+                if side == 'right' and tag_x <= ws_x:
+                    continue
+                dx = abs(tag_x - tx)
+                if dx >= x_tol:
+                    continue
+                dist = dx * dx + (tag_y - ty) * (tag_y - ty)
+                if dist < best_dist:
+                    best_dist = dist
+                    best = tag
+        return best
+
+    @staticmethod
+    def _find_terminal_icon(
+        x: float, y: float,
+        circles_by_y: dict[int, list[tuple[float, float, float]]],
+        terminal_icons_by_y: dict[int, list[tuple[float, float, str]]],
+        max_dist: float = 2.0,
+    ) -> tuple[float, float, bool]:
+        """Check for a terminal icon (CircleGeometry or TERNO/BL/BR) near (x,y).
+
+        Returns (icon_x, icon_y, found).
+        """
+        best_dist = max_dist
+        best_x, best_y = x, y
+        found = False
+        key = round(y * 2)
+        for dk in range(-4, 5):
+            for cx, cy, cr in circles_by_y.get(key + dk, []):
+                d = abs(cx - x) + abs(cy - y)
+                if d < best_dist:
+                    best_dist = d
+                    best_x, best_y = cx, cy
+                    found = True
+        for dk in range(-4, 5):
+            for ix, iy, itag in terminal_icons_by_y.get(key + dk, []):
+                d = abs(ix - x) + abs(iy - y)
+                if d < best_dist:
+                    best_dist = d
+                    best_x, best_y = ix, iy
+                    found = True
+        return best_x, best_y, found
+
+    @staticmethod
+    def _cabinet_path_trace(
+        wx: float, wy: float,
+        cabinets: list[dict],
+        core_lines: list[dict],
+        core_ys: list[float],
+        circles_by_y: dict[int, list[tuple[float, float, float]]],
+        terminal_icons_by_y: dict[int, list[tuple[float, float, str]]],
+        no_tags_by_y: dict[int, list[tuple[float, float, str, str]]],
+        verticals: list[dict],
+        side: str,
+    ) -> Optional[tuple[float, float, str, str]]:
+        """Cabinet-based path tracing to find a terminal for the given side.
+
+        Algorithm:
+        1. Find horizontal wires near wy that cross a cabinet vertical edge
+        2. Trace the wire endpoint (side opposite the cabinet) to find
+           a terminal icon (CircleGeometry or TERNO/BL/BR ATTRIB)
+        3. If no icon at the direct endpoint, follow 90° turns (vertical
+           segment → horizontal segment) looking for the terminal icon
+        4. Find the nearest NO/ObjTerm.Name tag near the terminal icon
+        5. Return (x, y, text, tag_type) or None
+
+        Returns None when no terminal is found (caller records icon-only
+        or empty).
+        """
+        import bisect as _bisect
+
+        _Y_TOL = 30.0
+        _CROSS_TOL = 2.0
+        _ENDPOINT_TOL = 30.0  # max x-distance from WS to wire endpoint
+
+        lo = _bisect.bisect_left(core_ys, wy - _Y_TOL)
+        hi = _bisect.bisect_right(core_ys, wy + _Y_TOL)
+        near_lines = core_lines[lo:hi]
+        if not near_lines:
+            return None
+
+        # Collect cabinet vertical edges at this y-level
+        crossing_edges: list[float] = []
+        for c in cabinets:
+            b = c['bbox']
+            if not (b.y - 1 <= wy <= b.y + b.h + 1):
+                continue
+            if side == 'left' and b.x < wx:
+                crossing_edges.append(b.x + b.w)
+            elif side == 'right' and b.x + b.w > wx:
+                crossing_edges.append(b.x)
+
+        # Candidate selection — four-tier priority:
+        #   1. Spans wx AND crosses a cabinet edge
+        #   2. Endpoint near wx AND crosses a cabinet edge
+        #   3. Spans wx (no cabinet constraint)
+        #   4. Endpoint near wx (no cabinet constraint)
+        def _crosses_cabinet(cl: dict) -> bool:
+            return any(
+                cl['x_min'] - _CROSS_TOL <= ex <= cl['x_max'] + _CROSS_TOL
+                for ex in crossing_edges
+            )
+
+        best: Optional[dict] = None
+        best_dy = float('inf')
+        for cl in near_lines:
+            spans = cl['x_min'] <= wx <= cl['x_max']
+            near_end = (
+                abs(cl['x_min'] - wx) <= _ENDPOINT_TOL
+                or abs(cl['x_max'] - wx) <= _ENDPOINT_TOL
+            )
+            if not spans and not near_end:
+                continue
+            crosses = _crosses_cabinet(cl)
+            # Priority encoding: (w_cabinet, w_span, dy)
+            # Higher priority = more likely to serve as the correct wire.
+            score = (1 if crosses else 0, 1 if spans else 0, -abs(cl['y'] - wy))
+            if best is None:
+                best = cl
+                best_dy = abs(cl['y'] - wy)
+                best_score = score
+            elif score > best_score:
+                best = cl
+                best_dy = abs(cl['y'] - wy)
+                best_score = score
+
+        if best is None:
+            return None
+
+        # Wire endpoint on the specified side
+        ep_x = best['x_min'] if side == 'left' else best['x_max']
+        ep_y = best['y']
+
+        # Find terminal icon at or near the endpoint
+        icon_x, icon_y, icon_found = CircuitLoopAnalyzer._find_terminal_icon(
+            ep_x, ep_y, circles_by_y, terminal_icons_by_y,
+        )
+
+        if not icon_found:
+            # Follow 90° turn: find a vertical segment at the endpoint
+            vert: Optional[dict] = None
+            for v in verticals:
+                if abs(v['x'] - ep_x) > 0.5:
+                    continue
+                if not (v['y1'] - 0.5 <= ep_y <= v['y2'] + 0.5):
+                    continue
+                at_endpoint = (
+                    abs(ep_y - v['y1']) <= 0.5 or abs(ep_y - v['y2']) <= 0.5
+                )
+                if not at_endpoint:
+                    continue
+                vert = v
+                break
+
+            if vert is not None:
+                # Follow vertical to its other end
+                other_y = (
+                    vert['y1'] if abs(vert['y2'] - ep_y) <= 0.5
+                    else vert['y2']
+                )
+                icon_x, icon_y, icon_found = CircuitLoopAnalyzer._find_terminal_icon(
+                    vert['x'], other_y, circles_by_y, terminal_icons_by_y,
+                )
+
+                if not icon_found:
+                    # Check for a horizontal segment at the vertical's other end
+                    hlo = _bisect.bisect_left(core_ys, other_y - 0.5)
+                    hhi = _bisect.bisect_right(core_ys, other_y + 0.5)
+                    for cl in core_lines[hlo:hhi]:
+                        if abs(cl['y'] - other_y) > 0.5:
+                            continue
+                        if not (cl['x_min'] <= vert['x'] <= cl['x_max']):
+                            continue
+                        h_ep = cl['x_min'] if side == 'left' else cl['x_max']
+                        icon_x, icon_y, icon_found = (
+                            CircuitLoopAnalyzer._find_terminal_icon(
+                                h_ep, other_y, circles_by_y,
+                                terminal_icons_by_y,
+                            )
+                        )
+                        break
+
+        if icon_found:
+            tag = CircuitLoopAnalyzer._nearest_tag_near(
+                icon_x, icon_y, no_tags_by_y, side, wx,
+            )
+            if tag is not None:
+                return tag
+            return (icon_x, icon_y, '', 'ICON_ONLY')
+
+        tag = CircuitLoopAnalyzer._nearest_tag_near(
+            ep_x, ep_y, no_tags_by_y, side, wx,
+        )
+        if tag is not None:
+            return tag
+        return None
+
     def analyze(self, doc: Document) -> list[dict]:
         attribs: list[dict] = []
         for e in doc.entities:
-            if isinstance(e, (AttributeEntity, TextEntity)):
-                cf = getattr(e, 'custom_fields', None) or {}
-                x = cf.get('x')
-                y = cf.get('y')
-                if x is None or y is None:
-                    continue
-                tag = e.tag if isinstance(e, AttributeEntity) else ''
-                attribs.append({
-                    'tag': tag,
-                    'val': (e.text or '').strip(),
-                    'x': x,
-                    'y': y,
-                })
+            if not isinstance(e, (AttributeEntity, TextEntity)):
+                continue
+            # Skip low-confidence entities (block-local text from
+            # Phase 2b expansion — coordinates are not in model space).
+            if e.confidence < 0.5:
+                continue
+            cf = getattr(e, 'custom_fields', None) or {}
+            x = cf.get('x')
+            y = cf.get('y')
+            if x is None or y is None:
+                continue
+            tag = e.tag if isinstance(e, AttributeEntity) else ''
+            attribs.append({
+                'tag': tag,
+                'val': (e.text or '').strip(),
+                'x': x,
+                'y': y,
+            })
 
         # V6.6: cabinet-region index from CabinetRegion IR entities
         # (TopologyStage populates them BEFORE invoking us). When the
@@ -505,10 +738,32 @@ class CircuitLoopAnalyzer:
                     core = int(m.group(2))
                     if cid not in cable_cores:
                         cable_cores[cid] = {}
-                    cable_cores[cid][core] = {
-                        'x': a['x'],
-                        'y': a['y'],
-                    }
+                    if core not in cable_cores[cid]:
+                        cable_cores[cid][core] = {
+                            'x': a['x'],
+                            'y': a['y'],
+                        }
+
+        # Collect cabinet boundary handles + bbox edges so we can
+        # filter them out of core_lines. Cabinet boundary edges at
+        # the WS y-level act as fake U-tops — the path tracer follows
+        # them (no terminals) and returns None for both sides.
+        _cab_handles: set[str] = set()
+        _cab_y_edges: list[tuple[float, float, float]] = []
+        for _ce in doc.entities:
+            if not isinstance(_ce, _CabReg_pre):
+                continue
+            if _ce.bbox is None:
+                continue
+            if _ce.boundary_handle:
+                _cab_handles.add(_ce.boundary_handle)
+            _cab_y_edges.append(
+                (_ce.bbox.y, _ce.bbox.x, _ce.bbox.x + _ce.bbox.w)
+            )
+            _cab_y_edges.append(
+                (_ce.bbox.y + _ce.bbox.h, _ce.bbox.x,
+                 _ce.bbox.x + _ce.bbox.w)
+            )
 
         # Pre-scan: collect horizontal LINE/LWPOLYLINE for core-line detection.
         # V6.7: pre-sort by y so each per-core search is O(log L + window)
@@ -518,6 +773,8 @@ class CircuitLoopAnalyzer:
         for e in doc.entities:
             if not isinstance(e, LineGeometry):
                 continue
+            if e.handle in _cab_handles:
+                continue  # skip cabinet boundary LWPOLYLINE
             pts = list(e.points or [])
             if len(pts) < 2:
                 continue
@@ -525,64 +782,83 @@ class CircuitLoopAnalyzer:
             xs = [p.x for p in pts]
             if max(ys) - min(ys) > 3:
                 continue
+            dx = max(xs) - min(xs)
+            dy = max(ys) - min(ys)
+            if dx > 2 and dy > 2:
+                continue  # skip short diagonal annotations
+            # Skip horizontal lines that match a cabinet bbox top or
+            # bottom edge in both y and x-span. Catches cases where
+            # the cabinet boundary is drawn as 4 separate LINE entities
+            # (each edge a 2-point LINE, not a single LWPOLYLINE).
+            _cl_y = ys[0]
+            _cl_xmin = min(xs)
+            _cl_xmax = max(xs)
+            _is_cab_edge = False
+            for _ey, _ex_min, _ex_max in _cab_y_edges:
+                if abs(_cl_y - _ey) > 0.5:
+                    continue
+                if abs(_cl_xmin - _ex_min) > 2:
+                    continue
+                if abs(_cl_xmax - _ex_max) > 2:
+                    continue
+                _is_cab_edge = True
+                break
+            if _is_cab_edge:
+                continue
             core_lines.append({
-                'y': ys[0],
-                'x_min': min(xs),
-                'x_max': max(xs),
+                'y': _cl_y,
+                'x_min': _cl_xmin,
+                'x_max': _cl_xmax,
             })
         core_lines.sort(key=lambda cl: cl['y'])
         _core_ys = [cl['y'] for cl in core_lines]
 
+        # V6.7: Pre-compute circles_by_y and verticals for geometry path tracing.
+        circles_by_y: dict[int, list[tuple[float, float, float]]] = {}
+        verticals: list[dict] = []  # {x, y1, y2} sorted by x
+        for e in doc.entities:
+            if isinstance(e, CircleGeometry):
+                c = e.center
+                if c is not None:
+                    key = round(c.y * 2)
+                    circles_by_y.setdefault(key, []).append(
+                        (c.x, c.y, e.radius or 1.0)
+                    )
+            elif isinstance(e, LineGeometry):
+                pts = list(e.points or [])
+                if len(pts) < 2:
+                    continue
+                xs = [p.x for p in pts]
+                ys = [p.y for p in pts]
+                dx = max(xs) - min(xs)
+                dy = max(ys) - min(ys)
+                if dx < 0.5 and dy > 5:  # near-vertical, substantial span
+                    verticals.append({
+                        'x': (xs[0] + xs[-1]) / 2,
+                        'y1': min(ys),
+                        'y2': max(ys),
+                    })
+        verticals.sort(key=lambda v: v['x'])
+
         # Group NO tags and cable-level ATTRIB by y position.
-        # Store (x, y, val, tag) tuples so we know the tag type for the
-        # XB-ownership filter (ObjTerm.Name tags can only be claimed by
-        # the WS closest to them at the same y).
         no_tags_by_y: dict[int, list[tuple[float, float, str, str]]] = {}
         cable_attribs: dict[str, list[dict]] = {}
-        # WireSerial x positions grouped by y-key, used by the
-        # ObjTerm.Name ownership filter below.
-        ws_x_by_y: dict[int, set[float]] = {}
+        # Terminal ICON positions (TERNO/BL/BR with empty text) grouped
+        # by y-key. These mark the physical icon location.
+        terminal_icons_by_y: dict[int, list[tuple[float, float, str]]] = {}
+        _TERMINAL_LABEL_RE = re.compile(r'^[A-Za-z0-9]+:[A-Za-z0-9]+$')
         for a in attribs:
             if a['tag'] in ('NO', 'ObjTerm.Name') and ':' in a['val']:
                 key = round(a['y'] * 2)
                 no_tags_by_y.setdefault(key, []).append((a['x'], a['y'], a['val'], a['tag']))
+            elif not a['tag'] and _TERMINAL_LABEL_RE.match(a['val']):
+                key = round(a['y'] * 2)
+                no_tags_by_y.setdefault(key, []).append((a['x'], a['y'], a['val'], 'NO'))
+            elif a['tag'] in ('TERNO', 'BL', 'BR') and not a['val']:
+                key = round(a['y'] * 2)
+                terminal_icons_by_y.setdefault(key, []).append((a['x'], a['y'], a['tag']))
             elif a['tag'] in ('WireDescription', 'LoopCode', 'WIRECODE'):
                 cable_attribs.setdefault(a['tag'], []).append(a)
-            elif a['tag'] == 'WireSerial':
-                key = round(a['y'] * 2)
-                ws_x_by_y.setdefault(key, set()).add(a['x'])
-
-        # V6.5.3: Pre-compute NO tag ownership — for every NO tag,
-        # store (closest_ws_dist, second_closest_ws_dist) across all
-        # WSs at the same y-bucket. Tags where the 2nd-closest WS is
-        # within _NO_TAG_SHARE_DISTANCE are "shared" between the
-        # closest and 2nd-closest WSs (e.g. VI:1 between 11037-384
-        # and 11003-387). Tags with a far-away 2nd-closest WS are
-        # owned exclusively by their closest WS (e.g. X5:7 from
-        # 11037-383, X4:20 owned by 11037-384 only). This filter
-        # prevents the gap-split from picking noise tags like X5:7
-        # / III:29 when 3 WSs share the same row (e.g. 11037-387
-        # cores 3-4 in D0210-16, where the noise tags are ~600
-        # units from the target WS but only ~50 units from another
-        # WS in the row).
-        _NO_TAG_SHARE_DISTANCE = 200.0
-        no_tag_ownership: dict[tuple[float, float, str], tuple[Optional[float], Optional[float]]] = {}
-        for tag_key, tag_list in no_tags_by_y.items():
-            for tag in tag_list:
-                tx, ty, tval, ttype = tag
-                if ttype != 'NO':
-                    continue
-                closest_d: Optional[float] = None
-                second_d: Optional[float] = None
-                for dk in (-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5):
-                    for ws_x in ws_x_by_y.get(tag_key + dk, set()):
-                        d = abs(tx - ws_x)
-                        if closest_d is None or d < closest_d:
-                            second_d = closest_d
-                            closest_d = d
-                        elif second_d is None or d < second_d:
-                            second_d = d
-                no_tag_ownership[(tx, ty, tval)] = (closest_d, second_d)
 
         records: list[dict] = []
         for cid in sorted(cable_cores.keys()):
@@ -593,24 +869,6 @@ class CircuitLoopAnalyzer:
             # Compute once using the first core that has valid terminals.
             cabinet_local: Optional[str] = None
             cabinet_remote: Optional[str] = None
-            # V6.6.2: per-cable per-side cabinet tracking. Two facts:
-            #   1. Every terminal on a given side (LEFT or RIGHT of WS)
-            #      of a cable belongs to the same cabinet.
-            #   2. WS itself is "sandwiched between" the two cabinets
-            #      and does NOT belong to either one — it just connects
-            #      them. (This is why V6.6 Phase 8's "WS in same cabinet
-            #      as terminal" gate was wrong: WS is in neither.)
-            # Once the first core finds a left/right terminal, the
-            # cabinet for that side is locked. Subsequent cores of the
-            # same cable on the same side must find their terminal in
-            # the SAME cabinet. This prevents the y-bucket search from
-            # picking up a left terminal from a neighboring cable when
-            # V6.5.3's 200-unit ownership threshold doesn't cleanly
-            # separate them (e.g. several cables on the same row whose
-            # left X4:N tags are all clustered within 200 units of
-            # each other in the same cabinet).
-            left_side_cabinet: Optional[str] = None
-            right_side_cabinet: Optional[str] = None
 
             for i, (core, info) in enumerate(core_order):
                 wx = info['x']
@@ -620,8 +878,7 @@ class CircuitLoopAnalyzer:
                 # within ±30mm of WireSerial y. Prefer a line that
                 # spans wx (typical WS-on-left layout); if none,
                 # fall back to the closest line in the core area
-                # (x_min >= 200 and span >= 50mm). V6.7: uses bisect
-                # to avoid scanning every core_line per core.
+                # (x_min >= 200 and span >= 50mm).
                 _CORE_LINE_TOLERANCE = 30.0
                 core_y = wy
                 best_cl: Optional[dict] = None
@@ -654,295 +911,27 @@ class CircuitLoopAnalyzer:
                                 best_cl = cl
                 core_line_x_min = best_cl['x_min'] if best_cl else None
                 core_line_x_max = best_cl['x_max'] if best_cl else None
-                # V6.5.2 fix: do NOT update core_y to the line's y.
-                # When multiple cores share a single bus line (e.g.
-                # 11003-381 cores 4-6 all connect to a y=355 bus),
-                # best_cl['y'] is the SAME for all of them, which
-                # caused every core to receive the SAME description
-                # (the one closest to the bus y). The
-                # WireDescription / LoopCode ATTRIBs are placed on
-                # each individual core's row at WS y, not the bus
-                # y, so the ATTRIB search MUST use wy (the WS y).
-                # (previously: `if best_cl is not None: core_y = ...`)
-                _ = core_y  # keep reference for any downstream code
+                _ = core_y  # keep reference
 
-                # Step 2: find NO tags by matching y position (same row).
-                # Terminals sit on both sides of the WireSerial in a
-                # [left terminal] [WS] [right terminal] layout.
-                # Pick the closest tag on each side of WS. When WS
-                # is at the far right (no tags to its right), use
-                # the largest x-gap in the bucket to separate local
-                # and remote terminal groups.
-                # V6.5.2: bucket widened from ±2 to ±5 keys (=±2.5mm
-                # instead of ±1mm) to catch shallow L-shape drops
-                # where the terminal sits a couple of mm below the
-                # WS row. Deeper L/Z-shapes still need V6.5.4.
-                # V6.5.3: ObjTerm.Name tags (XB column, past the line
-                # end inside anonymous blocks) are "owned" by the WS
-                # at the same y whose x is closest to the tag. This
-                # excludes the XB terminal from a left-side WS that
-                # shares the row with a right-side WS (e.g. 11037-384
-                # sharing y=395 with 11003-387: XB:2 belongs to
-                # 11003-387, not 11037-384). NO tags (X4:20, VI:1)
-                # remain shared between cables at the same y.
-                # V6.6 cabinet-restricted bucket (Phase 8): REMOVED in
-                # V6.6.1 because legitimate cross-cabinet wire pairs
-                # were being filtered out. Example: D0210-15 has WS
-                # `11003-311(1)` at x=286 (in cab_002); its left
-                # terminal `21CD:1` at x=186 is in cab_001 — a
-                # DIFFERENT cabinet from the WS, but legitimately the
-                # wire's left endpoint. The filter rejected 21CD:1,
-                # leaving the cable with an empty left terminal.
-                #
-                # V6.5.3's distance-based NO-tag ownership (200-unit
-                # share threshold) is sufficient for noise removal —
-                # when multiple WSs share a row, NO tags with both
-                # closest + 2nd-closest WS within 200 units are
-                # correctly marked as shared; tags with only one WS
-                # within 200 units are owned by that WS alone.
-                #
-                # The V6.6 spatial data is still used elsewhere:
-                # - cabinet_name / cabinet_name_remote lookups (more
-                #   reliable than the V6.5 _find_cabinet text search)
-                # - viewer UI cabinet-aware tabs
-                # - V6.6.2 same-side cabinet constraint (this section)
-                # - future V6.7 WireTracer
-                #
-                # V6.6.2 reintroduces a CABINET constraint — but per
-                # cable per side, NOT per WS. Per user axioms:
-                #   1. Every terminal on a given side (LEFT or RIGHT
-                #      of WS) of a cable belongs to the same cabinet.
-                #   2. WS is sandwiched between the two cabinets and
-                #      belongs to neither.
-                # So tracking is per-cable, per-side: the first core
-                # that finds a left terminal locks the cable's
-                # left-side cabinet id; subsequent cores of the same
-                # cable on the same side must have their terminals in
-                # that cabinet. This is implemented just below the
-                # `_tag_owned_by_current` filter (see the
-                # `if left_side_cabinet is not None and left_of_ws`
-                # block) and prevents the y-bucket from picking up a
-                # neighboring cable's left terminal when V6.5.3's
-                # 200-unit ownership threshold doesn't cleanly
-                # separate them. Empty records are preferred over
-                # wrong ones per user requirement.
-                key = round(wy * 2)
-                bucket_tags: list[tuple[float, float, str, str]] = []
-                for dk in (-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5):
-                    bucket_tags.extend(no_tags_by_y.get(key + dk, []))
-
-                # Collect every WS x position that lives in this y-bucket
-                # (a cable's WS at the same y belongs to the same row).
-                ws_x_at_y: set[float] = set()
-                for dk in (-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5):
-                    ws_x_at_y.update(ws_x_by_y.get(key + dk, set()))
-
-                def _tag_owned_by_current(
-                    tag_x: float, tag_y: float, tag_val: str, tag_type: str,
-                ) -> bool:
-                    """ObjTerm.Name tags (XB column, past line end): owned
-                    exclusively by the WS at this y whose x is closest
-                    to the tag.
-
-                    NO tags (X4:N, VI:N, etc.): shared between cables if
-                    both the closest WS and the 2nd-closest WS at the
-                    same y are within _NO_TAG_SHARE_DISTANCE of the tag
-                    (e.g. VI:1 between 11037-384 and 11003-387 at
-                    ~30 and ~120 units — both within 200 → shared).
-                    Otherwise the tag is owned exclusively by its closest
-                    WS (e.g. X4:20 has 2nd-closest WS at ~220 > 200,
-                    so 11003-387 cannot claim it; X5:7 has 2nd-closest
-                    at ~620 → only 11037-383 can claim it)."""
-                    if tag_type == 'ObjTerm.Name':
-                        if len(ws_x_at_y) <= 1:
-                            return True
-                        closest = min(ws_x_at_y, key=lambda w: abs(w - tag_x))
-                        return closest == wx
-                    # NO tag: use pre-computed ownership
-                    ownership = no_tag_ownership.get((tag_x, tag_y, tag_val))
-                    if ownership is None:
-                        return False
-                    closest_d, second_d = ownership
-                    if closest_d is None:
-                        return False
-                    current_d = abs(tag_x - wx)
-                    if second_d is not None and second_d <= _NO_TAG_SHARE_DISTANCE:
-                        # Shared between closest and 2nd-closest WSs
-                        return current_d == closest_d or current_d == second_d
-                    # Exclusive — only the closest WS can claim
-                    return current_d == closest_d
-
-                _MIN_GAP = 50.0
                 left_candidate: Optional[tuple[float, float, str, str]] = None
                 right_candidate: Optional[tuple[float, float, str, str]] = None
-                if bucket_tags:
-                    left_of_ws = [
-                        t for t in bucket_tags
-                        if t[0] < wx and _tag_owned_by_current(t[0], t[1], t[2], t[3])
-                    ]
-                    right_of_ws = [
-                        t for t in bucket_tags
-                        if t[0] > wx and _tag_owned_by_current(t[0], t[1], t[2], t[3])
-                    ]
 
-                    # V6.6.2: same-side cabinet constraint. Once any
-                    # core of this cable has established the cabinet
-                    # for the LEFT or RIGHT side, restrict subsequent
-                    # same-side terminal candidates to that cabinet.
-                    # Cross-side is unaffected (left cabinet != right
-                    # cabinet by user axiom 2), so cross-cabinet wire
-                    # pairs still match. The WS itself is OUTSIDE any
-                    # single cabinet (it's between the two endpoint
-                    # cabinets), which is why per-cable per-side is
-                    # the right granularity — not "WS's cabinet".
-                    #
-                    # When the side cabinet is unknown (first core, or
-                    # no terminal found on this side yet), no filter
-                    # is applied — fall through to the V6.5.3 closest-
-                    # ownership logic. This means:
-                    #   - The first core of every cable uses the
-                    #     existing V6.5.3 logic (no degradation).
-                    #   - Subsequent cores of the same cable get an
-                    #     extra cabinet filter on top of V6.5.3.
-                    #   - L/Z-shaped terminals at a different y
-                    #     (already unfindable by the ±5 y-bucket) get
-                    #     term=None — empty records are preferred
-                    #     over wrong ones per user requirement.
-                    #
-                    # IMPORTANT: the filter is applied per-side AFTER
-                    # the gap-split (in the gap-split branch), not on
-                    # the raw left_of_ws pool. Reason: in the gap-
-                    # split case, the same pool contains both LOCAL
-                    # (will become left) and REMOTE (will become
-                    # right) candidates. Filtering the whole pool
-                    # against `left_side_cabinet` would wrongly remove
-                    # candidates that are actually right-side terminals
-                    # in a different cabinet (e.g. core 5 of 11003-381
-                    # at x=449 has X1:10 in left_of_ws at x=429 — gap-
-                    # split promotes it to right, but a left-cabinet
-                    # filter on the raw pool would drop it).
-                    #
-                    # V6.6.2b tolerance: a candidate whose cabinet is
-                    # UNKNOWN (`_ws_in_cabinet` returns None because
-                    # it sits in a geometric gap between detected
-                    # cabinet bboxes) is ACCEPTED, not filtered. The
-                    # V6.6 cabinet detection is geometrically imperfect
-                    # — terminal labels often sit in narrow gaps
-                    # between two adjacent cabinet rectangles. Filtering
-                    # those candidates against a specific cabinet id
-                    # would falsely reject valid terminals (e.g.
-                    # 11003-383 core 4's X5:8 at y=156 sits 9 units
-                    # above cab_007's top edge and not in any other
-                    # cabinet). Accepting the unknown-cabinet candidate
-                    # is safer than rejecting it, per user preference
-                    # ("empty > wrong" — but here we don't know which
-                    # outcome is "wrong", so accept and let downstream
-                    # use it).
-                    def _passes_cab_filter(
-                        tag_x: float, tag_y: float, side_cab: Optional[str],
-                    ) -> bool:
-                        if side_cab is None:
-                            return True
-                        tag_cab = cabinet_grid.lookup(tag_x, tag_y)
-                        if tag_cab is None:
-                            # Cabinet detection didn't see this point.
-                            # Don't filter — accept.
-                            return True
-                        return tag_cab == side_cab
-                    if right_of_ws:
-                        # Standard layout: closest on each side.
-                        # Apply cabinet filter per-side on the already-
-                        # split left/right pools.
-                        if left_of_ws:
-                            left_of_ws = [
-                                t for t in left_of_ws
-                                if _passes_cab_filter(
-                                    t[0], t[1], left_side_cabinet,
-                                )
-                            ]
-                        if right_of_ws:
-                            right_of_ws = [
-                                t for t in right_of_ws
-                                if _passes_cab_filter(
-                                    t[0], t[1], right_side_cabinet,
-                                )
-                            ]
-                        if left_of_ws:
-                            left_candidate = min(
-                                left_of_ws, key=lambda t: abs(t[0] - wx)
-                            )
-                        if right_of_ws:
-                            right_candidate = min(
-                                right_of_ws, key=lambda t: abs(t[0] - wx)
-                            )
-                    else:
-                        # WS at far right: split left tags by largest
-                        # x-gap into a local cluster (closer to WS)
-                        # and a remote cluster (further away). Local
-                        # = left terminal; remote = right terminal.
-                        # V6.6.2: apply cabinet filters SEPARATELY to
-                        # local_side and remote_side (after the split),
-                        # not on the raw left_of_ws pool — see the
-                        # comment above for why.
-                        if len(left_of_ws) >= 2:
-                            st = sorted(left_of_ws, key=lambda t: t[0])
-                            mg = 0.0
-                            mg_idx = 0
-                            for j in range(1, len(st)):
-                                g = st[j][0] - st[j-1][0]
-                                if g > mg:
-                                    mg = g
-                                    mg_idx = j
-                            if mg >= _MIN_GAP:
-                                split_x = (st[mg_idx][0] + st[mg_idx-1][0]) / 2
-                                local_side = [t for t in st if t[0] <= split_x]
-                                remote_side = [t for t in st if t[0] > split_x]
-                                # Per-side cabinet filter
-                                if local_side:
-                                    local_side = [
-                                        t for t in local_side
-                                        if _passes_cab_filter(
-                                            t[0], t[1], left_side_cabinet,
-                                        )
-                                    ]
-                                if remote_side:
-                                    remote_side = [
-                                        t for t in remote_side
-                                        if _passes_cab_filter(
-                                            t[0], t[1], right_side_cabinet,
-                                        )
-                                    ]
-                                if local_side:
-                                    left_candidate = min(
-                                        local_side, key=lambda t: abs(t[0] - wx)
-                                    )
-                                if remote_side:
-                                    right_candidate = min(
-                                        remote_side, key=lambda t: abs(t[0] - split_x)
-                                    )
-                            else:
-                                # Gap too small to split: just pick
-                                # the closest left tag.
-                                left_candidate = min(
-                                    left_of_ws, key=lambda t: abs(t[0] - wx)
-                                )
-                        elif left_of_ws:
-                            left_candidate = min(
-                                left_of_ws, key=lambda t: abs(t[0] - wx)
-                            )
-
-                # V6.6.2: record side cabinet from the first terminal
-                # found on that side. Once established, it gates all
-                # subsequent same-side terminal searches for this cable.
-                # Only recorded when the candidate is non-None AND the
-                # side cabinet is still unknown (first core wins).
-                if left_candidate is not None and left_side_cabinet is None:
-                    left_side_cabinet = cabinet_grid.lookup(
-                        left_candidate[0], left_candidate[1],
+                # Cabinet-based path tracing (V7.0).
+                # Replaces all V6.5–V6.12 fallback methods with a single
+                # algorithm: find horizontal wires that cross cabinet
+                # vertical edges, trace endpoints to terminal icons,
+                # follow 90° turns, and find NO/ObjTerm.Name tags.
+                if left_candidate is None:
+                    left_candidate = CircuitLoopAnalyzer._cabinet_path_trace(
+                        wx, wy, v66_cabinets, core_lines, _core_ys,
+                        circles_by_y, terminal_icons_by_y, no_tags_by_y,
+                        verticals, 'left',
                     )
-                if right_candidate is not None and right_side_cabinet is None:
-                    right_side_cabinet = cabinet_grid.lookup(
-                        right_candidate[0], right_candidate[1],
+                if right_candidate is None:
+                    right_candidate = CircuitLoopAnalyzer._cabinet_path_trace(
+                        wx, wy, v66_cabinets, core_lines, _core_ys,
+                        circles_by_y, terminal_icons_by_y, no_tags_by_y,
+                        verticals, 'right',
                     )
 
                 left_terminal = left_candidate[2] if left_candidate else None
@@ -954,39 +943,31 @@ class CircuitLoopAnalyzer:
                 right_terminal_y = right_candidate[1] if right_candidate else None
 
                 # Step 2a: Cabinet detection — once per cable on the
-                # first core that has a valid terminal. V6.6.2:
-                # updated to accept ANY core with a valid terminal,
-                # not just i==0 (if core 1's left terminal was empty
-                # but core 2's wasn't, cabinet_local was previously
-                # stuck at None). V6.6: prefer the spatial cabinet
-                # lookup (the terminal position is inside a detected
-                # dashed-rectangle cabinet bbox → use its display
-                # name); fall back to the V6.5 text-search when no
-                # spatial cabinet covers the terminal.
-                if left_terminal_y is not None and cabinet_local is None:
+                # first core that has a valid terminal. Uses spatial
+                # cabinet lookup (terminal position inside a detected
+                # dashed-rectangle cabinet bbox → use its display name);
+                # falls back to text-search when no cabinet covers the
+                # terminal.
+                cab_lookup_x = left_terminal_x
+                cab_lookup_y = left_terminal_y
+                if cab_lookup_y is not None and cabinet_local is None:
                     cabinet_local = cabinet_grid.lookup_name(
-                        left_terminal_x, left_terminal_y,
+                        cab_lookup_x, cab_lookup_y,
                     ) or self._find_cabinet(
-                        left_terminal_x, left_terminal_y, attribs,
+                        cab_lookup_x, cab_lookup_y, attribs,
                     )
-                if right_terminal_y is not None and cabinet_remote is None:
+                right_cabinet_x = right_terminal_x
+                right_cabinet_y = right_terminal_y
+                if right_cabinet_y is not None and cabinet_remote is None:
                     cabinet_remote = cabinet_grid.lookup_name(
-                        right_terminal_x, right_terminal_y,
+                        right_cabinet_x, right_cabinet_y,
                     ) or self._find_cabinet(
-                        right_terminal_x, right_terminal_y, attribs,
+                        right_cabinet_x, right_cabinet_y, attribs,
                     )
 
                 # Step 3: circuit_desc/loop_id — find the nearest
                 # WireDescription and LoopCode ATTRIB to the cable's
                 # y range (scanning within 80mm y of wy).
-                # V6.5.2: ATTRIB search uses wy (WS y) instead of
-                # core_y (line y). The previous `core_y` was
-                # overwritten to the bus line's y when cores shared a
-                # bus, which collapsed all of them onto the same
-                # description (the one closest to the bus row).
-                # V6.5.2: x-distance to WS is used as a tie-breaker
-                # when multiple ATTRIBs at the same y belong to
-                # different cables' description columns.
                 circuit_desc = None
                 loop_id = None
                 for tag in ('WireDescription', 'LoopCode'):
@@ -1386,9 +1367,27 @@ class TopologyStage(Stage):
             ))
         if _cab_rows:
             self._store.bulk_upsert_cabinets(_cab_rows)
+        # Build set of terminal IDs actually used by cables, so we can
+        # filter out floating NO labels (e.g. TA3:N in 25G/24G protection
+        # cabinets) that are spatially inside a cabinet bbox but don't
+        # belong to any cable.
+        _used_terminal_ids: set[str] = set()
+        for rec in records:
+            strip = (rec.get('strip_name') or '')
+            tn = (rec.get('terminal_no') or '')
+            tnr = (rec.get('terminal_no_remote') or '')
+            if strip and tn:
+                _used_terminal_ids.add(f"{strip}:{tn}")
+            if tnr and tnr != 'None' and ':' in tnr:
+                # Remote terminal ID is already in combined format (e.g. "IV:31",
+                # "22ID:1"). Only add if it has a colon to avoid matching random
+                # bare numbers.
+                _used_terminal_ids.add(tnr)
         _ct_rows: list[tuple] = [
             (cab_id, doc.content_hash, tid, kind, x, y)
             for cab_id, tid, kind, x, y in cabinet_terminal_rows_pre
+            if kind not in ("NO", "ObjTerm.Name")
+               or tid in _used_terminal_ids
         ]
         if _ct_rows:
             self._store.bulk_upsert_cabinet_terminals(_ct_rows)
@@ -1478,7 +1477,7 @@ def _assign_cabinet_terminals(doc, cabinet_records) -> list:
         if not isinstance(ent, AttributeEntity):
             continue
         tag = getattr(ent, "tag", "") or ""
-        if tag not in ("NO", "ObjTerm.Name"):
+        if tag not in ("NO", "ObjTerm.Name", "TERNO", "BL", "BR"):
             continue
         cf = getattr(ent, "custom_fields", None) or {}
         x = cf.get("x")
@@ -1486,7 +1485,12 @@ def _assign_cabinet_terminals(doc, cabinet_records) -> list:
         if x is None or y is None:
             continue
         tid = (getattr(ent, "text", "") or "").strip()
-        if not tid or ":" not in tid:
+        if tag in ("TERNO", "BL", "BR"):
+            # Icon-only terminal: use a unique position-based ID
+            # even without text, so the cabinet containment check
+            # includes all terminal icons regardless of label status.
+            tid = tid or f'ICON_{tag}@{x:.0f}_{y:.0f}'
+        if not tid or (tag in ("NO", "ObjTerm.Name") and ":" not in tid):
             continue
         terminals.append((float(x), float(y), tid, tag))
 
