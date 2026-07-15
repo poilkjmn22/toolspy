@@ -8,6 +8,9 @@ stored in cable_topology. The viewer does a direct SQL lookup.
 
 Usage:
   python -m cable_engine.cli scan --input <dir> [--db <cable.db>]
+  python -m cable_engine.cli check-cable-cabinets --db <cable.db> [--output-dir <out>]
+  python -m cable_engine.cli group-by-cables --group-by-cables <xlsx> \\
+      --db <cable.db> [--output-dir <out>]
 """
 
 from __future__ import annotations
@@ -247,6 +250,376 @@ def cmd_scan(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# check-cable-cabinets
+# ---------------------------------------------------------------------------
+def cmd_check_cable_cabinets(args: argparse.Namespace) -> int:
+    """Export cable-cabinets.xlsx from cable.db.
+
+    Generates an XLSX with columns:
+      电缆编号, 电缆型号及截面,
+      cable_core_numbers, cable_core_cross_section,
+      cable_core_numbers2, cable_core_cross_section2,
+      起点, origin_cubicle, origin_device,
+      终点, terminal_cubicle, terminal_device,
+      序号
+
+    Each row corresponds to one cable (grouped by cable_id).
+    电缆型号及截面: for circuit_loop documents, found by spatial
+    lookup in text_entities — two TEXT blocks directly below the
+    cable_id label are concatenated.  Other doc types get empty.
+    """
+    try:
+        from openpyxl import Workbook
+    except ImportError:
+        print('ERROR: openpyxl is required. pip install openpyxl', file=sys.stderr)
+        return 1
+
+    db_path = Path(args.db).expanduser()
+    if not db_path.is_file():
+        print(f'ERROR: DB not found: {db_path}', file=sys.stderr)
+        return 1
+
+    if args.output_dir:
+        output_dir = Path(args.output_dir).expanduser().resolve()
+    else:
+        output_dir = db_path.parent
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_path = output_dir / 'cable-cabinets.xlsx'
+
+    conn = open_db(db_path, read_only=True)
+
+    # ── Phase 1: gather per-cable data ──
+    all_rows = conn.execute("""
+        SELECT cable_id, cabinet_name, cabinet_name_remote,
+               document_hash, source_type
+        FROM cable_topology
+        ORDER BY cable_id, conductor_no
+    """).fetchall()
+
+    if not all_rows:
+        print('No data found in cable_topology table', file=sys.stderr)
+        conn.close()
+        return 1
+
+    cables: dict[str, dict] = {}
+    cable_conductor_counts: dict[str, int] = {}
+    for r in all_rows:
+        cid = r['cable_id']
+        cable_conductor_counts[cid] = cable_conductor_counts.get(cid, 0) + 1
+        if cid in cables:
+            continue
+        cables[cid] = {
+            'cabinet_name': r['cabinet_name'] or '',
+            'cabinet_name_remote': r['cabinet_name_remote'] or '',
+            'cl_doc_hash': r['document_hash'] if r['source_type'] == 'circuit_loop' else None,
+        }
+
+    # ── Phase 2: load text_entities for circuit_loop documents only ──
+    import re
+    _CL_DOCS = {info['cl_doc_hash'] for info in cables.values()
+                if info['cl_doc_hash']}
+    _XS_RE = re.compile(r'(\d+)[×x*](\d+(?:\.\d+)?)')
+
+    doc_texts: dict[str, list[dict]] = {}
+    for dh in _CL_DOCS:
+        doc_texts[dh] = [
+            dict(r) for r in conn.execute(
+                "SELECT text, x, y, entity_type "
+                "FROM text_entities WHERE document_hash = ?",
+                (dh,),
+            ).fetchall()
+        ]
+    conn.close()
+
+    # ── Phase 3: for each cable, grab the two TEXT below cable_id ──
+    def _find_two_below(
+        texts: list[dict], cable_id: str,
+    ) -> tuple[str, str]:
+        """Return (concatenated_text, cross_section).
+
+        Find the cable_id text anchor, then collect TEXT entities
+        directly below it (same x-range, lower y).  Concatenate the
+        first two non-empty texts encountered when scanning downward.
+        """
+        anchor = None
+        for t in texts:
+            txt = t['text'].strip()
+            if txt == cable_id:
+                anchor = t
+                break
+        if anchor is None:
+            for t in texts:
+                txt = t['text'].strip()
+                # Strip "(C1)" / "(1)" suffixes common in cable IDs
+                paren = txt.find('(')
+                bare = txt[:paren].strip() if paren > 0 else txt
+                if bare == cable_id:
+                    anchor = t
+                    break
+        if anchor is None:
+            return '', ''
+
+        ax, ay = anchor['x'], anchor['y']
+
+        below = [
+            t for t in texts
+            if t is not anchor
+            and abs(t['x'] - ax) < 300
+            and t['y'] < ay
+        ]
+        below.sort(key=lambda t: t['y'], reverse=True)  # closest to anchor first
+
+        parts: list[str] = []
+        xs = ''
+        for t in below:
+            txt = t['text'].strip()
+            if not txt or txt == cable_id:
+                continue
+            parts.append(txt)
+            if not xs:
+                m = _XS_RE.search(txt)
+                if m:
+                    xs = m.group(2)
+            if len(parts) == 2:
+                break
+
+        return ' '.join(parts), xs
+
+    # ── Phase 4: write XLSX ──
+    wb = Workbook()
+    ws = wb.active
+    ws.title = 'Cable Cabinets'
+
+    headers = [
+        '电缆编号', '电缆型号及截面',
+        'cable_core_numbers', 'cable_core_cross_section',
+        'cable_core_numbers2', 'cable_core_cross_section2',
+        '起点', 'origin_cubicle', 'origin_device',
+        '终点', 'terminal_cubicle', 'terminal_device',
+        '序号',
+    ]
+    ws.append(headers)
+
+    for seq, (cid, info) in enumerate(sorted(cables.items()), 1):
+        model_text = ''
+        xs = ''
+        dh = info['cl_doc_hash']
+        if dh:
+            texts = doc_texts.get(dh, [])
+            model_text, xs = _find_two_below(texts, cid)
+
+        ws.append([
+            cid,
+            model_text,
+            cable_conductor_counts[cid],
+            xs,
+            '',
+            '',
+            info['cabinet_name'],
+            info['cabinet_name'],
+            '',
+            info['cabinet_name_remote'],
+            info['cabinet_name_remote'],
+            '',
+            seq,
+        ])
+
+    wb.save(out_path)
+    print(f'已生成: {out_path}')
+    print(f'共 {len(cables)} 条电缆记录')
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# group-by-cables
+# ---------------------------------------------------------------------------
+def cmd_group_by_cables(args: argparse.Namespace) -> int:
+    """Group DWG files by cabinet using the scanned DB + XLSX schedule.
+
+    After `python -m cable_engine.cli scan --input <dir>` has populated
+    cable.db, this command queries cable_topology (via cable_id) to find
+    which document each cable belongs to, then copies those DWG files into
+    folders named after cubicle_model_name.
+
+    XLSX columns: cable_nums (电缆编号, comma-separated with optional
+    (cx) core suffixes to strip), cubicle_model_name (柜体型号, folder).
+    """
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        print('ERROR: openpyxl is required. pip install openpyxl', file=sys.stderr)
+        return 1
+
+    import shutil
+
+    xlsx_path = Path(args.group_by_cables).expanduser()
+    db_path = Path(args.db).expanduser()
+    output_dir = Path(args.output_dir or '.').expanduser().resolve()
+
+    if not xlsx_path.is_file():
+        print(f'ERROR: XLSX not found: {xlsx_path}', file=sys.stderr)
+        return 1
+    if not db_path.is_file():
+        print(f'ERROR: DB not found: {db_path}', file=sys.stderr)
+        return 1
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # ---- Step 1: read XLSX, collect all cable IDs ----
+    wb = load_workbook(xlsx_path)
+    ws = wb.active
+
+    headers: dict[str, int] = {}
+    for cell in ws[1]:
+        if cell.value:
+            headers[str(cell.value).strip()] = cell.column
+
+    cable_col = headers.get('cable_nums') or headers.get('电缆编号')
+    cubicle_col = headers.get('cubicle_model_name') or headers.get('柜体型号')
+
+    if not cable_col or not cubicle_col:
+        print('ERROR: XLSX must have cable_nums (电缆编号) and '
+              'cubicle_model_name (柜体型号) columns', file=sys.stderr)
+        return 1
+
+    # Each row: (list[cable_id], cubicle_name)
+    row_data: list[tuple[list[str], str]] = []
+    all_cable_ids: set[str] = set()
+
+    for row in range(2, ws.max_row + 1):
+        val = ws.cell(row=row, column=cable_col).value
+        cubicle = ws.cell(row=row, column=cubicle_col).value
+        if not val or not cubicle:
+            continue
+        parts = [p.strip() for p in str(val).strip().replace('，', ',').split(',') if p.strip()]
+        ids = [p.split('(')[0].strip() for p in parts if p.split('(')[0].strip()]
+        if not ids:
+            continue
+        row_data.append((ids, str(cubicle).strip()))
+        for cid in ids:
+            all_cable_ids.add(cid)
+
+    if not row_data:
+        print('ERROR: no data rows found in XLSX', file=sys.stderr)
+        return 1
+
+    print(f'XLSX: {len(row_data)} rows, {len(all_cable_ids)} unique cable IDs',
+          flush=True)
+
+    # ---- Step 2: query text_entities for cable→document mapping ----
+    from .storage.sqlite import open_db
+    conn = open_db(db_path, read_only=True)
+
+    cable_to_doc: dict[str, tuple[str, str]] = {}
+
+    # Try text_entities first (fast path — data already scanned)
+    for cid in all_cable_ids:
+        rows = conn.execute(
+            """SELECT DISTINCT d.rel_path, d.content_hash
+               FROM text_entities te
+               JOIN documents d ON d.content_hash = te.document_hash
+               WHERE te.text LIKE ?""",
+            (f'%{cid}%',),
+        ).fetchall()
+        for rel_path, doc_hash in rows:
+            if cid not in cable_to_doc:
+                cable_to_doc[cid] = (rel_path, doc_hash)
+                break
+
+    # If text_entities is empty or only contains error messages, fall back
+    # to scanning source DWGs directly via dwgread.
+    _te_check = conn.execute(
+        "SELECT text FROM text_entities WHERE text NOT LIKE '<%' LIMIT 1"
+    ).fetchone()
+    text_entities_have_data = _te_check is not None
+    conn.close()
+
+    if len(cable_to_doc) == 0 and not text_entities_have_data:
+        print('text_entities has no real data (scan likely failed). '
+              'Falling back to direct dwgread scan…', flush=True)
+
+        import subprocess
+        import re
+
+        dwgread_path = shutil.which('dwgread')
+        if dwgread_path is None:
+            print('ERROR: dwgread not found. Install libredwg.', file=sys.stderr)
+            return 1
+
+        conn2 = open_db(db_path, read_only=True)
+        doc_files = conn2.execute(
+            "SELECT DISTINCT rel_path, content_hash FROM documents"
+        ).fetchall()
+        conn2.close()
+
+        _TEXT_PATTERN = re.compile(r'"text"\s*:\s*"([^"]*)"')
+        for row in doc_files:
+            src_path = Path(row['rel_path'])
+            if not src_path.is_file():
+                continue
+            try:
+                proc = subprocess.run(
+                    [dwgread_path, '-O', 'JSON', str(src_path)],
+                    capture_output=True, timeout=120,
+                )
+            except (subprocess.TimeoutExpired, OSError):
+                continue
+            if proc.returncode != 0 or not proc.stdout:
+                continue
+            raw = proc.stdout.decode('utf-8', errors='replace')
+            found_in_file: set[str] = set()
+            for m in _TEXT_PATTERN.finditer(raw):
+                txt = m.group(1)
+                if txt in found_in_file:
+                    continue
+                _bare = txt.split('(')[0].strip() if '(' in txt else txt
+                if _bare in all_cable_ids:
+                    cable_to_doc.setdefault(_bare, ())
+                    if cable_to_doc[_bare] == ():
+                        cable_to_doc[_bare] = (row['rel_path'], row['content_hash'])
+                    found_in_file.add(txt)
+
+    print(f'DB: {len(cable_to_doc)}/{len(all_cable_ids)} cable IDs found',
+          flush=True)
+
+    # ---- Step 3: resolve source-file paths and process rows ----
+    src_root = db_path.parent  # DWG files are relative to DB's directory
+    matched = 0
+
+    for ids, cubicle in row_data:
+        found = False
+        for cid in ids:
+            entry = cable_to_doc.get(cid)
+            if entry is None:
+                continue
+            rel_path, _ = entry
+            src = Path(rel_path)
+            if not src.is_absolute():
+                src = src_root / src
+            if not src.is_file():
+                print(f'  WARN: {cid} maps to {src} but file not found',
+                      file=sys.stderr)
+                continue
+            cubicle_dir = output_dir / f'{cubicle}+{cid}'
+            cubicle_dir.mkdir(parents=True, exist_ok=True)
+            dst = cubicle_dir / src.name
+            if not dst.exists():
+                shutil.copy2(src, dst)
+            print(f'  {cid:20s} -> {cubicle}+{cid}/{src.name}')
+            matched += 1
+            found = True
+            break
+
+        if not found:
+            cable_str = ', '.join(ids)
+            print(f'  {"[NO MATCH]":20s} cable={cable_str} cubicle={cubicle}')
+
+    print(f'\nDone: {matched} rows matched, '
+          f'{len(row_data) - matched} rows unmatched', flush=True)
+    return 0 if matched == len(row_data) else 1
+
+
+# ---------------------------------------------------------------------------
 # Argparse
 # ---------------------------------------------------------------------------
 def _build_argparser() -> argparse.ArgumentParser:
@@ -259,6 +632,25 @@ def _build_argparser() -> argparse.ArgumentParser:
     s.add_argument('--input', required=True, help='Input directory (DWG/DXF)')
     s.add_argument('--db', help='Output cable.db path (default: <input>/cable.db)')
     s.add_argument('--workers', type=int, default=1, help='Parallel workers (default: 1)')
+
+    cc = sub.add_parser(
+        'check-cable-cabinets',
+        help='Export cable-cabinets.xlsx from cable.db',
+    )
+    cc.add_argument('--db', required=True, help='cable.db path')
+    cc.add_argument('--output-dir', default=None,
+                    help='Output directory (default: same dir as cable.db)')
+
+    gc = sub.add_parser(
+        'group-by-cables',
+        help='Group DWG files by cabinet using an XLSX cable schedule',
+    )
+    gc.add_argument('--group-by-cables', required=True,
+                    help='XLSX file with cable_nums and cubicle_model_name columns')
+    gc.add_argument('--db', required=True,
+                    help='cable.db path (from a prior scan)')
+    gc.add_argument('--output-dir', default=None,
+                    help='Output directory (default: current dir)')
     return p
 
 
@@ -267,6 +659,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
     if args.command == 'scan':
         return cmd_scan(args)
+    if args.command == 'check-cable-cabinets':
+        return cmd_check_cable_cabinets(args)
+    if args.command == 'group-by-cables':
+        return cmd_group_by_cables(args)
     parser.print_help()
     return 1
 

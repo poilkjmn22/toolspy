@@ -344,22 +344,56 @@ function renderCabinetDetail(c) {
     <span style="font-size:11px;color:#888;margin-left:8px;">${escHtml(docName)}</span>
   </div>`;
 
-  // Terminals table
-  html += `<div class="section"><h3>包含端子 (${c.terminal_count})</h3>`;
+  // Terminals table — grouped by kind (NO/ObjTerm.Name=标签, TERNO=端子号, BL/BR=设备).
+  // The same physical terminal often has both a NO label and a TERNO icon at
+  // slightly different positions (~3px apart). Count physical terminals as
+  // NO entries only (primary labels); display groups as supplemental info.
+  const kindLabels = {
+    'NO': '标签', 'ObjTerm.Name': '标签',
+    'TERNO': '端子号',
+    'BL': '设备', 'BR': '设备',
+  };
+  const kindOrder = ['NO', 'ObjTerm.Name', 'TERNO', 'BL', 'BR'];
+  function kindGroup(term_kind) {
+    if (term_kind === 'NO' || term_kind === 'ObjTerm.Name') return 'NO';
+    return term_kind;
+  }
+  const groups = {};
+  const groupSeen = {};
+  for (const t of (c.terminals || [])) {
+    const g = kindGroup(t.terminal_kind);
+    // Dedup within group: same terminal_kind at roughly the same position
+    const gKey = g + ':' + Math.round(t.x / 5) + ':' + Math.round(t.y / 5);
+    if (groupSeen[gKey]) continue;
+    groupSeen[gKey] = true;
+    if (!groups[g]) groups[g] = [];
+    groups[g].push(t);
+  }
+  // Physical terminal count: NO entries are the primary terminal labels.
+  // TERNO/BL/BR icons at the same position are supplementary.
+  const noTerms = groups['NO'] || [];
+  const physCount = noTerms.length || c.terminals.length;
+  html += `<div class="section"><h3>包含端子 (${physCount})</h3>`;
   if (!c.terminals || !c.terminals.length) {
     html += '<div class="empty-state">无关联端子</div>';
   } else {
-    html += '<table style="width:100%;border-collapse:collapse;font-size:12px;">';
-    html += '<tr style="background:#f5f5f5;font-weight:600;"><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">端子 ID</th><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">类型</th><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">X</th><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">Y</th></tr>';
-    for (const t of c.terminals) {
-      html += `<tr style="border-bottom:1px solid #eee;">
-        <td style="padding:4px 6px;font-family:monospace;">${escHtml(t.terminal_id)}</td>
-        <td style="padding:4px 6px;">${escHtml(t.terminal_kind)}</td>
-        <td style="padding:4px 6px;font-family:monospace;">${Math.round(t.x)}</td>
-        <td style="padding:4px 6px;font-family:monospace;">${Math.round(t.y)}</td>
-      </tr>`;
+    for (const g of kindOrder) {
+      const terms = groups[g];
+      if (!terms || !terms.length) continue;
+      const label = kindLabels[g] || g;
+      html += `<div style="font-size:12px;font-weight:600;color:#555;margin:8px 0 4px;">${escHtml(label)} (${terms.length})</div>`;
+      html += '<table style="width:100%;border-collapse:collapse;font-size:12px;">';
+      html += '<tr style="background:#f5f5f5;font-weight:600;"><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">端子 ID</th><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">类型</th><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">X</th><th style="padding:4px 6px;text-align:left;border-bottom:1px solid #ddd;">Y</th></tr>';
+      for (const t of terms) {
+        html += `<tr style="border-bottom:1px solid #eee;">
+          <td style="padding:4px 6px;font-family:monospace;">${escHtml(t.terminal_id)}</td>
+          <td style="padding:4px 6px;">${escHtml(t.terminal_kind)}</td>
+          <td style="padding:4px 6px;font-family:monospace;">${Math.round(t.x)}</td>
+          <td style="padding:4px 6px;font-family:monospace;">${Math.round(t.y)}</td>
+        </tr>`;
+      }
+      html += '</table>';
     }
-    html += '</table>';
   }
   html += `</div>`;
 
@@ -469,16 +503,22 @@ function drawCabinetOverlay(cabinet) {
       svg.appendChild(path);
     }
 
-    // Terminal markers
+    // Terminal markers (color by kind: NO/ObjTerm.Name=green, TERNO=orange, BL/BR=purple)
     if (cabinet.terminals) {
       const ns = 'http://www.w3.org/2000/svg';
+      const kindColors = {
+        'NO': '#4caf50', 'ObjTerm.Name': '#4caf50',
+        'TERNO': '#ff9800',
+        'BL': '#9c27b0', 'BR': '#9c27b0',
+      };
       for (const t of cabinet.terminals) {
         const sp = w2s(t.x, t.y);
+        const color = kindColors[t.terminal_kind] || '#4caf50';
         const circle = document.createElementNS(ns, 'circle');
         circle.setAttribute('cx', sp.x);
         circle.setAttribute('cy', sp.y);
         circle.setAttribute('r', '5');
-        circle.setAttribute('fill', '#4caf50');
+        circle.setAttribute('fill', color);
         circle.setAttribute('stroke', '#fff');
         circle.setAttribute('stroke-width', '2');
         svg.appendChild(circle);

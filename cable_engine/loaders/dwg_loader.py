@@ -2,15 +2,16 @@
 
 This loader produces the V5 IR: a flat list of geometry entities
 (TextEntity, LineGeometry, CircleGeometry, ArcGeometry, BlockRef,
-AttributeEntity). It also expands anonymous block references at load
+AttributeEntity). It expands anonymous block references at load
 time so that geometry inside unnamed blocks becomes first-class in
 model space — this unlocks L-shape detection that was broken in V4
 because `dwgread -O JSON` does not expand anonymous blocks by default.
 
-The loader is `dwgread -O JSON` first, with `ezdxf` as a fallback for
-clean DXF files. It deliberately does not use the legacy V4 entity
-types (LineEntity, PolylineEntity, SymbolEntity); V5's GraphBuilder
-and Rule Engine operate exclusively on the geometry-aware types.
+The loader prefers the **ODA File Converter** pipeline for .dwg files:
+ODAFileConverter CLI → DXF → ezdxf read. This gives correct ATTRIB
+coordinates inside rotated anonymous blocks, which dwgread corrupts.
+Falls back to `dwgread -O JSON` (for systems without ODA), then to
+ezdxf (for clean .dxf files).
 
 Document space convention (V5):
   - Origin: bottom-left
@@ -18,13 +19,9 @@ Document space convention (V5):
   - Y axis: increases upward (matches DWG)
 
 Anonymous block expansion:
-  - dwgread -O JSON emits BLOCK / ENDBLK pairs in a separate "objects"
-    section, but does NOT inline them into the model space INSERTs.
-  - We index all BLOCK definitions by handle.
-  - When we encounter an INSERT in model space whose block handle
-    refers to a BLOCK with no user-visible name (anonymous), we walk
-    the block's children and emit copies of each child entity in
-    model space, transformed by the INSERT's ins_pt / rotation / scale.
+  - ODA + ezdxf: INSERT entities are expanded via `virtual_entities()`
+    and `attribs()` — ezdxf handles the coordinate transform natively.
+  - dwgread fallback: manual BLOCK_HEADER walking + coordinate transform.
 """
 
 from __future__ import annotations
@@ -33,7 +30,9 @@ import hashlib
 import json
 import math
 import re
+import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -57,6 +56,53 @@ def _content_hash(p: Path) -> str:
 
 
 _ENTITY_RE = re.compile(r'"entity":\s*"(\w+)"')
+
+
+# Named block whitelist for expansion — blocks whose geometry is needed
+# for cable path tracing (U-top horizontals, terminal circles).
+_EXPAND_BLOCK_NAMES = frozenset({'CT1', 'tmR', 'tmInLR', 'IsGround', 'CQ'})
+
+# Regex for AutoCAD M+ big-font encoding (e.g. \M+5CBB5).
+# Group 1 captures the 4-hex-digit GBK code after the constant '5'.
+_M_PLUS_RE = re.compile(r'\\M\+5([0-9A-Fa-f]{4})')
+
+
+def _decode_mplus(text: str) -> str:
+    """Decode AutoCAD ``\\M+5XXXX`` GBK-encoded Chinese text to Unicode.
+
+    ODA's DXF output preserves the raw SHX big-font codes (``\\M+5XXXX``)
+    instead of decoding them to Unicode. LibreDWG dwgread handles this
+    correctly. This function strips the ``\\M+5`` prefix and decodes the
+    remaining 4 hex digits as a GBK byte pair.
+    """
+    def _replace(m: re.Match) -> str:
+        try:
+            b = bytes.fromhex(m.group(1))
+            return b.decode('gbk')
+        except (ValueError, LookupError, UnicodeDecodeError):
+            return m.group(0)
+    return _M_PLUS_RE.sub(_replace, text)
+
+
+def _extract_eed_from_xdata(e) -> list[str]:
+    """Extract EED (extended entity data) from an ezdxf entity's XDATA.
+
+    ODA File Converter preserves EED as XDATA with app IDs ``Cable``
+    and ``WireLine`` on model-space LWPOLYLINE / LINE entities. This
+    function reads those and returns a flat list of string values
+    matching the dwgread EED format.
+    """
+    xd = getattr(e, 'xdata', None)
+    if xd is None or len(xd) == 0:
+        return []
+    eed: list[str] = []
+    for appid in ('Cable', 'WireLine'):
+        if appid in xd.data:
+            tags = xd.get(appid)
+            for t in tags:
+                if t.code == 1000 and isinstance(t.value, str):
+                    eed.append(t.value)
+    return eed
 
 
 # ---------------------------------------------------------------------------
@@ -89,13 +135,263 @@ class DWGLoader(BaseLoader):
 
         suffix = document_path.suffix.lower()
         if suffix == '.dwg':
+            if self._load_via_oda(document_path, doc):
+                return doc
             if self._load_via_dwgread(document_path, doc):
                 return doc
-            # Fall through to ezdxf
         return self._load_via_ezdxf(document_path, doc)
 
     # ------------------------------------------------------------------
-    # dwgread path (preferred — gives us anonymous block definitions)
+    # ODA path (primary for .dwg — correct ATTRIB coords in blocks)
+    # ------------------------------------------------------------------
+    def _load_via_oda(self, path: Path, doc: Document) -> bool:
+        """Load via ODA File Converter → DXF → ezdxf.
+
+        ODAFileConverter correctly transforms ATTRIB coordinates inside
+        rotated anonymous blocks to model space. LibreDWG dwgread corrupts
+        this data for certain files (e.g. rotated *U blocks in D0209-03).
+        """
+        oda_bin = '/Applications/ODAFileConverter.app/Contents/MacOS/ODAFileConverter'
+        if not Path(oda_bin).exists():
+            return False
+        try:
+            import ezdxf
+        except ImportError:
+            return False
+
+        tmp_in = Path(tempfile.mkdtemp(prefix='oda_in_'))
+        tmp_out = Path(tempfile.mkdtemp(prefix='oda_out_'))
+        try:
+            shutil.copy2(str(path), str(tmp_in / path.name))
+            r = subprocess.run(
+                [oda_bin, str(tmp_in), str(tmp_out),
+                 'ACAD2018', 'DXF', '0', '1', '*.dwg'],
+                capture_output=True, timeout=120,
+            )
+            if r.returncode != 0:
+                return False
+            dxf_files = list(tmp_out.glob('*.dxf'))
+            if not dxf_files:
+                return False
+            dwg = ezdxf.readfile(str(dxf_files[0]))
+            self._parse_oda_entities(dwg, doc)
+            return bool(doc.entities)
+        except Exception:
+            return False
+        finally:
+            shutil.rmtree(tmp_in, ignore_errors=True)
+            shutil.rmtree(tmp_out, ignore_errors=True)
+
+    def _parse_oda_entities(self, dwg, doc: Document) -> None:
+        """Parse ezdxf entities from an ODA-converted DXF into Document IR.
+
+        Extracts model-space entities directly, then expands every INSERT
+        via ``virtual_entities()`` (geometry) and ``attribs`` (ATTRIB text
+        values) with correct model-space coordinates.
+        """
+        # Pre-build layer→linetype map for BYLAYER resolution
+        _layer_lt: dict[str, str] = {}
+        for l in dwg.layers:
+            _layer_lt[l.dxf.name] = getattr(l.dxf, 'linetype', '') or ''
+
+        msp = dwg.modelspace()
+        for e in msp:
+            try:
+                self._consume_ezdxf_entity_oda(e, doc, _layer_lt)
+            except Exception:
+                pass
+
+    def _consume_ezdxf_entity_oda(
+        self, e, doc: Document,
+        _layer_lt: dict[str, str] | None = None,
+    ) -> None:
+        typ = e.dxftype()
+        handle = getattr(e.dxf, 'handle', '') or ''
+        layer = getattr(e.dxf, 'layer', '') or ''
+
+        if typ == 'LINE':
+            s = e.dxf.start
+            t = e.dxf.end
+            ent = LineGeometry(
+                id=handle or _next_id(doc, 'oda_line'),
+                source='dwg', page=1, confidence=1.0,
+                layer=layer, handle=handle,
+                points=[Point(s.x, s.y), Point(t.x, t.y)],
+            )
+            _eed = _extract_eed_from_xdata(e)
+            _lt = getattr(e.dxf, 'linetype', '') or ''
+            if _lt.upper() == 'BYLAYER' and _layer_lt:
+                _lt = _layer_lt.get(layer, '')
+            if _eed or _lt:
+                ent.custom_fields = {}
+                if _eed:
+                    ent.custom_fields['eed'] = _eed
+                if _lt:
+                    ent.custom_fields['ltype'] = _lt
+            doc.add_entity(ent)
+
+        elif typ == 'LWPOLYLINE':
+            pts = [Point(p[0], p[1]) for p in e.get_points()]
+            ent = LineGeometry(
+                id=handle or _next_id(doc, 'oda_poly'),
+                source='dwg', page=1, confidence=1.0,
+                layer=layer, handle=handle, points=pts,
+                closed=getattr(e.closed, 'is_closed', False),
+            )
+            _eed = _extract_eed_from_xdata(e)
+            _lt = getattr(e.dxf, 'linetype', '') or ''
+            if _lt.upper() == 'BYLAYER' and _layer_lt:
+                _lt = _layer_lt.get(layer, '')
+            if _eed or _lt:
+                ent.custom_fields = {}
+                if _eed:
+                    ent.custom_fields['eed'] = _eed
+                if _lt:
+                    ent.custom_fields['ltype'] = _lt
+            doc.add_entity(ent)
+
+        elif typ == 'CIRCLE':
+            c = e.dxf.center
+            r = float(e.dxf.radius)
+            doc.add_entity(CircleGeometry(
+                id=handle or _next_id(doc, 'oda_circ'),
+                source='dwg', page=1, confidence=1.0,
+                layer=layer, handle=handle,
+                center=Point(c.x, c.y), radius=r,
+            ))
+
+        elif typ == 'ARC':
+            c = e.dxf.center
+            r = float(e.dxf.radius)
+            sa = float(e.dxf.start_angle)
+            ea = float(e.dxf.end_angle)
+            doc.add_entity(ArcGeometry(
+                id=handle or _next_id(doc, 'oda_arc'),
+                source='dwg', page=1, confidence=1.0,
+                layer=layer, handle=handle,
+                center=Point(c.x, c.y), radius=r,
+                start_angle=sa, end_angle=ea,
+            ))
+
+        elif typ in ('TEXT', 'MTEXT'):
+            text = (e.plain_text() if typ == 'MTEXT' else e.dxf.text) or ''
+            if _M_PLUS_RE.search(text):
+                text = _decode_mplus(text)
+            if not text.strip():
+                return
+            insert = getattr(e.dxf, 'insert', None)
+            x, y = (insert[0], insert[1]) if insert else (None, None)
+            ent = TextEntity(
+                id=handle or _next_id(doc, 'oda_txt'),
+                source='dwg', page=1, confidence=1.0, text=text.strip(),
+            )
+            ent.custom_fields = {'x': x, 'y': y, 'layer': layer,
+                                 'rotation': float(getattr(e.dxf, 'rotation', 0.0) or 0.0),
+                                 'height': float(getattr(e.dxf, 'height', 0.0) or 0.0)}
+            doc.add_entity(ent)
+
+        elif typ == 'INSERT':
+            name = getattr(e.dxf, 'name', '') or ''
+            ix, iy = e.dxf.insert.x, e.dxf.insert.y
+
+            for att in getattr(e, 'attribs', []) or []:
+                tag = getattr(att.dxf, 'tag', '') or ''
+                val = getattr(att.dxf, 'text', '') or ''
+                if _M_PLUS_RE.search(val):
+                    val = _decode_mplus(val)
+                if not tag.strip() or not val.strip():
+                    continue
+                att_ins = getattr(att.dxf, 'insert', None)
+                ax, ay = (att_ins[0], att_ins[1]) if att_ins else (None, None)
+                aent = AttributeEntity(
+                    id=f'{handle}__{tag}' or _next_id(doc, 'oda_att'),
+                    source='dwg', page=1, confidence=1.0,
+                    layer=layer, tag=tag, text=val.strip(),
+                )
+                aent.custom_fields = {'x': ax, 'y': ay}
+                doc.add_entity(aent)
+
+            # Explode INSERT geometry via virtual_entities
+            for ve in e.virtual_entities():
+                vtyp = ve.dxftype()
+                if vtyp in ('ATTRIB', 'ATTDEF'):
+                    continue
+                vh = getattr(ve.dxf, 'handle', '') or ''
+                vl = getattr(ve.dxf, 'layer', '') or layer
+                _vlt = getattr(ve.dxf, 'linetype', '') or ''
+                if _vlt.upper() == 'BYLAYER' and _layer_lt:
+                    _vlt = _layer_lt.get(vl, '')
+
+                if vtyp == 'LINE':
+                    s = ve.dxf.start
+                    t = ve.dxf.end
+                    vent = LineGeometry(
+                        id=vh or _next_id(doc, 'oda_vline'),
+                        source='dwg', page=1, confidence=1.0,
+                        layer=vl, handle=vh,
+                        points=[Point(s.x, s.y), Point(t.x, t.y)],
+                    )
+                    if _vlt:
+                        vent.custom_fields = {'ltype': _vlt}
+                    doc.add_entity(vent)
+                elif vtyp == 'LWPOLYLINE':
+                    pts = [Point(p[0], p[1]) for p in ve.get_points()]
+                    vent = LineGeometry(
+                        id=vh or _next_id(doc, 'oda_vpoly'),
+                        source='dwg', page=1, confidence=1.0,
+                        layer=vl, handle=vh, points=pts,
+                        closed=getattr(ve.closed, 'is_closed', False),
+                    )
+                    if _vlt:
+                        vent.custom_fields = {'ltype': _vlt}
+                    doc.add_entity(vent)
+                elif vtyp == 'CIRCLE':
+                    c = ve.dxf.center
+                    r = float(ve.dxf.radius)
+                    doc.add_entity(CircleGeometry(
+                        id=vh or _next_id(doc, 'oda_vcirc'),
+                        source='dwg', page=1, confidence=1.0,
+                        layer=vl, handle=vh,
+                        center=Point(c.x, c.y), radius=r,
+                    ))
+                elif vtyp == 'ARC':
+                    c = ve.dxf.center
+                    r = float(ve.dxf.radius)
+                    sa = float(ve.dxf.start_angle)
+                    ea = float(ve.dxf.end_angle)
+                    doc.add_entity(ArcGeometry(
+                        id=vh or _next_id(doc, 'oda_varc'),
+                        source='dwg', page=1, confidence=1.0,
+                        layer=vl, handle=vh,
+                        center=Point(c.x, c.y), radius=r,
+                        start_angle=sa, end_angle=ea,
+                    ))
+                elif vtyp in ('TEXT', 'MTEXT'):
+                    text = (ve.plain_text() if vtyp == 'MTEXT' else ve.dxf.text) or ''
+                    if not text.strip():
+                        continue
+                    vins = getattr(ve.dxf, 'insert', None)
+                    vx, vy = (vins[0], vins[1]) if vins else (None, None)
+                    tent = TextEntity(
+                        id=vh or _next_id(doc, 'oda_vtxt'),
+                        source='dwg', page=1, confidence=1.0,
+                        text=text.strip(),
+                    )
+                    tent.custom_fields = {'x': vx, 'y': vy, 'layer': vl}
+                    doc.add_entity(tent)
+
+            doc.add_entity(BlockRef(
+                id=handle or _next_id(doc, 'oda_ins'),
+                source='dwg', page=1, confidence=1.0,
+                layer=layer, handle=handle, name=name,
+                insert_point=Point(ix, iy),
+                rotation=float(getattr(e.dxf, 'rotation', 0.0) or 0.0),
+            ))
+
+        # Other types skipped (SPLINE, POLYLINE, POINT, etc.)
+
+    # ------------------------------------------------------------------
+    # dwgread path (fallback when ODA is unavailable)
     # ------------------------------------------------------------------
     def _load_via_dwgread(self, path: Path, doc: Document) -> bool:
         try:
@@ -109,6 +405,11 @@ class DWGLoader(BaseLoader):
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return False
 
+        # Instance vars for Phase 3 block expansion
+        self._block_buffers: dict[int, list[tuple[str, str]]] = {}
+        self._bh_entity_map: dict[int, dict] = {}
+        self._expand_bh_map: dict[str, int] = {}
+
         self._parse_v5(raw, doc)
         return bool(doc.entities)
 
@@ -116,20 +417,30 @@ class DWGLoader(BaseLoader):
         """Parse dwgread JSON and emit V5 entities.
 
         Three-pass approach:
-          1. Build an ltype-handle → ltype-name map from all LTYPE objects.
-          2. Build a BLOCK_HEADER entity map to determine which entities are
-             inside block definitions (via ownerhandle → BLOCK_HEADER).
-          3. Linear pass over `"entity"` rows. Model-space entities are
-             emitted directly. Entities belonging to any BLOCK_HEADER are
-             buffered by BLOCK_HEADER handle, NOT emitted.
-             INSERT entities pick up their block name from a pre-built
-             block_header → block_name lookup (dwgread JSON does not
-             include `"name"` in INSERT entities).
-          4. Post-pass: for each INSERT (BlockRef) referencing an anonymous
-             block, resolve its BLOCK_HEADER and expand the buffered
-             entities into model space with coordinates transformed by the
-             INSERT's ins_pt / rotation / scale and the BLOCK_HEADER's
-             base_pt offset.
+           1. Build an ltype-handle → ltype-name map from all LTYPE objects.
+           2. Build a BLOCK_HEADER entity map to determine which entities are
+              inside block definitions (via ownerhandle → BLOCK_HEADER).
+           3. Linear pass over `"entity"` rows. Model-space entities are
+              emitted directly. Entities belonging to any BLOCK_HEADER are
+              buffered by BLOCK_HEADER handle, NOT emitted.
+              INSERT entities pick up their block name from a pre-built
+              block_header → block_name lookup (dwgread JSON does not
+              include `"name"` in INSERT entities).
+           4. Post-pass: for each INSERT (BlockRef) referencing an anonymous
+              block, resolve its BLOCK_HEADER and expand the buffered
+              entities into model space with coordinates transformed by the
+              INSERT's ins_pt / rotation / scale and the BLOCK_HEADER's
+              base_pt offset.
+
+        Note on the "rotated copy" problem: some DWGs (esp. Shengli 回路图)
+        contain ATTRIB entities that are children of an INSERT with non-zero
+        rotation, but dwgread lists them in the model-space entities section
+        rather than inside a BLOCK_HEADER definition.  Their coordinates are
+        block-local, not model-space.  These entities are emitted as-is
+        (confidence=1.0) because degrading them creates false negatives
+        (terminals that WERE matched using the block-local coordinates become
+        unmatchable).  The block-local coordinates are inaccurate but the
+        matching is still better than no match at all.
         """
         ltype_map = _build_ltype_map(raw)
         block_name_map = _build_block_header_name_map(raw)
@@ -146,8 +457,10 @@ class DWGLoader(BaseLoader):
                 block_internal_handles.add(h)
                 entity_to_bh[h] = bh_handle
 
-        # Phase 2: buffer anonymous block entities, emit model-space entities
-        block_buffers: dict[int, list[tuple[str, str]]] = {}
+        # Phase 2: buffer block entities, emit model-space entities
+        self._block_buffers: dict[int, list[tuple[str, str]]] = {}
+        self._bh_entity_map = bh_entity_map
+        self._expand_bh_map: dict[str, int] = {}
 
         for m in _ENTITY_RE.finditer(raw):
             etype = m.group(1)
@@ -160,6 +473,7 @@ class DWGLoader(BaseLoader):
                 continue
 
             # Inject block name into INSERT JSON for model-space entities
+            inserted_name = None
             if etype == 'INSERT' and block_name_map:
                 try:
                     blk_obj = json.loads(block)
@@ -168,7 +482,8 @@ class DWGLoader(BaseLoader):
                         bbytes = bh[1]
                         handle_key = tuple(bh[2:2 + bbytes])
                         if handle_key in block_name_map:
-                            blk_obj['name'] = block_name_map[handle_key]
+                            inserted_name = block_name_map[handle_key]
+                            blk_obj['name'] = inserted_name
                             block = json.dumps(blk_obj, indent=2)
                 except (json.JSONDecodeError, IndexError):
                     pass
@@ -177,33 +492,80 @@ class DWGLoader(BaseLoader):
             handle = _json_handle_value(block)
             if handle in block_internal_handles:
                 bh_handle = entity_to_bh[handle]
-                block_buffers.setdefault(bh_handle, []).append((etype, block))
+                self._block_buffers.setdefault(bh_handle, []).append((etype, block))
                 continue
+
+            # For model-space INSERTS, pre-compute expand lookup
+            if etype == 'INSERT' and inserted_name:
+                is_expandable = (
+                    inserted_name.startswith('*U')
+                    or inserted_name in _EXPAND_BLOCK_NAMES
+                )
+                if is_expandable:
+                    try:
+                        ins_json = json.loads(block)
+                        bh_arr = ins_json.get('block_header', [])
+                        if len(bh_arr) >= 3:
+                            bh_handle = bh_arr[-1]
+                            hdl_str = _json_handle(block)
+                            if hdl_str:
+                                self._expand_bh_map[hdl_str] = bh_handle
+                    except (json.JSONDecodeError, IndexError):
+                        pass
 
             self._emit_model_entity_v5(etype, block, doc, ltype_map)
 
-        # Phase 3: expand anonymous block references via BLOCK_HEADER
-        inserts: list[BlockRef] = [
-            e for e in doc.entities
-            if isinstance(e, BlockRef) and e.name
-            and e.name.startswith('*U') and e.insert_point is not None
-        ]
+        # Phase 2b: flush TEXT/MTEXT/ATTRIB from ALL block buffers so that
+        # full-text search works even for named blocks that Phase 3 won't
+        # expand (e.g. feeder-panel labels inside `1HUILIU` blocks).
+        # Uses confidence=0.0 so the analyzer skips these — their
+        # coordinates are block-local, not model-space.
+        for buf in self._block_buffers.values():
+            for etype, block in buf:
+                if etype not in ('TEXT', 'MTEXT', 'ATTRIB'):
+                    continue
+                text = _json_str(block, 'text_value', 'default_value').strip()
+                if not text:
+                    continue
+                ins = _json_point(block, 'ins_pt')
+                if etype == 'ATTRIB':
+                    tag = _json_str(block, 'tag').strip()
+                    ent = AttributeEntity(
+                        id=_next_id(doc, 'dwg_att'),
+                        source='dwg', page=1, confidence=0.0,
+                        layer=_json_str(block, 'layer') or '',
+                        tag=tag, text=text,
+                    )
+                else:
+                    ent = TextEntity(
+                        id=_next_id(doc, 'dwg_txt'),
+                        source='dwg', page=1, confidence=0.0,
+                        text=text,
+                    )
+                ent.custom_fields = {
+                    'x': ins[0] if ins else None,
+                    'y': ins[1] if ins else None,
+                }
+                doc.add_entity(ent)
 
-        # Build reverse mapping: BLOCK entity handle → BLOCK_HEADER handle
-        be_to_bh: dict[int, int] = {}
-        for bh_handle, bh_data in bh_entity_map.items():
-            be = bh_data['block_entity_handle']
-            if be:
-                be_to_bh[be] = bh_handle
+        # Phase 3: expand block references via BLOCK_HEADER (fixed multi-*U)
+        for ins in list(doc.entities):
+            if not isinstance(ins, BlockRef):
+                continue
+            if ins.name and ins.insert_point is not None:
+                is_expandable = (
+                    ins.name.startswith('*U')
+                    or ins.name in _EXPAND_BLOCK_NAMES
+                )
+            else:
+                is_expandable = False
+            if not is_expandable:
+                continue
 
-        block_name_to_handle = _build_block_name_handle_map(raw)
-
-        for ins in inserts:
-            blk_handle = block_name_to_handle.get(ins.name, 0)
-            bh_handle = be_to_bh.get(blk_handle, 0)
+            bh_handle = self._expand_bh_map.get(ins.handle, 0)
             if not bh_handle:
                 continue
-            buf = block_buffers.get(bh_handle, [])
+            buf = self._block_buffers.get(bh_handle, [])
             if not buf:
                 continue
             base_pt = bh_entity_map[bh_handle]['base_pt']
@@ -216,6 +578,7 @@ class DWGLoader(BaseLoader):
         doc: Document,
         ltype_map: dict[str, str],
         base_pt: list[float] | None = None,
+        depth: int = 0,
     ) -> None:
         """Expand one anonymous block reference into model-space entities.
 
@@ -223,6 +586,8 @@ class DWGLoader(BaseLoader):
         entity coordinates are relative to this base_pt, so we subtract it
         before applying the INSERT transform.
         """
+        if depth >= 8:
+            return
         ix = ins.insert_point.x
         iy = ins.insert_point.y
         cos_r = math.cos(ins.rotation)
@@ -240,7 +605,7 @@ class DWGLoader(BaseLoader):
             return (mx, my)
 
         for etype, orig_block in buf:
-            self._emit_transformed_block(etype, orig_block, doc, ltype_map, tx)
+            self._emit_transformed_block(etype, orig_block, doc, ltype_map, tx, depth)
 
     def _emit_transformed_block(
         self,
@@ -249,12 +614,60 @@ class DWGLoader(BaseLoader):
         doc: Document,
         ltype_map: dict[str, str],
         tx: object,  # Callable[[float, float], tuple[float, float]]
+        depth: int = 0,
     ) -> None:
-        """Emit one block-internal entity with coordinates transformed."""
-        if etype in ('INSERT', 'BLOCK', 'ENDBLK', 'ATTDEF'):
+        """Emit one block-internal entity with coordinates transformed.
+
+        Supports recursive INSERT expansion up to 8 levels of nesting.
+        """
+        if etype in ('BLOCK', 'ENDBLK', 'ATTDEF'):
             return
 
         obj = json.loads(orig_block)
+
+        # Recursive INSERT expansion
+        if etype == 'INSERT':
+            if depth >= 8:
+                return
+            # Find the nested block's buffer
+            bh_arr = obj.get('block_header', [])
+            if len(bh_arr) < 3:
+                return
+            nested_bh = bh_arr[-1]
+            nested_buf = self._block_buffers.get(nested_bh, [])
+            if not nested_buf:
+                return
+
+            # Nested INSERT transform data
+            nested_pt = obj.get('ins_pt', [0.0, 0.0, 0.0])
+            nested_rot = float(obj.get('rotation', 0.0) or 0.0)
+            nested_cos = math.cos(nested_rot)
+            nested_sin = math.sin(nested_rot)
+            scale_arr = obj.get('scale', [])
+            if isinstance(scale_arr, list) and len(scale_arr) >= 2:
+                n_sx = float(scale_arr[0]) if isinstance(scale_arr[0], (int, float)) else 1.0
+                n_sy = float(scale_arr[1]) if isinstance(scale_arr[1], (int, float)) else 1.0
+            else:
+                n_sx = n_sy = 1.0
+            nested_bh_data = self._bh_entity_map.get(nested_bh, {})
+            nested_base_pt = nested_bh_data.get('base_pt', [0.0, 0.0, 0.0])
+            n_bx0 = float(nested_base_pt[0]) if nested_base_pt else 0.0
+            n_by0 = float(nested_base_pt[1]) if nested_base_pt else 0.0
+
+            # Combined transform: first apply nested INSERT local-to-parent,
+            # then apply outer (parent-to-world) transform.
+            def nested_tx(bx: float, by: float) -> tuple[float, float]:
+                dx = bx - n_bx0
+                dy = by - n_by0
+                nx = float(nested_pt[0]) + dx * n_sx * nested_cos - dy * n_sy * nested_sin
+                ny = float(nested_pt[1]) + dx * n_sx * nested_sin + dy * n_sy * nested_cos
+                return tx(float(nx), float(ny))  # type: ignore[operator]
+
+            for n_etype, n_block in nested_buf:
+                self._emit_transformed_block(
+                    n_etype, n_block, doc, ltype_map, nested_tx, depth + 1,
+                )
+            return  # INSERT itself emitted as transformed children
 
         def transform_point(bx: float, by: float) -> list[float]:
             mx, my = tx(bx, by)  # type: ignore[operator]
@@ -503,11 +916,15 @@ class DWGLoader(BaseLoader):
                 val = getattr(att.dxf, 'text', '') or ''
                 if not tag.strip() or not val.strip():
                     continue
-                doc.add_entity(AttributeEntity(
+                att_ins = getattr(att.dxf, 'insert', None)
+                ax, ay = (att_ins[0], att_ins[1]) if att_ins else (None, None)
+                aent = AttributeEntity(
                     id=f'{handle}__{tag}' or _next_id(doc, 'ezdxf_att'),
                     source='dwg', page=1, confidence=1.0,
                     layer=layer, tag=tag, text=val.strip(),
-                ))
+                )
+                aent.custom_fields = {'x': ax, 'y': ay}
+                doc.add_entity(aent)
 
 
 # ---------------------------------------------------------------------------
