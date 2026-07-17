@@ -324,10 +324,11 @@ class CableStore:
                FROM documents d
                WHERE d.classification_primary IN (
                        'protection_diagram', 'panel_layout',
-                       'monitoring_system', 'unknown'
+                       'monitoring_system', 'manufacturer_catalog',
+                       'unknown'
                    )
-                   OR d.classification_primary IS NULL
-               ORDER BY d.classification_primary, d.rel_path
+                       OR d.classification_primary IS NULL
+                   ORDER BY d.classification_primary, d.rel_path
                LIMIT ?""",
             (limit,),
         ).fetchall())
@@ -853,10 +854,11 @@ class CableStore:
         try:
             row = self._conn.execute(
                 """SELECT COUNT(*) AS n FROM documents
-                   WHERE classification_primary IN (
-                       'protection_diagram', 'panel_layout',
-                       'monitoring_system', 'unknown'
-                   )
+                    WHERE classification_primary IN (
+                        'protection_diagram', 'panel_layout',
+                        'monitoring_system', 'manufacturer_catalog',
+                        'unknown'
+                    )
                       OR classification_primary IS NULL"""
             ).fetchone()
             out['unmatched_documents'] = row['n']

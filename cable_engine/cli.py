@@ -25,6 +25,7 @@ from typing import Any, Optional
 from cable_engine.graph import TopologyStage
 from cable_engine.ir import DocumentType
 from cable_engine.loaders import get_loader_for
+from cable_engine.loaders.dwg_loader import _content_hash
 from cable_engine.pipeline import Context, Pipeline
 from cable_engine.storage import CableStore, open_db, ensure_schema
 
@@ -168,24 +169,47 @@ def cmd_scan(args: argparse.Namespace) -> int:
         return 0
     print(f'Discovered: {len(documents)} supported documents', flush=True)
 
+    # Resume: skip documents already in the DB with a valid classification.
+    store = CableStore(open_db(db_path, read_only=True))
+    done_hashes = set(
+        r['content_hash'] for r in store._conn.execute(
+            "SELECT content_hash FROM documents WHERE classification_primary IS NOT NULL"
+        ).fetchall()
+    )
+    store.close()
+    skipped = 0
+    resume_docs: list = []
+    for p, ld in documents:
+        h = _content_hash(p)
+        if h in done_hashes:
+            skipped += 1
+        else:
+            resume_docs.append((p, ld))
+    if skipped:
+        print(f'Resume: {skipped} documents already scanned, {len(resume_docs)} remaining', flush=True)
+    elif done_hashes:
+        # All in DB but none have classification — likely a prior interrupted scan.
+        print(f'Note: {len(done_hashes)} docs in DB but unclassified, will re-process', flush=True)
+
     completed = 0
     start = time.time()
     print(f'Processing with {args.workers} workers...', flush=True)
 
+    scan_total = len(resume_docs)
     if args.workers <= 1:
         # Single-process — easier to debug
-        for p, _ in documents:
+        for p, _ in resume_docs:
             res = _process_one_document(str(p), str(db_path))
             completed += 1
             elapsed = time.time() - start
             if res.get('error'):
-                print(f'[{completed}/{len(documents)}] {p.name} ({elapsed:.1f}s)  '
+                print(f'[{completed}/{scan_total}] {p.name} ({elapsed:.1f}s)  '
                       f'错误: {res["error"]}', flush=True)
             else:
                 cls = res.get('classification', '')
                 cls_short = cls.replace('_', '')[:8] if cls else '-'
                 conf = res.get('classification_confidence', 0.0)
-                print(f'[{completed}/{len(documents)}] {p.name} ({elapsed:.1f}s)  '
+                print(f'[{completed}/{scan_total}] {p.name} ({elapsed:.1f}s)  '
                       f'[{res["source_type"]}] {res["pages"]}p/{res["entities"]}e '
                       f'cls={cls_short}({conf:.2f})',
                       flush=True)
@@ -193,19 +217,19 @@ def cmd_scan(args: argparse.Namespace) -> int:
         with mp.Pool(processes=args.workers) as pool:
             for result in pool.imap_unordered(
                 _process_one_document_wrapper,
-                [(str(p), str(db_path)) for p, _ in documents],
+                [(str(p), str(db_path)) for p, _ in resume_docs],
             ):
                 completed += 1
                 elapsed = time.time() - start
                 if result.get('error'):
-                    print(f'[{completed}/{len(documents)}] '
+                    print(f'[{completed}/{scan_total}] '
                           f'{Path(result["path"]).name} ({elapsed:.1f}s)  '
                           f'错误: {result["error"]}', flush=True)
                 else:
                     cls = result.get('classification', '')
                     cls_short = cls.replace('_', '')[:8] if cls else '-'
                     conf = result.get('classification_confidence', 0.0)
-                    print(f'[{completed}/{len(documents)}] '
+                    print(f'[{completed}/{scan_total}] '
                           f'{Path(result["path"]).name} ({elapsed:.1f}s)  '
                           f'[{result["source_type"]}] {result["pages"]}p/{result["entities"]}e '
                           f'cls={cls_short}({conf:.2f})',
@@ -234,6 +258,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
                 'protection_diagram': '保护原理图',
                 'panel_layout': '屏位布置图',
                 'monitoring_system': '状态监测/通风',
+                'manufacturer_catalog': '厂家图册',
                 'unknown': '目录/封面',
                 'unclassified': '(未分类)',
             }.get(cls, cls)

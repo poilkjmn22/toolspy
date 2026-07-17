@@ -255,19 +255,20 @@ class GeometryGraph:
     # -- Merge close nodes ----------------------------------------------
 
     def merge_close_nodes(self, tolerance: float = 0.5) -> None:
-        """Merge nodes within tolerance into the existing lower-id node."""
+        """Merge nodes within tolerance using spatial index (O(n log n))."""
         merged: dict[int, int] = {}
-        all_ids = sorted(self.nodes.keys())
-        for i, a in enumerate(all_ids):
+        for a in sorted(self.nodes.keys()):
             if a in merged:
                 continue
-            na = self.nodes[a]
-            for b in all_ids[i + 1:]:
-                if b in merged:
-                    continue
-                nb = self.nodes[b]
-                if abs(na.x - nb.x) <= tolerance and abs(na.y - nb.y) <= tolerance:
-                    merged[b] = a
+            na = self.nodes.get(a)
+            if na is None:
+                continue
+            # Use spatial index to find close pairs — much faster than O(n²) brute force.
+        for cn in self.spatial.lookup(
+            na.x, na.y, tolerance,
+            filter_fn=lambda n: n.id > a and n.id not in merged,
+        ):
+                merged[cn.id] = a
         if not merged:
             return
         old_to_new = merged

@@ -100,6 +100,7 @@ INDEX_HTML = """<!DOCTYPE html>
   .doc-tree .cls-protection_diagram { background: #ffebee; color: #c62828; }
   .doc-tree .cls-panel_layout { background: #e8f5e9; color: #2e7d32; }
   .doc-tree .cls-monitoring_system { background: #ede7f6; color: #4527a0; }
+  .doc-tree .cls-manufacturer_catalog { background: #fce4ec; color: #880e4f; }
   .doc-tree .cls-unknown, .doc-tree .cls-unclassified { background: #eee; color: #888; }
   .doc-tree .cable-cnt { font-size: 10px; color: #888; font-family: monospace; }
   .doc-tree .children { margin-left: 14px; }
@@ -696,9 +697,10 @@ const CLS_LABELS = {
   'cable_schedule': '电缆清册',
   'protection_diagram': '保护原理图',
   'panel_layout': '屏位布置图',
-  'monitoring_system': '状态监测',
-  'unknown': '未识别',
-  'unclassified': '未分类',
+   'monitoring_system': '状态监测',
+   'manufacturer_catalog': '厂家图册',
+   'unknown': '未识别',
+   'unclassified': '未分类',
   '': '未分类',
 };
 
@@ -924,6 +926,7 @@ async function renderUnclassified() {
     'protection_diagram': '保护 / 测控信号回路图',
     'panel_layout': '屏位 / 屏柜布置图',
     'monitoring_system': '状态监测 / 通风控制 / SF6',
+    'manufacturer_catalog': '厂家图册',
     'unknown': '目录 / 封面 / 总说明',
     'unclassified': '未分类 (legacy)',
     '': '未分类',
@@ -993,6 +996,7 @@ async function renderStats() {
     'protection_diagram': '保护原理图',
     'panel_layout': '屏位布置图',
     'monitoring_system': '状态监测/通风',
+    'manufacturer_catalog': '厂家图册',
     'unknown': '目录/封面',
     'unclassified': '(未分类)',
   };

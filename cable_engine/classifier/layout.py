@@ -142,6 +142,7 @@ class LayoutClassifier(BaseClassifier):
             BusinessType.PROTECTION_DIAGRAM: protection_diagram,
             BusinessType.PANEL_LAYOUT: panel_layout,
             BusinessType.MONITORING_SYSTEM: monitoring_system,
+            BusinessType.MANUFACTURER_CATALOG: 0.0,
             BusinessType.UNKNOWN: unknown,
         }
 

@@ -50,14 +50,17 @@ _KEYWORD_TABLE: dict[BusinessType, list[str]] = {
         '监控信号',
     ],
     BusinessType.PANEL_LAYOUT: [
-        '屏位', '屏柜布置', '屏顶', '布置图',
-        '小室', '继电器室', '控制室',
-        '设备布置', '平面布置',
+        '屏面布置',
     ],
     BusinessType.MONITORING_SYSTEM: [
         '状态监测', '在线监测', '监测系统',
         '通风控制', 'SF6', '密度监测', '密度在线',
         '局放', '温度监测',
+    ],
+    BusinessType.MANUFACTURER_CATALOG: [
+        '厂家图册', '厂家资料', '产品说明书',
+        '安装使用说明书', '技术资料', '产品样本',
+        '产品目录', '使用手册',
     ],
     BusinessType.UNKNOWN: [
         # Markers of low-value drawings: cover pages, TOCs, design notes.
@@ -92,6 +95,7 @@ _STRONG_MARKERS: dict[BusinessType, list[str]] = {
     BusinessType.PROTECTION_DIAGRAM: ['保护原理图'],
     BusinessType.PANEL_LAYOUT: ['屏位布置图', '屏柜布置图'],
     BusinessType.MONITORING_SYSTEM: ['状态监测系统', '通风控制系统'],
+    BusinessType.MANUFACTURER_CATALOG: ['厂家图册', '产品说明书', '安装使用说明书'],
     BusinessType.UNKNOWN: ['目录', '卷册说明'],
 }
 

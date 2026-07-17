@@ -18,7 +18,7 @@ and second-best (a heuristic for "how sure are we").
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from .base import BaseClassifier, BusinessType, Classification
 from .geometry import GeometryClassifier
@@ -80,6 +80,31 @@ class CompositeClassifier(BaseClassifier):
         else:
             confidence = primary_score
 
+        # Manufacturer catalog override: if the document contains strong
+        # markers (e.g. "厂家图册"), it is a manufacturer catalog regardless
+        # of other keyword matches. This bypass prevents multi-type catalogs
+        # from being misclassified as circuit_loop / terminal_strip.
+        if BusinessType.MANUFACTURER_CATALOG not in composite:
+            pass
+        elif self._has_manufacturer_marker(doc):
+            composite[BusinessType.MANUFACTURER_CATALOG] += 5.0
+            composite[BusinessType.CIRCUIT_LOOP] = 0.0
+            composite[BusinessType.TERMINAL_STRIP] = 0.0
+            composite[BusinessType.PROTECTION_DIAGRAM] = 0.0
+            # Re-normalise so the boost doesn't overrun
+            max_s = max(composite.values()) or 1.0
+            normalised = {bt: s / max_s for bt, s in composite.items()}
+            ranked = sorted(normalised.items(), key=lambda kv: -kv[1])
+            primary_bt, primary_score = ranked[0]
+            secondary = [(bt, s) for bt, s in ranked[1:4] if s > 0.05]
+            confidence = 1.0
+            return Classification(
+                primary=primary_bt,
+                confidence=round(confidence, 4),
+                secondary=secondary,
+                signals=signals,
+            )
+
         # If the raw composite sum is too low (every classifier scored
         # < 0.1), the document is essentially empty / unrecognisable —
         # mark it unknown instead of inheriting enum-order tiebreaks.
@@ -96,6 +121,16 @@ class CompositeClassifier(BaseClassifier):
             secondary=secondary,
             signals=signals,
         )
+
+
+    @staticmethod
+    def _has_manufacturer_marker(doc: 'Document') -> bool:
+        """Check if the document text contains manufacturer_catalog strong markers."""
+        for e in doc.entities:
+            t = getattr(e, 'text', '') or ''
+            if '厂家图册' in t or '产品说明书' in t or '安装使用说明书' in t:
+                return True
+        return False
 
 
 __all__ = ['CompositeClassifier']
