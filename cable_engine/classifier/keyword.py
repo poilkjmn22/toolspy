@@ -93,7 +93,7 @@ _STRONG_MARKERS: dict[BusinessType, list[str]] = {
     BusinessType.TERMINAL_STRIP: ['端子排图', '端子功能图'],
     BusinessType.CABLE_SCHEDULE: ['电缆清册', '电缆联系图'],
     BusinessType.PROTECTION_DIAGRAM: ['保护原理图'],
-    BusinessType.PANEL_LAYOUT: ['屏位布置图', '屏柜布置图'],
+    BusinessType.PANEL_LAYOUT: ['屏面布置图'],
     BusinessType.MONITORING_SYSTEM: ['状态监测系统', '通风控制系统'],
     BusinessType.MANUFACTURER_CATALOG: ['厂家图册', '产品说明书', '安装使用说明书'],
     BusinessType.UNKNOWN: ['目录', '卷册说明'],

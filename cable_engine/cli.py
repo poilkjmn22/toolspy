@@ -256,7 +256,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
                 'terminal_strip': '端子排图',
                 'cable_schedule': '电缆清册',
                 'protection_diagram': '保护原理图',
-                'panel_layout': '屏位布置图',
+                'panel_layout': '屏面布置图',
                 'monitoring_system': '状态监测/通风',
                 'manufacturer_catalog': '厂家图册',
                 'unknown': '目录/封面',
