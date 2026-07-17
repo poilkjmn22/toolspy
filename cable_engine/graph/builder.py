@@ -444,238 +444,21 @@ class CircuitLoopAnalyzer:
             return f"{location}-{cab_name}"
         return cab_name
 
-    # ------------------------------------------------------------------
-    # V6.7 Geometry path tracing — finds terminals by following 90° wire
-    # paths from the WS position along the U-top, ray-casting for
-    # terminal circles and ignoring cabinet-boundary crossings.
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _nearest_tag_near(
-        tx: float, ty: float,
-        no_tags_by_y: dict[int, list[tuple[float, float, str, str]]],
-        side: str, ws_x: float,
-        y_range: int = 30,
-        x_tol: float = 50.0,
-    ) -> Optional[tuple[float, float, str, str]]:
-        """Find the nearest terminal text tag near position (tx, ty).
-
-        Searches ±y_range keys (±15 y-units with default 2x key)* and
-        returns the closest NO tag within x_tol of tx. Only returns tags
-        on the correct side of wx.
-        """
-        best: Optional[tuple[float, float, str, str]] = None
-        best_dist = float('inf')
-        key = round(ty * 2)
-        for dk in range(-y_range, y_range + 1):
-            for tag in no_tags_by_y.get(key + dk, []):
-                tag_x, tag_y, tag_val, tag_type = tag
-                if ':' not in tag_val:
-                    continue
-                if side == 'left' and tag_x >= ws_x:
-                    continue
-                if side == 'right' and tag_x <= ws_x:
-                    continue
-                dx = abs(tag_x - tx)
-                if dx >= x_tol:
-                    continue
-                dist = dx * dx + (tag_y - ty) * (tag_y - ty)
-                if dist < best_dist:
-                    best_dist = dist
-                    best = tag
-        return best
-
-    @staticmethod
-    def _find_terminal_icon(
-        x: float, y: float,
-        circles_by_y: dict[int, list[tuple[float, float, float]]],
-        terminal_icons_by_y: dict[int, list[tuple[float, float, str]]],
-        max_dist: float = 2.0,
-    ) -> tuple[float, float, bool]:
-        """Check for a terminal icon (CircleGeometry or TERNO/BL/BR) near (x,y).
-
-        Returns (icon_x, icon_y, found).
-        """
-        best_dist = max_dist
-        best_x, best_y = x, y
-        found = False
-        key = round(y * 2)
-        for dk in range(-4, 5):
-            for cx, cy, cr in circles_by_y.get(key + dk, []):
-                d = abs(cx - x) + abs(cy - y)
-                if d < best_dist:
-                    best_dist = d
-                    best_x, best_y = cx, cy
-                    found = True
-        for dk in range(-4, 5):
-            for ix, iy, itag in terminal_icons_by_y.get(key + dk, []):
-                d = abs(ix - x) + abs(iy - y)
-                if d < best_dist:
-                    best_dist = d
-                    best_x, best_y = ix, iy
-                    found = True
-        return best_x, best_y, found
-
-    @staticmethod
-    def _cabinet_path_trace(
-        wx: float, wy: float,
-        cabinets: list[dict],
-        core_lines: list[dict],
-        core_ys: list[float],
-        circles_by_y: dict[int, list[tuple[float, float, float]]],
-        terminal_icons_by_y: dict[int, list[tuple[float, float, str]]],
-        no_tags_by_y: dict[int, list[tuple[float, float, str, str]]],
-        verticals: list[dict],
-        side: str,
-    ) -> Optional[tuple[float, float, str, str]]:
-        """Cabinet-based path tracing to find a terminal for the given side.
-
-        Algorithm:
-        1. Find horizontal wires near wy that cross a cabinet vertical edge
-        2. Trace the wire endpoint (side opposite the cabinet) to find
-           a terminal icon (CircleGeometry or TERNO/BL/BR ATTRIB)
-        3. If no icon at the direct endpoint, follow 90° turns (vertical
-           segment → horizontal segment) looking for the terminal icon
-        4. Find the nearest NO/ObjTerm.Name tag near the terminal icon
-        5. Return (x, y, text, tag_type) or None
-
-        Returns None when no terminal is found (caller records icon-only
-        or empty).
-        """
-        import bisect as _bisect
-
-        _Y_TOL = 30.0
-        _CROSS_TOL = 2.0
-        _ENDPOINT_TOL = 30.0  # max x-distance from WS to wire endpoint
-
-        lo = _bisect.bisect_left(core_ys, wy - _Y_TOL)
-        hi = _bisect.bisect_right(core_ys, wy + _Y_TOL)
-        near_lines = core_lines[lo:hi]
-        if not near_lines:
-            return None
-
-        # Collect cabinet vertical edges at this y-level
-        crossing_edges: list[float] = []
-        for c in cabinets:
-            b = c['bbox']
-            if not (b.y - 1 <= wy <= b.y + b.h + 1):
-                continue
-            if side == 'left' and b.x < wx:
-                crossing_edges.append(b.x + b.w)
-            elif side == 'right' and b.x + b.w > wx:
-                crossing_edges.append(b.x)
-
-        # Candidate selection — four-tier priority:
-        #   1. Spans wx AND crosses a cabinet edge
-        #   2. Endpoint near wx AND crosses a cabinet edge
-        #   3. Spans wx (no cabinet constraint)
-        #   4. Endpoint near wx (no cabinet constraint)
-        def _crosses_cabinet(cl: dict) -> bool:
-            return any(
-                cl['x_min'] - _CROSS_TOL <= ex <= cl['x_max'] + _CROSS_TOL
-                for ex in crossing_edges
-            )
-
-        best: Optional[dict] = None
-        best_dy = float('inf')
-        for cl in near_lines:
-            spans = cl['x_min'] <= wx <= cl['x_max']
-            near_end = (
-                abs(cl['x_min'] - wx) <= _ENDPOINT_TOL
-                or abs(cl['x_max'] - wx) <= _ENDPOINT_TOL
-            )
-            if not spans and not near_end:
-                continue
-            crosses = _crosses_cabinet(cl)
-            # Priority encoding: (w_cabinet, w_span, dy)
-            # Higher priority = more likely to serve as the correct wire.
-            score = (1 if crosses else 0, 1 if spans else 0, -abs(cl['y'] - wy))
-            if best is None:
-                best = cl
-                best_dy = abs(cl['y'] - wy)
-                best_score = score
-            elif score > best_score:
-                best = cl
-                best_dy = abs(cl['y'] - wy)
-                best_score = score
-
-        if best is None:
-            return None
-
-        # Wire endpoint on the specified side
-        ep_x = best['x_min'] if side == 'left' else best['x_max']
-        ep_y = best['y']
-
-        # Find terminal icon at or near the endpoint
-        icon_x, icon_y, icon_found = CircuitLoopAnalyzer._find_terminal_icon(
-            ep_x, ep_y, circles_by_y, terminal_icons_by_y,
-        )
-
-        if not icon_found:
-            # Follow 90° turn: find a vertical segment at the endpoint
-            vert: Optional[dict] = None
-            for v in verticals:
-                if abs(v['x'] - ep_x) > 0.5:
-                    continue
-                if not (v['y1'] - 0.5 <= ep_y <= v['y2'] + 0.5):
-                    continue
-                at_endpoint = (
-                    abs(ep_y - v['y1']) <= 0.5 or abs(ep_y - v['y2']) <= 0.5
-                )
-                if not at_endpoint:
-                    continue
-                vert = v
-                break
-
-            if vert is not None:
-                # Follow vertical to its other end
-                other_y = (
-                    vert['y1'] if abs(vert['y2'] - ep_y) <= 0.5
-                    else vert['y2']
-                )
-                icon_x, icon_y, icon_found = CircuitLoopAnalyzer._find_terminal_icon(
-                    vert['x'], other_y, circles_by_y, terminal_icons_by_y,
-                )
-
-                if not icon_found:
-                    # Check for a horizontal segment at the vertical's other end
-                    hlo = _bisect.bisect_left(core_ys, other_y - 0.5)
-                    hhi = _bisect.bisect_right(core_ys, other_y + 0.5)
-                    for cl in core_lines[hlo:hhi]:
-                        if abs(cl['y'] - other_y) > 0.5:
-                            continue
-                        if not (cl['x_min'] <= vert['x'] <= cl['x_max']):
-                            continue
-                        h_ep = cl['x_min'] if side == 'left' else cl['x_max']
-                        icon_x, icon_y, icon_found = (
-                            CircuitLoopAnalyzer._find_terminal_icon(
-                                h_ep, other_y, circles_by_y,
-                                terminal_icons_by_y,
-                            )
-                        )
-                        break
-
-        if icon_found:
-            tag = CircuitLoopAnalyzer._nearest_tag_near(
-                icon_x, icon_y, no_tags_by_y, side, wx,
-            )
-            if tag is not None:
-                return tag
-            return (icon_x, icon_y, '', 'ICON_ONLY')
-
-        tag = CircuitLoopAnalyzer._nearest_tag_near(
-            ep_x, ep_y, no_tags_by_y, side, wx,
-        )
-        if tag is not None:
-            return tag
-        return None
-
     def analyze(self, doc: Document) -> list[dict]:
+        # V8: Build GeometryGraph + ElectricalQuery
+        from ..electrical import (
+            GeometryBuilder, GeometryGraph, WireBuilder, CabinetBuilder,
+            ElectricalQuery,
+        )
+        geo_graph: GeometryGraph = GeometryBuilder().build(doc)
+        WireBuilder(geo_graph).run()
+        CabinetBuilder(geo_graph).run()
+        query = ElectricalQuery(geo_graph)
+
         attribs: list[dict] = []
         for e in doc.entities:
             if not isinstance(e, (AttributeEntity, TextEntity)):
                 continue
-            # Skip low-confidence entities (block-local text from
-            # Phase 2b expansion — coordinates are not in model space).
             if e.confidence < 0.5:
                 continue
             cf = getattr(e, 'custom_fields', None) or {}
@@ -690,43 +473,6 @@ class CircuitLoopAnalyzer:
                 'x': x,
                 'y': y,
             })
-
-        # V6.6: cabinet-region index from CabinetRegion IR entities
-        # (TopologyStage populates them BEFORE invoking us). When the
-        # array is empty (e.g. an old rescan before V6.6), the
-        # cabinet-restricted filter is a no-op and the bucket +
-        # V6.5.3 200-unit-threshold logic still applies.
-        from ..ir import CabinetRegion as _CabReg_pre
-        from .cabinet import CabinetGridIndex
-        v66_cabinets: list[dict] = []
-        for ent in doc.entities:
-            if not isinstance(ent, _CabReg_pre):
-                continue
-            if ent.bbox is None:
-                continue
-            v66_cabinets.append({
-                'id': ent.id,
-                'name': ent.name,
-                'location': ent.location,
-                'display_name': ent.display_name,
-                'text_label': ent.text_label,
-                'bbox': ent.bbox,
-            })
-        # V6.7: spatial grid index for O(1) cabinet lookup.
-        cabinet_grid = CabinetGridIndex(v66_cabinets)
-
-        # Map each NO/ObjTerm.Name ATTRIB → its cabinet id (based on
-        # bbox containment). Attribs without a containing cabinet
-        # are NOT in this map — the bucket filter still considers them.
-        v66_terminal_cab: dict = {}
-        for a in attribs:
-            if a['tag'] not in ('NO', 'ObjTerm.Name'):
-                continue
-            if ':' not in a['val']:
-                continue
-            cab_id = cabinet_grid.lookup(a['x'], a['y'])
-            if cab_id is not None:
-                v66_terminal_cab[(a['x'], a['y'])] = cab_id
 
         # Detect cables from WireSerial entries
         cable_cores: dict[str, dict[int, dict]] = {}
@@ -744,129 +490,32 @@ class CircuitLoopAnalyzer:
                             'y': a['y'],
                         }
 
-        # Collect cabinet boundary handles + bbox edges so we can
-        # filter them out of core_lines. Cabinet boundary edges at
-        # the WS y-level act as fake U-tops — the path tracer follows
-        # them (no terminals) and returns None for both sides.
-        _cab_handles: set[str] = set()
-        _cab_y_edges: list[tuple[float, float, float]] = []
-        for _ce in doc.entities:
-            if not isinstance(_ce, _CabReg_pre):
-                continue
-            if _ce.bbox is None:
-                continue
-            if _ce.boundary_handle:
-                _cab_handles.add(_ce.boundary_handle)
-            _cab_y_edges.append(
-                (_ce.bbox.y, _ce.bbox.x, _ce.bbox.x + _ce.bbox.w)
-            )
-            _cab_y_edges.append(
-                (_ce.bbox.y + _ce.bbox.h, _ce.bbox.x,
-                 _ce.bbox.x + _ce.bbox.w)
-            )
-
-        # Pre-scan: collect horizontal LINE/LWPOLYLINE for core-line detection.
-        # V6.7: pre-sort by y so each per-core search is O(log L + window)
-        # instead of O(L).
-        import bisect as _bisect
-        core_lines: list[dict] = []
-        for e in doc.entities:
-            if not isinstance(e, LineGeometry):
-                continue
-            if e.handle in _cab_handles:
-                continue  # skip cabinet boundary LWPOLYLINE
-            pts = list(e.points or [])
-            if len(pts) < 2:
-                continue
-            ys = [p.y for p in pts]
-            xs = [p.x for p in pts]
-            if max(ys) - min(ys) > 3:
-                continue
-            dx = max(xs) - min(xs)
-            dy = max(ys) - min(ys)
-            if dx > 2 and dy > 2:
-                continue  # skip short diagonal annotations
-            # Skip horizontal lines that match a cabinet bbox top or
-            # bottom edge in both y and x-span. Catches cases where
-            # the cabinet boundary is drawn as 4 separate LINE entities
-            # (each edge a 2-point LINE, not a single LWPOLYLINE).
-            _cl_y = ys[0]
-            _cl_xmin = min(xs)
-            _cl_xmax = max(xs)
-            _is_cab_edge = False
-            for _ey, _ex_min, _ex_max in _cab_y_edges:
-                if abs(_cl_y - _ey) > 0.5:
-                    continue
-                if abs(_cl_xmin - _ex_min) > 2:
-                    continue
-                if abs(_cl_xmax - _ex_max) > 2:
-                    continue
-                _is_cab_edge = True
-                break
-            if _is_cab_edge:
-                continue
-            core_lines.append({
-                'y': _cl_y,
-                'x_min': _cl_xmin,
-                'x_max': _cl_xmax,
-            })
-        core_lines.sort(key=lambda cl: cl['y'])
-        _core_ys = [cl['y'] for cl in core_lines]
-
-        # V6.7: Pre-compute circles_by_y and verticals for geometry path tracing.
-        circles_by_y: dict[int, list[tuple[float, float, float]]] = {}
-        verticals: list[dict] = []  # {x, y1, y2} sorted by x
-        for e in doc.entities:
-            if isinstance(e, CircleGeometry):
-                c = e.center
-                if c is not None:
-                    key = round(c.y * 2)
-                    circles_by_y.setdefault(key, []).append(
-                        (c.x, c.y, e.radius or 1.0)
-                    )
-            elif isinstance(e, LineGeometry):
-                pts = list(e.points or [])
-                if len(pts) < 2:
-                    continue
-                xs = [p.x for p in pts]
-                ys = [p.y for p in pts]
-                dx = max(xs) - min(xs)
-                dy = max(ys) - min(ys)
-                if dx < 0.5 and dy > 5:  # near-vertical, substantial span
-                    verticals.append({
-                        'x': (xs[0] + xs[-1]) / 2,
-                        'y1': min(ys),
-                        'y2': max(ys),
-                    })
-        verticals.sort(key=lambda v: v['x'])
-
-        # Group NO tags and cable-level ATTRIB by y position.
-        no_tags_by_y: dict[int, list[tuple[float, float, str, str]]] = {}
+        # Group cable-level ATTRIB by tag for circuit_desc/loop_id matching
         cable_attribs: dict[str, list[dict]] = {}
-        # Terminal ICON positions (TERNO/BL/BR with empty text) grouped
-        # by y-key. These mark the physical icon location.
-        terminal_icons_by_y: dict[int, list[tuple[float, float, str]]] = {}
-        _TERMINAL_LABEL_RE = re.compile(r'^[A-Za-z0-9]+:[A-Za-z0-9]+$')
         for a in attribs:
-            if a['tag'] in ('NO', 'ObjTerm.Name') and ':' in a['val']:
-                key = round(a['y'] * 2)
-                no_tags_by_y.setdefault(key, []).append((a['x'], a['y'], a['val'], a['tag']))
-            elif not a['tag'] and _TERMINAL_LABEL_RE.match(a['val']):
-                key = round(a['y'] * 2)
-                no_tags_by_y.setdefault(key, []).append((a['x'], a['y'], a['val'], 'NO'))
-            elif a['tag'] in ('TERNO', 'BL', 'BR') and not a['val']:
-                key = round(a['y'] * 2)
-                terminal_icons_by_y.setdefault(key, []).append((a['x'], a['y'], a['tag']))
-            elif a['tag'] in ('WireDescription', 'LoopCode', 'WIRECODE'):
+            if a['tag'] in ('WireDescription', 'LoopCode', 'WIRECODE', 'WIRETYPE'):
                 cable_attribs.setdefault(a['tag'], []).append(a)
+
+        # Pre-compute cable_type per cable: find WIRETYPE nearest to each
+        # cable's WIRECODE attribute.
+        cable_wire_type: dict[str, Optional[str]] = {}
+        for wa in cable_attribs.get('WIRECODE', []):
+            wc_x, wc_y = wa['x'], wa['y']
+            best_d = 100.0
+            best = None
+            for wta in cable_attribs.get('WIRETYPE', []):
+                d = abs(wta['x'] - wc_x) + abs(wta['y'] - wc_y)
+                if d < best_d:
+                    best_d = d
+                    best = wta['val']
+            cable_wire_type[wa['val']] = best
 
         records: list[dict] = []
         for cid in sorted(cable_cores.keys()):
             cores = cable_cores[cid]
             core_order = sorted(cores.items(), key=lambda kv: -kv[1]['y'])
 
-            # Cabinet info is the same for all cores of a cable.
-            # Compute once using the first core that has valid terminals.
+            wire_type = cable_wire_type.get(cid)
             cabinet_local: Optional[str] = None
             cabinet_remote: Optional[str] = None
 
@@ -874,98 +523,44 @@ class CircuitLoopAnalyzer:
                 wx = info['x']
                 wy = info['y']
 
-                # Step 1: find the core line — closest horizontal line
-                # within ±30mm of WireSerial y. Prefer a line that
-                # spans wx (typical WS-on-left layout); if none,
-                # fall back to the closest line in the core area
-                # (x_min >= 200 and span >= 50mm).
-                _CORE_LINE_TOLERANCE = 30.0
-                core_y = wy
-                best_cl: Optional[dict] = None
-                best_dy = float('inf')
-                lo = _bisect.bisect_left(_core_ys, wy - _CORE_LINE_TOLERANCE)
-                hi = _bisect.bisect_right(_core_ys, wy + _CORE_LINE_TOLERANCE)
-                window = core_lines[lo:hi]
-                # Pass 1: find closest line that spans wx
-                for cl in window:
-                    if cl['x_min'] <= wx <= cl['x_max']:
-                        dy = abs(cl['y'] - wy)
-                        if dy < best_dy:
-                            best_dy = dy
-                            best_cl = cl
-                # Pass 2: if no spanning line, find closest line that
-                # is both in the core x-region (x_min >= 200) and has
-                # a substantial span (>= 50mm). This picks the main
-                # core line when WS is placed to its right, while
-                # excluding left-side formatting lines (x < 200) and
-                # right-side tick marks (span < 50mm).
-                if best_cl is None:
-                    for cl in window:
-                        if (
-                            cl['x_min'] >= 200
-                            and cl['x_max'] - cl['x_min'] >= 50.0
-                        ):
-                            dy = abs(cl['y'] - wy)
-                            if dy < best_dy:
-                                best_dy = dy
-                                best_cl = cl
-                core_line_x_min = best_cl['x_min'] if best_cl else None
-                core_line_x_max = best_cl['x_max'] if best_cl else None
-                _ = core_y  # keep reference
+                left_result = query.find_terminal(wx, wy, 'left', cable_id=cid)
+                right_result = query.find_terminal(wx, wy, 'right', cable_id=cid)
 
-                left_candidate: Optional[tuple[float, float, str, str]] = None
-                right_candidate: Optional[tuple[float, float, str, str]] = None
+                left_terminal = left_result.number if left_result else None
+                left_terminal_x = left_result.x if left_result else None
+                left_terminal_y = left_result.y if left_result else None
 
-                # Cabinet-based path tracing (V7.0).
-                # Replaces all V6.5–V6.12 fallback methods with a single
-                # algorithm: find horizontal wires that cross cabinet
-                # vertical edges, trace endpoints to terminal icons,
-                # follow 90° turns, and find NO/ObjTerm.Name tags.
-                if left_candidate is None:
-                    left_candidate = CircuitLoopAnalyzer._cabinet_path_trace(
-                        wx, wy, v66_cabinets, core_lines, _core_ys,
-                        circles_by_y, terminal_icons_by_y, no_tags_by_y,
-                        verticals, 'left',
+                right_terminal = right_result.number if right_result else None
+                right_terminal_x = right_result.x if right_result else None
+                right_terminal_y = right_result.y if right_result else None
+
+                # Deduplicate: if left and right resolve to the same terminal
+                # (short wire stub, same cabinet), clear the remote
+                if (left_terminal and right_terminal
+                        and left_terminal == right_terminal
+                        and left_result and right_result
+                        and left_result.cabinet == right_result.cabinet):
+                    right_terminal = None
+                    right_terminal_x = None
+                    right_terminal_y = None
+
+                # Cabinet detection — once per cable on first valid terminal
+                if left_terminal_x is not None and cabinet_local is None:
+                    cabinet_local = (
+                        left_result.cabinet
+                        or self._find_cabinet(
+                            left_terminal_x, left_terminal_y, attribs,
+                        )
                     )
-                if right_candidate is None:
-                    right_candidate = CircuitLoopAnalyzer._cabinet_path_trace(
-                        wx, wy, v66_cabinets, core_lines, _core_ys,
-                        circles_by_y, terminal_icons_by_y, no_tags_by_y,
-                        verticals, 'right',
+                if right_terminal_x is not None and cabinet_remote is None:
+                    cabinet_remote = (
+                        right_result.cabinet
+                        or self._find_cabinet(
+                            right_terminal_x, right_terminal_y, attribs,
+                        )
                     )
 
-                left_terminal = left_candidate[2] if left_candidate else None
-                left_terminal_x = left_candidate[0] if left_candidate else None
-                left_terminal_y = left_candidate[1] if left_candidate else None
-
-                right_terminal = right_candidate[2] if right_candidate else None
-                right_terminal_x = right_candidate[0] if right_candidate else None
-                right_terminal_y = right_candidate[1] if right_candidate else None
-
-                # Step 2a: Cabinet detection — once per cable on the
-                # first core that has a valid terminal. Uses spatial
-                # cabinet lookup (terminal position inside a detected
-                # dashed-rectangle cabinet bbox → use its display name);
-                # falls back to text-search when no cabinet covers the
-                # terminal.
-                cab_lookup_x = left_terminal_x
-                cab_lookup_y = left_terminal_y
-                if cab_lookup_y is not None and cabinet_local is None:
-                    cabinet_local = cabinet_grid.lookup_name(
-                        cab_lookup_x, cab_lookup_y,
-                    ) or self._find_cabinet(
-                        cab_lookup_x, cab_lookup_y, attribs,
-                    )
-                right_cabinet_x = right_terminal_x
-                right_cabinet_y = right_terminal_y
-                if right_cabinet_y is not None and cabinet_remote is None:
-                    cabinet_remote = cabinet_grid.lookup_name(
-                        right_cabinet_x, right_cabinet_y,
-                    ) or self._find_cabinet(
-                        right_cabinet_x, right_cabinet_y, attribs,
-                    )
-
-                # Step 3: circuit_desc/loop_id — find the nearest
+                # circuit_desc/loop_id — find the nearest
                 # WireDescription and LoopCode ATTRIB to the cable's
                 # y range (scanning within 80mm y of wy).
                 circuit_desc = None
@@ -980,8 +575,6 @@ class CircuitLoopAnalyzer:
                         if dy > 80:
                             continue
                         dx = abs(a['x'] - wx)
-                        # Pick the closest in y first; if y tie, pick
-                        # the closer in x to the WS column.
                         if dy < best_dy or (dy == best_dy and dx < best_dx):
                             best_dy = dy
                             best_dx = dx
@@ -1002,7 +595,6 @@ class CircuitLoopAnalyzer:
                     except ValueError:
                         pass
 
-                # Remote terminal (full ID string, e.g. "9D:1")
                 terminal_no_remote = right_terminal
 
                 records.append({
@@ -1016,6 +608,7 @@ class CircuitLoopAnalyzer:
                     'circuit_desc': circuit_desc,
                     'loop_id': loop_id,
                     'source_type': 'circuit_loop',
+                    'wire_type': wire_type,
                 })
         return records
 
@@ -1344,6 +937,19 @@ class TopologyStage(Stage):
             self._store.bulk_upsert_cable_topology(_topo_rows)
         if _strip_rows:
             self._store.bulk_upsert_terminal_strips(_strip_rows)
+
+        # V8: persist cable_type info (one row per cable)
+        _seen_cable: set[str] = set()
+        _cable_info_rows: list[tuple] = []
+        for rec in records:
+            wt = rec.get('wire_type')
+            if wt and rec['cable_id'] not in _seen_cable:
+                _seen_cable.add(rec['cable_id'])
+                _cable_info_rows.append((
+                    rec['cable_id'], doc.content_hash, wt,
+                ))
+        if _cable_info_rows:
+            self._store.bulk_upsert_cable_info(_cable_info_rows)
 
         # V6.6: persist the cabinet-region rows computed BEFORE the
         # analyzer ran (so the analyzer could already use them).

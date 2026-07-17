@@ -151,6 +151,18 @@ CREATE INDEX IF NOT EXISTS idx_text_doc ON text_entities(document_hash);
 CREATE INDEX IF NOT EXISTS idx_text_content ON text_entities(text);
 
 -- ----------------------------------------------------------------------
+-- V8: Cable-type info (model + cross-section, from WIRETYPE attribute)
+-- One row per cable per document.
+-- ----------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS cable_info (
+    cable_id        TEXT NOT NULL,
+    document_hash   TEXT NOT NULL,
+    wire_type       TEXT,                     -- e.g. 'ZBN-KYJYP2-23-1kV-4x6'
+    PRIMARY KEY (cable_id, document_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_cable_info_wire_type ON cable_info(wire_type);
+
+-- ----------------------------------------------------------------------
 -- Generic scan state bag (replaces state.json)
 -- ----------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS scan_state (
@@ -471,6 +483,32 @@ class CableStore:
     def delete_topology_for_document(self, document_hash: str) -> None:
         self._conn.execute(
             'DELETE FROM cable_topology WHERE document_hash = ?',
+            (document_hash,),
+        )
+        self._conn.execute(
+            'DELETE FROM cable_info WHERE document_hash = ?',
+            (document_hash,),
+        )
+
+    def bulk_upsert_cable_info(
+        self,
+        rows: list[tuple],
+    ) -> None:
+        """Batch insert cable_type info. Each tuple has 3 elements::
+
+            (cable_id, wire_type, document_hash)
+        """
+        self._conn.executemany(
+            """INSERT INTO cable_info (cable_id, document_hash, wire_type)
+               VALUES (?, ?, ?)
+               ON CONFLICT(cable_id, document_hash) DO UPDATE SET
+                   wire_type = excluded.wire_type""",
+            rows,
+        )
+
+    def delete_cable_info_for_document(self, document_hash: str) -> None:
+        self._conn.execute(
+            'DELETE FROM cable_info WHERE document_hash = ?',
             (document_hash,),
         )
 
