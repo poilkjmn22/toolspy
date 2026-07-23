@@ -13,6 +13,8 @@ Pipeline:
 
 from __future__ import annotations
 
+from typing import Optional
+
 from .primitives.rectangle import DetectedRect, detect_rectangles
 from .primitives.line import LongLine, detect_long_lines
 from .primitives.bbox import (
@@ -48,16 +50,35 @@ def _collect_leaf_devices(node: LayoutNode) -> list[LayoutNode]:
             if c.node_type == LayoutNodeType.DEVICE]
 
 
+def _collect_text_positions(doc: Document) -> list[tuple[float, float, str]]:
+    """Collect (x, y, text) tuples for group label assignment."""
+    out: list[tuple[float, float, str]] = []
+    for e in doc.entities:
+        from ..ir import TextEntity, AttributeEntity
+        if not isinstance(e, (TextEntity, AttributeEntity)):
+            continue
+        t = (e.text or '').strip()
+        if not t or len(t) > 20:
+            continue
+        cf = getattr(e, 'custom_fields', None) or {}
+        ex = cf.get('x')
+        ey = cf.get('y')
+        if ex is not None and ey is not None:
+            out.append((ex, ey, t))
+    return out
+
+
 def _apply_grouping(
     parent: LayoutNode,
     cab_bbox: BBox,
+    text_positions: Optional[list[tuple[float, float, str]]] = None,
 ) -> None:
     """Cluster direct DEVICE children into GROUP nodes, insert into *parent*."""
     all_devices = _collect_leaf_devices(parent)
     if len(all_devices) < 3:
         return
 
-    groups = detect_layout_groups(all_devices, cab_bbox)
+    groups = detect_layout_groups(all_devices, cab_bbox, text_positions)
     if not groups:
         return
 
@@ -78,6 +99,19 @@ def _apply_grouping(
     parent.children = remaining
 
 
+def _identify_front_back(cabinets: list[LayoutNode]) -> None:
+    if len(cabinets) < 2:
+        return
+    sorted_cabs = sorted(cabinets, key=lambda n: n.bbox.x)
+    sorted_cabs[0].data['face'] = 'front'
+    if not sorted_cabs[0].name:
+        sorted_cabs[0].name = '正面'
+    for c in sorted_cabs[1:]:
+        c.data['face'] = 'back'
+        if not c.name:
+            c.name = '背面'
+
+
 def build_layout_tree(doc: Document) -> LayoutTree:
     tree = LayoutTree()
 
@@ -88,6 +122,8 @@ def build_layout_tree(doc: Document) -> LayoutTree:
     cabinets = detect_cabinets(doc, rects, verts, hors)
     if not cabinets:
         return tree
+
+    text_positions = _collect_text_positions(doc)
 
     for cab in cabinets:
         interior = detect_cabinet_interior(cab, rects)
@@ -121,7 +157,7 @@ def build_layout_tree(doc: Document) -> LayoutTree:
                 cab.add_child(area)
 
                 # Apply spatial grouping within each area.
-                _apply_grouping(area, cab.bbox)
+                _apply_grouping(area, cab.bbox, text_positions)
 
             # Detect orphan devices inside the cabinet but outside all areas.
             cab_rect_devs = detect_devices(doc, rects, cab)
@@ -149,7 +185,7 @@ def build_layout_tree(doc: Document) -> LayoutTree:
                 cab.add_child(d)
 
             # Apply grouping on orphans too.
-            _apply_grouping(cab, cab.bbox)
+            _apply_grouping(cab, cab.bbox, text_positions)
         else:
             devices = detect_devices(doc, rects, cab)
             open_devs = _detect_open_rect_devices(doc, cab, all_verts, all_hors)
@@ -161,12 +197,15 @@ def build_layout_tree(doc: Document) -> LayoutTree:
                     cab.add_child(d)
 
             # Apply spatial grouping at cabinet level.
-            _apply_grouping(cab, cab.bbox)
+            _apply_grouping(cab, cab.bbox, text_positions)
 
         tree.add_root(cab)
 
     # Annotate GROUP nodes with semantic types.
     _annotate_groups(tree)
+
+    # Identify front/back cabinets by relative x position.
+    _identify_front_back(cabinets)
 
     return tree
 

@@ -28,7 +28,8 @@ H_DIFF_TOL = 6.0
 SPACING_STD_TOL = 5.0
 MIN_COUNT = 2
 GRID_MIN_DIM = 2
-GAP_MAX = 40.0
+GAP_MAX = 80.0
+ROW_GAP_MAX = 120.0
 PROXIMITY_RADIUS = 50.0
 SCORE_THRESHOLD = 0.40
 
@@ -41,6 +42,7 @@ SCORE_THRESHOLD = 0.40
 def detect_layout_groups(
     devices: list[LayoutNode],
     cab_bbox: BBox,
+    text_positions: Optional[list[tuple[float, float, str]]] = None,
 ) -> list[LayoutNode]:
     if len(devices) < MIN_COUNT:
         return []
@@ -71,6 +73,10 @@ def detect_layout_groups(
                 for d in comp:
                     used.add(d.id)
                 groups.append(g)
+
+    # Assign text labels to unnamed groups
+    if text_positions:
+        _assign_group_labels(groups, text_positions, cab_bbox)
 
     return groups
 
@@ -369,7 +375,7 @@ def _detect_rows(
     for aligned in _y_sweep(devices, Y_TOL):
         if len(aligned) < MIN_COUNT:
             continue
-        for part in _split_gap_x(aligned, GAP_MAX):
+        for part in _split_gap_x(aligned, ROW_GAP_MAX):
             if len(part) < MIN_COUNT:
                 continue
             g = _score_row(part, cab_bbox)
@@ -513,6 +519,42 @@ def _connected_components(
                     stack.append(nb)
         components.append(comp)
     return components
+
+
+def _assign_group_labels(
+    groups: list[LayoutNode],
+    text_positions: list[tuple[float, float, str]],
+    cab_bbox: BBox,
+) -> None:
+    """Assign nearby text labels as group names.
+
+    For each GROUP, finds the closest text entity above its bbox
+    (within 30u y-range and ±50u x-range) and sets it as the
+    group's *name*.  This catches labels such as "左侧" / "右侧"
+    that describe a column or row.
+    """
+    for g in groups:
+        if g.name:
+            continue
+        gb = g.bbox
+        cx = gb.x + gb.w / 2
+        best_label = ''
+        best_dy = 999.0
+        for ex, ey, t in text_positions:
+            if gb.x - 10 <= ex <= gb.x + gb.w + 10:
+                pass  # same x-span as group
+            elif abs(ex - cx) > 50:
+                continue  # too far in x
+            if ey < gb.y + gb.h:
+                continue  # not above
+            dy = ey - (gb.y + gb.h)
+            if dy > 30:
+                continue
+            if dy < best_dy:
+                best_dy = dy
+                best_label = t
+        if best_label:
+            g.name = best_label
 
 
 def _build_freeform(

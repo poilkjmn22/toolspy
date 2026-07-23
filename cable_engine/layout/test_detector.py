@@ -401,6 +401,62 @@ def test_grouping_integration():
     print('  ✓ test_grouping_integration')
 
 
+def test_front_back_cabinets():
+    """Left cabinet → front face, right cabinet → back face."""
+    cab_left = LayoutNode(id='cab_l', node_type=LayoutNodeType.CABINET,
+                          bbox=BBox(0, 0, 100, 200), name='')
+    cab_right = LayoutNode(id='cab_r', node_type=LayoutNodeType.CABINET,
+                           bbox=BBox(200, 0, 100, 200), name='')
+    from .detector import _identify_front_back
+    _identify_front_back([cab_left, cab_right])
+    assert cab_left.data.get('face') == 'front'
+    assert cab_left.name == '正面'
+    assert cab_right.data.get('face') == 'back'
+    assert cab_right.name == '背面'
+    print('  ✓ test_front_back_cabinets')
+
+
+def test_group_label_assignment_right():
+    """Text label 右侧 above the right column → group name = 右侧."""
+    from .grouping.clustering import detect_layout_groups
+    devs = [
+        _device_node('1D', 160, 200, 20, 15, 'd1'),
+        _device_node('3D', 160, 170, 20, 15, 'd3'),
+        _device_node('5D', 160, 140, 20, 15, 'd5'),
+    ]
+    text_positions = [(160, 240, '右侧')]
+    cab = BBox(0, 0, 300, 300)
+    groups = detect_layout_groups(devs, cab, text_positions)
+    assert len(groups) == 1, f'expected 1 group, got {len(groups)}'
+    g = groups[0]
+    assert g.group_type == LayoutGroupType.VERTICAL_COLUMN
+    assert g.name == '右侧', f'expected name=右侧, got {g.name!r}'
+    print(f'  Group: {g.name} [{g.group_type.value}]')
+    print('  ✓ test_group_label_assignment_right')
+
+
+def test_eyebrow_row_all_together():
+    """6 devices in a top row with 50-70u gaps → single ROW group (ROW_GAP_MAX=120)."""
+    from .grouping.clustering import _detect_rows
+    devs = [
+        _device_node('ZDK', 0, 280, 30, 15, 'zdk'),
+        _device_node('ZDF', 50, 280, 30, 15, 'zdf'),
+        _device_node('DK1', 120, 280, 30, 15, 'dk1'),
+        _device_node('DK2', 160, 280, 30, 15, 'dk2'),
+        _device_node('DK3', 200, 280, 30, 15, 'dk3'),
+        _device_node('DK4', 240, 280, 30, 15, 'dk4'),
+    ]
+    cab = BBox(0, 0, 300, 300)
+    used: set[str] = set()
+    rows = _detect_rows(devs, cab, used)
+    assert len(rows) == 1, f'expected 1 row, got {len(rows)}'
+    row = rows[0]
+    assert row.group_type == LayoutGroupType.HORIZONTAL_ROW
+    assert len(row.children) == 6
+    print(f'  Row: score={row.data["score"]}, children={len(row.children)}')
+    print('  ✓ test_eyebrow_row_all_together')
+
+
 if __name__ == '__main__':
     print('LayoutTree detector tests:')
     test_empty_doc()
@@ -418,5 +474,8 @@ if __name__ == '__main__':
     test_grid_detection()
     test_horizontal_row_detection()
     test_grouping_integration()
+    test_front_back_cabinets()
+    test_group_label_assignment_right()
+    test_eyebrow_row_all_together()
     print()
     print('All tests passed.')
