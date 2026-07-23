@@ -24,6 +24,7 @@ from typing import Any, Optional
 
 from cable_engine.graph import TopologyStage
 from cable_engine.ir import DocumentType
+from cable_engine.layout.stage import LayoutStage
 from cable_engine.loaders import get_loader_for
 from cable_engine.loaders.dwg_loader import _content_hash
 from cable_engine.pipeline import Context, Pipeline
@@ -57,11 +58,14 @@ def _discover_documents(input_dir: Path):
 
 
 def _pipeline_for(store: CableStore) -> Pipeline:
-    """V6 pipeline: Loader (already done) -> TopologyStage.
-    TopologyStage dispatches to the appropriate analyzer per doc type.
+    """V6 pipeline: Loader (already done) -> TopologyStage -> LayoutStage.
+    TopologyStage dispatches to the appropriate analyzer. LayoutStage
+    runs after classification is known so it only processes
+    panel_layout documents.
     """
     return Pipeline([
         TopologyStage(store),
+        LayoutStage(store),
     ])
 
 
@@ -257,6 +261,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
                 'cable_schedule': '电缆清册',
                 'protection_diagram': '保护原理图',
                 'panel_layout': '屏面布置图',
+                'panel_position': '屏位布置图',
                 'monitoring_system': '状态监测/通风',
                 'manufacturer_catalog': '厂家图册',
                 'unknown': '目录/封面',

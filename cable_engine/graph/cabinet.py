@@ -46,6 +46,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Iterable, Optional
 
+from ..core.asset import SpatialContainer
 from ..ir import Document, LineGeometry, TextEntity
 from ..ir.entities import BBox, Point
 
@@ -163,6 +164,18 @@ class CabinetRecord:
     @property
     def bbox(self) -> BBox:
         return self.boundary.bbox
+
+    @property
+    def container(self) -> SpatialContainer:
+        """Unified spatial identity for cross-world queries."""
+        return SpatialContainer(
+            id=self.id,
+            document_hash=self.document_hash,
+            bbox=self.bbox,
+            name=self.display_name or self.name,
+            source='dwg_dashed_rect',
+            layer=self.boundary.layer,
+        )
 
 
 # ---------------------------------------------------------------------------

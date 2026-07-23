@@ -1,0 +1,422 @@
+"""Tests for the LayoutTree detector using synthetic Document IR.
+
+Run: python -m cable_engine.layout.test_detector
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from ..ir import BBox, Document, DocumentType
+from ..ir.geometry import BlockRef, LineGeometry
+from ..ir.entities import Point, TextEntity
+from .detector import (
+    build_layout_tree,
+    detect_cabinets,
+    detect_long_lines,
+    detect_rectangles,
+)
+from .model import LayoutNode, LayoutNodeType, LayoutGroupType
+from .grouping import DeviceSpatialGraph, detect_layout_groups
+from .grouping.clustering import (
+    _detect_grids, _detect_columns, _detect_rows,
+    _connected_components,
+)
+
+
+def _line_geom(pts: list[Point], id_: str = '') -> LineGeometry:
+    ent = LineGeometry(
+        id=id_, source='dwg', page=1, confidence=1.0,
+        handle=id_, points=pts,
+    )
+    ent.custom_fields = {}
+    return ent
+
+
+def _text(text: str, x: float, y: float, id_: str = '') -> TextEntity:
+    ent = TextEntity(
+        id=id_, source='dwg', page=1, confidence=1.0, text=text,
+    )
+    ent.custom_fields = {'x': x, 'y': y}
+    return ent
+
+
+def _block_ref(name: str, x: float, y: float, id_: str = '') -> BlockRef:
+    return BlockRef(
+        id=id_, source='dwg', page=1, confidence=1.0,
+        handle=id_, name=name, insert_point=Point(x, y),
+    )
+
+
+def _device_node(name: str, x: float, y: float, w: float, h: float,
+                 did: str = '') -> LayoutNode:
+    return LayoutNode(
+        id=did or f'dev_{name}',
+        node_type=LayoutNodeType.DEVICE,
+        bbox=BBox(x, y, w, h),
+        name=name,
+    )
+
+
+def test_rectangle_from_polyline():
+    doc = Document(document_path=Path('/fake'), content_hash='test1', document_type=DocumentType.DWG)
+    doc.add_entity(_line_geom([
+        Point(0, 0), Point(100, 0), Point(100, 50), Point(0, 50), Point(0, 0),
+    ], 'h1'))
+    rects = detect_rectangles(doc)
+    assert len(rects) == 1, f'expected 1 rect, got {len(rects)}'
+    r = rects[0]
+    assert r.bbox.x == 0 and r.bbox.y == 0
+    assert r.bbox.w == 100 and r.bbox.h == 50
+    assert r.source_type == 'polyline'
+    print('  ✓ test_rectangle_from_polyline')
+
+
+def test_rectangle_from_4seg():
+    doc = Document(document_path=Path('/fake'), content_hash='test2', document_type=DocumentType.DWG)
+    doc.add_entity(_line_geom([Point(0, 0), Point(100, 0)], 's1'))
+    doc.add_entity(_line_geom([Point(100, 0), Point(100, 50)], 's2'))
+    doc.add_entity(_line_geom([Point(100, 50), Point(0, 50)], 's3'))
+    doc.add_entity(_line_geom([Point(0, 50), Point(0, 0)], 's4'))
+    rects = detect_rectangles(doc)
+    assert len(rects) == 1, f'expected 1 rect, got {len(rects)}'
+    r = rects[0]
+    assert r.bbox.x == 0 and r.bbox.y == 0
+    assert r.bbox.w == 100 and r.bbox.h == 50
+    assert r.source_type == '4seg'
+    print('  ✓ test_rectangle_from_4seg')
+
+
+def test_cabinet_from_paired_verticals():
+    """Cabinet formed by 2 long vertical lines (no top/bottom)."""
+    doc = Document(document_path=Path('/fake'), content_hash='test_cab', document_type=DocumentType.DWG)
+    doc.add_entity(_line_geom([Point(-166, -107), Point(-166, 200)], 'v1'))
+    doc.add_entity(_line_geom([Point(12, -107), Point(12, 200)], 'v2'))
+    doc.add_entity(_text('保护屏 220kV线路A', -77, 210, 't1'))
+
+    rects = detect_rectangles(doc)
+    assert len(rects) == 0
+
+    verts, hors = detect_long_lines(doc, min_length=50.0)
+    assert len(verts) == 2, f'expected 2 verticals, got {len(verts)}'
+    assert verts[0].length == 307
+
+    cabinets = detect_cabinets(doc, rects, verts, hors)
+    assert len(cabinets) == 1, f'expected 1 cabinet, got {len(cabinets)}'
+    cab = cabinets[0]
+    print(f'  Cabinet: {cab.name} bbox=({cab.bbox.x:.0f},{cab.bbox.y:.0f}) '
+          f'{cab.bbox.w:.0f}x{cab.bbox.h:.0f}')
+    assert cab.bbox.w == 178 and cab.bbox.h == 307
+    print('  ✓ test_cabinet_from_paired_verticals')
+
+
+def test_areas_from_horizontal_dividers():
+    """Cabinet with horizontal dividers → panel areas (thin areas filtered)."""
+    doc = Document(document_path=Path('/fake'), content_hash='test_area', document_type=DocumentType.DWG)
+    doc.add_entity(_line_geom([Point(-166, -107), Point(-166, 200)], 'v1'))
+    doc.add_entity(_line_geom([Point(12, -107), Point(12, 200)], 'v2'))
+    doc.add_entity(_line_geom([Point(-166, 60), Point(12, 60)], 'h1'))
+    doc.add_entity(_line_geom([Point(-166, 10), Point(12, 10)], 'h2'))
+
+    tree = build_layout_tree(doc)
+    cab = tree.roots[0]
+    print(f'  Cabinets: {len(tree.roots)}, areas: {len(cab.children)}')
+    assert len(cab.children) == 3, f'expected 3 areas, got {len(cab.children)}'
+    for area in cab.children:
+        assert area.node_type == LayoutNodeType.PANEL_AREA
+        print(f'    Area {area.id}: y={area.bbox.y:.0f} h={area.bbox.h:.0f}')
+    print('  ✓ test_areas_from_horizontal_dividers')
+
+
+def test_devices_in_cabinet():
+    """Devices (small rectangles) inside a cabinet."""
+    doc = Document(document_path=Path('/fake'), content_hash='test_dev', document_type=DocumentType.DWG)
+    doc.add_entity(_line_geom([Point(-166, -107), Point(-166, 200)], 'v1'))
+    doc.add_entity(_line_geom([Point(12, -107), Point(12, 200)], 'v2'))
+    doc.add_entity(_line_geom([Point(-166, 40), Point(12, 40)], 'h1'))
+
+    doc.add_entity(_line_geom([
+        Point(-155, 80), Point(-138, 80),
+        Point(-138, 108), Point(-155, 108), Point(-155, 80),
+    ], 'dev1'))
+    doc.add_entity(_line_geom([
+        Point(-130, 80), Point(-113, 80),
+        Point(-113, 108), Point(-130, 108), Point(-130, 80),
+    ], 'dev2'))
+
+    doc.add_entity(_text('M1', -146, 95, 'tm1'))
+    doc.add_entity(_text('DK1', -122, 95, 'tdk1'))
+
+    tree = build_layout_tree(doc)
+    cab = tree.roots[0]
+    print(f'  Cabinet children ({len(cab.children)}):')
+    for c in cab.children:
+        print(f'    {c.node_type.value} "{c.name}" ({len(c.children)} children)')
+        for cc in c.children or []:
+            print(f'      {cc.node_type.value} "{cc.name}"')
+    assert len(cab.children) == 2, f'expected 2 areas, got {len(cab.children)}'
+    area_top = cab.children[1]
+    print(f'  Top area: {area_top.bbox.h:.0f}u, devices: {len(area_top.children)}')
+    assert len(area_top.children) == 2
+    for dev in area_top.children:
+        assert dev.node_type == LayoutNodeType.DEVICE
+        print(f'    Device "{dev.name}" ({dev.bbox.w:.0f}x{dev.bbox.h:.0f})')
+    print('  ✓ test_devices_in_cabinet')
+
+
+def test_device_with_blockref():
+    """Device as BlockRef with anonymous block + expanded geometry."""
+    doc = Document(document_path=Path('/fake'), content_hash='test_br', document_type=DocumentType.DWG)
+    doc.add_entity(_line_geom([Point(-166, -107), Point(-166, 200)], 'v1'))
+    doc.add_entity(_line_geom([Point(12, -107), Point(12, 200)], 'v2'))
+    doc.add_entity(_line_geom([
+        Point(-155, 80), Point(-138, 80),
+        Point(-138, 108), Point(-155, 108), Point(-155, 80),
+    ], 'dev_frame'))
+    doc.add_entity(_block_ref('A$C49E661ED', -146, 94, 'br1'))
+
+    tree = build_layout_tree(doc)
+    assert len(tree.roots) == 1
+    cab = tree.roots[0]
+    print(f'  Cabinet children: {len(cab.children)}')
+    for child in cab.children:
+        if child.node_type == LayoutNodeType.DEVICE:
+            print(f'    Device "{child.name}" src={child.data.get("source")}')
+    assert len(cab.children) >= 1
+    assert any(c.node_type == LayoutNodeType.DEVICE for c in cab.children)
+    print('  ✓ test_device_with_blockref')
+
+
+def test_empty_doc():
+    """Empty document → empty tree."""
+    doc = Document(document_path=Path('/fake'), content_hash='empty', document_type=DocumentType.DWG)
+    tree = build_layout_tree(doc)
+    assert len(tree.roots) == 0
+    print('  ✓ test_empty_doc')
+
+
+# ---------------------------------------------------------------------------
+# Grouping tests
+# ---------------------------------------------------------------------------
+
+
+def test_text_device_detection():
+    """Text-only DEVICE nodes created when no rectangle surrounds them."""
+    doc = Document(document_path=Path('/fake'), content_hash='test_txt', document_type=DocumentType.DWG)
+    doc.add_entity(_line_geom([Point(-166, -107), Point(-166, 200)], 'v1'))
+    doc.add_entity(_line_geom([Point(12, -107), Point(12, 200)], 'v2'))
+    doc.add_entity(_text('DH1', -150, 180, 'tdh1'))
+    doc.add_entity(_text('DH2', -150, 165, 'tdh2'))
+    doc.add_entity(_text('端子排', -80, 100, 'ttag'))  # skipped: >20 chars? No, "端子排" = 3 chars
+
+    tree = build_layout_tree(doc)
+    assert len(tree.roots) == 1
+    cab = tree.roots[0]
+    print(f'  Cabinet children: {len(cab.children)}')
+
+    def find_devices(node):
+        result = []
+        if node.node_type == LayoutNodeType.DEVICE:
+            result.append(node.name)
+        for c in node.children or []:
+            result.extend(find_devices(c))
+        return result
+
+    dev_names = find_devices(cab)
+    print(f'  Device names: {dev_names}')
+    assert 'DH1' in dev_names, f'DH1 not found in {dev_names}'
+    assert 'DH2' in dev_names, f'DH2 not found in {dev_names}'
+    print('  ✓ test_text_device_detection')
+
+
+def test_grid_detection():
+    """4 devices in 2×2 grid (M1, M2, DH1, DH2) → GRID group."""
+    devs = [
+        _device_node('M1', 10, 100, 20, 15, 'm1'),
+        _device_node('M2', 60, 100, 20, 15, 'm2'),
+        _device_node('DH1', 10, 60, 20, 15, 'dh1'),
+        _device_node('DH2', 60, 60, 20, 15, 'dh2'),
+    ]
+    cab = BBox(0, 0, 200, 300)
+    used: set[str] = set()
+    grids = _detect_grids(devs, cab, used)
+    assert len(grids) == 1, f'expected 1 grid, got {len(grids)}'
+    grid = grids[0]
+    assert grid.group_type == LayoutGroupType.GRID
+    assert len(grid.children) == 4
+    assert grid.data['grid_dims'] == {'cols': 2, 'rows': 2}
+    print(f'  GRID: dims={grid.data["grid_dims"]}, score={grid.data["score"]}')
+    print('  ✓ test_grid_detection')
+
+
+def test_horizontal_row_detection():
+    """Devices in a horizontal row at the top → HORIZONTAL_ROW group."""
+    cab_bbox = BBox(0, 0, 200, 300)
+    devs = [
+        _device_node('DK1', 10, 280, 30, 15, 'dk1'),
+        _device_node('DK2', 50, 280, 30, 15, 'dk2'),
+        _device_node('DK4', 90, 280, 30, 15, 'dk4'),
+        _device_node('DK3', 130, 280, 30, 15, 'dk3'),
+        _device_node('ZDK', 170, 280, 30, 15, 'zdk'),
+        _device_node('ZDF', 210, 280, 30, 15, 'zdf'),
+    ]
+    used: set[str] = set()
+    rows = _detect_rows(devs, cab_bbox, used)
+    assert len(rows) == 1, f'expected 1 row, got {len(rows)}'
+    row = rows[0]
+    assert row.group_type == LayoutGroupType.HORIZONTAL_ROW
+    assert len(row.children) == 6
+    assert 'top' in row.data.get('position', ''), f'position={row.data.get("position")}'
+    print(f'  Row: score={row.data["score"]}, pos={row.data["position"]}')
+    print('  ✓ test_horizontal_row_detection')
+
+
+def test_gap_splitting_excludes_distant_device():
+    """GZ11 far from 1D-5D column → split into separate groups (or GZ11 excluded)."""
+    cab_bbox = BBox(0, 0, 200, 300)
+    # Tight column of 5 terminals
+    devs = [
+        _device_node('1D', 160, 200, 20, 15, 'd1'),
+        _device_node('3D', 160, 170, 20, 15, 'd3'),
+        _device_node('5D', 160, 140, 20, 15, 'd5'),
+        _device_node('GZ11', 160, 40, 25, 20, 'gz'),  # far below, gap > 40
+    ]
+    used: set[str] = set()
+    cols = _detect_columns(devs, cab_bbox, used)
+    assert len(cols) == 1, f'expected 1 column (1D-5D), got {len(cols)}'
+    col = cols[0]
+    names = [c.name for c in col.children]
+    assert 'GZ11' not in names, f'GZ11 should be excluded, children={names}'
+    assert len(col.children) == 3
+    print(f'  Column children: {names}')
+    print('  ✓ test_gap_splitting_excludes_distant_device')
+
+
+def test_device_spatial_graph():
+    """DeviceSpatialGraph indexes devices by centroid."""
+    devs = [
+        _device_node('A', 10, 100, 20, 10, 'da'),
+        _device_node('B', 10, 80, 20, 10, 'db'),
+        _device_node('C', 10, 60, 20, 10, 'dc'),
+    ]
+    g = DeviceSpatialGraph(devs, cell_size=50)
+    assert len(g.devices) == 3
+    assert g.center(devs[0]) == (20, 105)
+    print('  ✓ test_device_spatial_graph')
+
+
+def test_vertical_column_detection():
+    """6 devices in a vertical column (x-aligned, evenly spaced)."""
+    devs = [
+        _device_node('2D', 10, 180, 20, 10, 'd2'),
+        _device_node('4D', 10, 150, 20, 10, 'd4'),
+        _device_node('6D', 10, 120, 20, 10, 'd6'),
+        _device_node('8D', 10, 90, 20, 10, 'd8'),
+        _device_node('10D', 10, 60, 20, 10, 'd10'),
+        _device_node('12D', 10, 30, 20, 10, 'd12'),
+    ]
+    cab = BBox(0, 0, 200, 300)
+    used: set[str] = set()
+    cols = _detect_columns(devs, cab, used)
+    assert len(cols) == 1, f'expected 1 column, got {len(cols)}'
+    col = cols[0]
+    assert col.node_type == LayoutNodeType.GROUP
+    assert col.group_type == LayoutGroupType.VERTICAL_COLUMN
+    assert len(col.children) == 6
+    assert col.data['score'] >= 0.40
+    print(f'  Column: score={col.data["score"]}, evidence={col.data["evidence"]}')
+    print('  ✓ test_vertical_column_detection')
+
+
+def test_no_group_for_scattered_devices():
+    """Scattered devices with different x positions → no group."""
+    devs = [
+        _device_node('A', 10, 100, 20, 10, 'da'),
+        _device_node('B', 50, 80, 20, 10, 'db'),
+        _device_node('C', 90, 60, 20, 10, 'dc'),
+    ]
+    cab = BBox(0, 0, 200, 300)
+    used: set[str] = set()
+    cols = _detect_columns(devs, cab, used)
+    assert len(cols) == 0, f'expected 0 columns, got {len(cols)}'
+    print('  ✓ test_no_group_for_scattered_devices')
+
+
+def test_grouping_integration():
+    """Full pipeline: cabinet + devices → LayoutGroup nodes in tree."""
+    doc = Document(document_path=Path('/fake'), content_hash='test_grp', document_type=DocumentType.DWG)
+    doc.add_entity(_line_geom([Point(-166, -107), Point(-166, 200)], 'v1'))
+    doc.add_entity(_line_geom([Point(12, -107), Point(12, 200)], 'v2'))
+    doc.add_entity(_line_geom([Point(-166, 40), Point(12, 40)], 'h1'))
+
+    # 6 terminals in a column + 1 standalone device
+    for i, y in enumerate([180, 155, 130, 105, 80, 55]):
+        tag = f'{2 * (i + 1)}D'
+        did = f'dev_{tag}'
+        doc.add_entity(_line_geom([
+            Point(-155, y), Point(-135, y),
+            Point(-135, y + 18), Point(-155, y + 18), Point(-155, y),
+        ], did))
+        doc.add_entity(_text(tag, -145, y + 5, f't_{tag}'))
+
+    # GZ11 standalone
+    doc.add_entity(_line_geom([
+        Point(-100, 10), Point(-80, 10),
+        Point(-80, 35), Point(-100, 35), Point(-100, 10),
+    ], 'dev_gz'))
+    doc.add_entity(_text('GZ11', -90, 18, 't_gz'))
+
+    tree = build_layout_tree(doc)
+    assert len(tree.roots) == 1
+    cab = tree.roots[0]
+    print(f'  Cabinet children: {len(cab.children)}')
+    for c in cab.children:
+        print(f'    {c.node_type.value} "{c.name}" ({len(c.children)} children)')
+
+    # Find a GROUP somewhere in the tree
+    def find_groups(node: LayoutNode) -> list[LayoutNode]:
+        result = []
+        if node.node_type == LayoutNodeType.GROUP:
+            result.append(node)
+        for c in node.children or []:
+            result.extend(find_groups(c))
+        return result
+
+    groups = find_groups(cab)
+    print(f'  Groups found: {len(groups)}')
+    for g in groups:
+        print(f'    GROUP [{g.group_type}] score={g.data.get("score")} '
+              f'children={len(g.children)} '
+              f'semantic={g.data.get("group_semantic", {})}')
+    assert len(groups) == 1, f'expected 1 GROUP node, got {len(groups)}'
+    col = groups[0]
+    assert col.group_type == LayoutGroupType.VERTICAL_COLUMN
+    assert len(col.children) == 6
+    # Check group is under PANEL_AREA, not CABINET
+    assert col.parent is not None
+    assert col.parent.node_type == LayoutNodeType.PANEL_AREA
+    # Check semantic annotation
+    sem = col.data.get('group_semantic', {})
+    assert sem.get('type') == 'TERMINAL_COLUMN', f'expected TERMINAL_COLUMN, got {sem}'
+    print('  ✓ test_grouping_integration')
+
+
+if __name__ == '__main__':
+    print('LayoutTree detector tests:')
+    test_empty_doc()
+    test_rectangle_from_polyline()
+    test_rectangle_from_4seg()
+    test_cabinet_from_paired_verticals()
+    test_areas_from_horizontal_dividers()
+    test_devices_in_cabinet()
+    test_device_with_blockref()
+    test_text_device_detection()
+    test_device_spatial_graph()
+    test_vertical_column_detection()
+    test_no_group_for_scattered_devices()
+    test_gap_splitting_excludes_distant_device()
+    test_grid_detection()
+    test_horizontal_row_detection()
+    test_grouping_integration()
+    print()
+    print('All tests passed.')

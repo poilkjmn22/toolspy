@@ -98,7 +98,8 @@ INDEX_HTML = """<!DOCTYPE html>
   .doc-tree .cls-terminal_strip { background: #e3f2fd; color: #1565c0; }
   .doc-tree .cls-cable_schedule { background: #f3e5f5; color: #6a1b9a; }
   .doc-tree .cls-protection_diagram { background: #ffebee; color: #c62828; }
-  .doc-tree .cls-panel_layout { background: #e8f5e9; color: #2e7d32; }
+   .doc-tree .cls-panel_layout { background: #e8f5e9; color: #2e7d32; }
+   .doc-tree .cls-panel_position { background: #fff3e0; color: #e65100; }
   .doc-tree .cls-monitoring_system { background: #ede7f6; color: #4527a0; }
   .doc-tree .cls-manufacturer_catalog { background: #fce4ec; color: #880e4f; }
   .doc-tree .cls-unknown, .doc-tree .cls-unclassified { background: #eee; color: #888; }
@@ -696,11 +697,12 @@ const CLS_LABELS = {
   'terminal_strip': '端子排图',
   'cable_schedule': '电缆清册',
   'protection_diagram': '保护原理图',
-  'panel_layout': '屏位布置图',
-   'monitoring_system': '状态监测',
-   'manufacturer_catalog': '厂家图册',
-   'unknown': '未识别',
-   'unclassified': '未分类',
+  'panel_layout': '屏面布置图',
+  'panel_position': '屏位布置图',
+  'monitoring_system': '状态监测',
+  'manufacturer_catalog': '厂家图册',
+  'unknown': '未识别',
+  'unclassified': '未分类',
   '': '未分类',
 };
 
@@ -830,13 +832,99 @@ async function selectDocument(hash) {
   cableList.querySelectorAll('.file-row').forEach(el => {
     el.classList.toggle('selected', el.dataset.docHash === hash);
   });
-  const r = await fetch('/api/document/' + encodeURIComponent(hash) + '/topology');
-  if (!r.ok) {
+  const [topoR, layoutR] = await Promise.all([
+    fetch('/api/document/' + encodeURIComponent(hash) + '/topology'),
+    fetch('/api/document/' + encodeURIComponent(hash) + '/layout'),
+  ]);
+  if (!topoR.ok) {
     detail.innerHTML = '<div class="empty-state">未找到此图纸</div>';
     return;
   }
-  const data = await r.json();
+  let layoutData = null;
+  if (layoutR.ok) {
+    layoutData = await layoutR.json();
+  }
+  const data = await topoR.json();
+  data.layout = layoutData;
   renderDocumentDetail(data);
+}
+
+function renderLayoutTree(layout) {
+  if (!layout || !layout.roots || !layout.roots.length) return '';
+  const cabinets = layout.roots.filter(n => n.type === 'CABINET');
+  if (!cabinets.length) return '';
+
+  let html = '<div class="section"><h3>屏面布置图</h3>';
+  html += '<div style="font-size:12px;">';
+
+  for (const cab of cabinets) {
+    const isFront = cab.name ? true : false;
+    const label = isFront ? `${escHtml(cab.name)} (正面)` : '背面';
+    html += `<div style="margin:4px 0;padding:6px 8px;background:#fff;border:1px solid #e0e0e0;border-radius:4px;">
+      <div style="font-weight:600;color:#1565c0;">${label}</div>`;
+    html += _renderNodes(cab.children || [], 1);
+    html += '</div>';
+  }
+
+  html += '</div></div>';
+  return html;
+}
+
+function _renderNodes(nodes, depth) {
+  if (!nodes.length) return '';
+  let html = '';
+  for (const node of nodes) {
+    const indent = depth * 16;
+    if (node.type === 'PANEL_AREA') {
+      const inner = node.children || [];
+      const subGroups = inner.filter(c => c.type === 'PANEL_AREA');
+      const groups = inner.filter(c => c.type === 'GROUP');
+      const devices = inner.filter(c => c.type === 'DEVICE');
+      const hasLabel = !!node.name && node.name !== '设备区';
+      html += `<div style="margin:2px 0 2px ${indent}px;padding:2px 6px;border-left:2px solid #e0e0e0;">
+        <div style="font-size:11px;color:${hasLabel ? '#e65100' : '#666'};${hasLabel ? 'font-weight:600;' : ''}">${escHtml(node.name || '设备区')}</div>`;
+      if (subGroups.length) {
+        html += _renderNodes(subGroups, depth + 1);
+      }
+      if (groups.length) {
+        html += _renderNodes(groups, depth + 1);
+      }
+      for (const dev of devices) {
+        html += `<div style="margin:1px 0 1px ${(depth + 1) * 16}px;font-size:12px;">
+          <span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:#2e7d32;margin-right:4px;"></span>
+          ${escHtml(dev.name || '(未命名)')}
+        </div>`;
+      }
+      html += '</div>';
+    } else if (node.type === 'GROUP') {
+      const sem = node.data && node.data.group_semantic || {};
+      const semLabel = sem.type || node.group_type || 'GROUP';
+      const conf = sem.confidence ? ` (${(sem.confidence * 100).toFixed(0)}%)` : '';
+      const pos = node.data && node.data.position ? ` · ${node.data.position}` : '';
+      const scoreStr = node.data && node.data.score ? ` [${node.data.score}]` : '';
+      const dims = node.data && node.data.grid_dims
+        ? ` ${node.data.grid_dims.cols}×${node.data.grid_dims.rows}` : '';
+      const label = semLabel.replace(/_/g, ' ') + dims + pos + scoreStr;
+      html += `<div style="margin:2px 0 2px ${indent}px;padding:2px 6px;border-left:2px solid #7b1fa2;background:#faf0ff;">
+        <div style="font-size:11px;color:#7b1fa2;font-weight:600;">${escHtml(label)}${conf}</div>`;
+      const inner = node.children || [];
+      for (const child of inner) {
+        if (child.type === 'DEVICE') {
+          html += `<div style="margin:1px 0 1px ${(depth + 1) * 16}px;font-size:12px;">
+            <span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:#7b1fa2;margin-right:4px;"></span>
+            ${escHtml(child.name || '(未命名)')}
+          </div>`;
+        }
+      }
+      html += '</div>';
+    } else if (node.type === 'DEVICE') {
+      html += `<div style="margin:1px 0 1px ${indent}px;font-size:12px;">
+        <span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:#2e7d32;margin-right:4px;"></span>
+        ${escHtml(node.name || '(未命名)')}
+      </div>`;
+    }
+  }
+  return html;
 }
 
 function renderDocumentDetail(d) {
@@ -860,6 +948,11 @@ function renderDocumentDetail(d) {
       <span>业务类型: <strong>${escHtml(stLabel)}</strong></span>
     </div>
   </div>`;
+
+  // V8.5: panel layout tree (for 屏面布置图)
+  if (d.layout) {
+    html += renderLayoutTree(d.layout);
+  }
 
   html += `<div class="section">
     <h3>拓扑记录 (${d.conductor_count})</h3>
@@ -924,7 +1017,8 @@ async function renderUnclassified() {
 
   const clsLabels = {
     'protection_diagram': '保护 / 测控信号回路图',
-    'panel_layout': '屏位 / 屏柜布置图',
+    'panel_layout': '屏面布置图',
+    'panel_position': '屏位布置图',
     'monitoring_system': '状态监测 / 通风控制 / SF6',
     'manufacturer_catalog': '厂家图册',
     'unknown': '目录 / 封面 / 总说明',
@@ -994,7 +1088,8 @@ async function renderStats() {
     'terminal_strip': '端子排图',
     'cable_schedule': '电缆清册',
     'protection_diagram': '保护原理图',
-    'panel_layout': '屏位布置图',
+    'panel_layout': '屏面布置图',
+    'panel_position': '屏位布置图',
     'monitoring_system': '状态监测/通风',
     'manufacturer_catalog': '厂家图册',
     'unknown': '目录/封面',
@@ -1204,6 +1299,15 @@ async def search_text_handler(request: web.Request) -> web.Response:
     return web.json_response({'results': results, 'query': q, 'count': len(results)})
 
 
+async def document_layout_handler(request: web.Request) -> web.Response:
+    """V8.5: panel layout tree (cabinet → area → device) for a document."""
+    h = request.match_info['hash']
+    data = _viewer(request).get_document_layout(h)
+    if data is None:
+        return web.json_response({'error': f'no layout data for {h!r}'}, status=404)
+    return web.json_response(data)
+
+
 async def healthz_handler(request: web.Request) -> web.Response:
     return web.Response(text='OK', content_type='text/plain')
 
@@ -1238,6 +1342,7 @@ def make_app(db_path: Path) -> web.Application:
     app.router.add_get('/api/documents', documents_tree_handler)
     app.router.add_get('/api/document/{hash}/topology', document_topology_handler)
     app.router.add_get('/api/search-text', search_text_handler)
+    app.router.add_get('/api/document/{hash}/layout', document_layout_handler)
     app.router.add_get('/healthz', healthz_handler)
     return app
 

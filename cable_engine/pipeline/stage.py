@@ -57,6 +57,17 @@ class Context:
     # Business classification set by TopologyStage's DocumentClassifier.
     classification: Optional['Classification'] = None
 
+    # ---------- LayoutTree (V8.5) ----------
+    # Spatial containment tree, built by LayoutStage before TopologyStage.
+    layout_tree: Any = None                  # cable_engine.layout.LayoutTree
+
+    # ---------- PhysicalCabinet (V8.6) ----------
+    # List of PhysicalCabinet instances, one per CABINET node in the
+    # layout_tree. Each exposes .container: SpatialContainer for
+    # cross-world queries with LogicalCabinet (graph.cabinet).
+    physical_cabinets: list = field(default_factory=list)
+    # cable_engine.layout.cabinet.PhysicalCabinet
+
     # ---------- V6 outputs ----------
     # Result dict populated by the TopologyStage.
     result: Optional[dict] = None

@@ -77,8 +77,32 @@ class LayoutClassifier(BaseClassifier):
         se_frac = n_q[2] / total
         # If more than 50% in SE -> very title-block-heavy
         panel_layout = 0.0
+        panel_position = 0.0
         if se_frac > 0.45:
             panel_layout = min((se_frac - 0.45) / 0.3, 1.0)
+            panel_position = min((se_frac - 0.45) / 0.35, 0.7)
+
+        # panel_position (屏位布置图): floor plan text — moderately spread
+        # in a grid pattern. Text distributed across drawing but not too
+        # evenly (balance 0.4-0.7), moderate rows_per_text (0.15-0.5).
+        # The SE_frac-only rule above misses floor plans whose text is
+        # spread across the whole drawing (not title-block-concentrated).
+        if (not panel_position) and len(pts) > 50:
+            ne_frac = n_q[0] / total
+            nw_frac = n_q[1] / total
+            sw_frac = n_q[3] / total
+            balance = 1.0 - (
+                abs(ne_frac - 0.25) + abs(nw_frac - 0.25)
+                + abs(se_frac - 0.25) + abs(sw_frac - 0.25)
+            )
+            n_rows = len(set(round(y) for _, y in pts))
+            rows_per_text = n_rows / total
+            if 0.35 < balance < 0.7 and 0.15 < rows_per_text < 0.5:
+                panel_position = min(
+                    0.5 * min((balance - 0.35) / 0.2, 1.0)
+                    + 0.5 * min(rows_per_text / 0.3, 1.0),
+                    1.0,
+                )
 
         # Spread across all 4 quadrants (within ±10% of 25% each)
         ne_frac = n_q[0] / total
@@ -141,6 +165,7 @@ class LayoutClassifier(BaseClassifier):
             BusinessType.CABLE_SCHEDULE: cable_schedule,
             BusinessType.PROTECTION_DIAGRAM: protection_diagram,
             BusinessType.PANEL_LAYOUT: panel_layout,
+            BusinessType.PANEL_POSITION: panel_position,
             BusinessType.MONITORING_SYSTEM: monitoring_system,
             BusinessType.MANUFACTURER_CATALOG: 0.0,
             BusinessType.UNKNOWN: unknown,

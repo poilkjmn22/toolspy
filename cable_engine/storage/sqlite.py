@@ -162,14 +162,26 @@ CREATE TABLE IF NOT EXISTS cable_info (
 );
 CREATE INDEX IF NOT EXISTS idx_cable_info_wire_type ON cable_info(wire_type);
 
--- ----------------------------------------------------------------------
--- Generic scan state bag (replaces state.json)
--- ----------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS scan_state (
-    key             TEXT PRIMARY KEY,
-    value           TEXT
-);
-"""
+	-- ----------------------------------------------------------------------
+	-- Generic scan state bag (replaces state.json)
+	-- ----------------------------------------------------------------------
+	CREATE TABLE IF NOT EXISTS scan_state (
+	    key             TEXT PRIMARY KEY,
+	    value           TEXT
+	);
+
+	-- ----------------------------------------------------------------------
+	-- V8.5: Panel layout tree (屏面布置图 → 屏柜-设备关系)
+	-- One row per panel_layout document. The tree_json stores the full
+	-- LayoutTree (cabinet → areas → devices) as a JSON string.
+	-- ----------------------------------------------------------------------
+	CREATE TABLE IF NOT EXISTS panel_layout (
+	    document_hash   TEXT PRIMARY KEY,
+	    tree_json       TEXT NOT NULL,
+	    updated_at      TEXT DEFAULT (datetime('now')),
+	    FOREIGN KEY (document_hash) REFERENCES documents(content_hash)
+	);
+	"""
 
 
 # ---------------------------------------------------------------------------
@@ -323,11 +335,11 @@ class CableStore:
                        WHERE ct.document_hash = d.content_hash) AS has_topology
                FROM documents d
                WHERE d.classification_primary IN (
-                       'protection_diagram', 'panel_layout',
-                       'monitoring_system', 'manufacturer_catalog',
-                       'unknown'
-                   )
-                       OR d.classification_primary IS NULL
+                        'protection_diagram', 'panel_layout',
+                        'panel_position', 'monitoring_system',
+                        'manufacturer_catalog', 'unknown'
+                    )
+                        OR d.classification_primary IS NULL
                    ORDER BY d.classification_primary, d.rel_path
                LIMIT ?""",
             (limit,),
@@ -762,6 +774,34 @@ class CableStore:
         self.set_state(key, cur)
 
     # ------------------------------------------------------------------
+    # V8.5: Panel layout tree (屏面布置图)
+    # ------------------------------------------------------------------
+    def upsert_panel_layout(
+        self, document_hash: str, tree_json: str,
+    ) -> None:
+        self._conn.execute(
+            """INSERT INTO panel_layout (document_hash, tree_json, updated_at)
+               VALUES (?, ?, datetime('now'))
+               ON CONFLICT(document_hash) DO UPDATE SET
+                   tree_json = excluded.tree_json,
+                   updated_at = datetime('now')""",
+            (document_hash, tree_json),
+        )
+
+    def get_panel_layout(self, document_hash: str) -> Optional[str]:
+        row = self._conn.execute(
+            'SELECT tree_json FROM panel_layout WHERE document_hash = ?',
+            (document_hash,),
+        ).fetchone()
+        return row['tree_json'] if row else None
+
+    def delete_panel_layout_for_document(self, document_hash: str) -> None:
+        self._conn.execute(
+            'DELETE FROM panel_layout WHERE document_hash = ?',
+            (document_hash,),
+        )
+
+    # ------------------------------------------------------------------
     # Stats
     # ------------------------------------------------------------------
     def stats(self) -> dict:
@@ -856,8 +896,8 @@ class CableStore:
                 """SELECT COUNT(*) AS n FROM documents
                     WHERE classification_primary IN (
                         'protection_diagram', 'panel_layout',
-                        'monitoring_system', 'manufacturer_catalog',
-                        'unknown'
+                        'panel_position', 'monitoring_system',
+                        'manufacturer_catalog', 'unknown'
                     )
                       OR classification_primary IS NULL"""
             ).fetchone()

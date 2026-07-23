@@ -18,6 +18,7 @@ import math
 import re
 from typing import Iterable, Optional
 
+from ..core.asset import SpatialContainer
 from ..ir import (
     ArcGeometry, AttributeEntity, BlockRef, CircleGeometry, Document,
     DocumentType, GeometryEntity, LineGeometry, TextEntity,
@@ -827,8 +828,8 @@ _ANALYZERS_BY_TYPE: dict[BusinessType, Any] = {
     BusinessType.CIRCUIT_LOOP: CircuitLoopAnalyzer,
     BusinessType.TERMINAL_STRIP: TerminalStripAnalyzer,
     BusinessType.CABLE_SCHEDULE: CableScheduleAnalyzer,
-    # PROTECTION_DIAGRAM / PANEL_LAYOUT / MONITORING_SYSTEM / UNKNOWN
-    # don't have analyzers yet — they're surfaced in the "unmatched" bucket.
+    # PROTECTION_DIAGRAM / PANEL_LAYOUT / PANEL_POSITION /
+    # MONITORING_SYSTEM / UNKNOWN don't have analyzers yet.
 }
 
 

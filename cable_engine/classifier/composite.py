@@ -91,6 +91,7 @@ class CompositeClassifier(BaseClassifier):
             composite[BusinessType.CIRCUIT_LOOP] = 0.0
             composite[BusinessType.TERMINAL_STRIP] = 0.0
             composite[BusinessType.PROTECTION_DIAGRAM] = 0.0
+            composite[BusinessType.PANEL_POSITION] = 0.0
             # Re-normalise so the boost doesn't overrun
             max_s = max(composite.values()) or 1.0
             normalised = {bt: s / max_s for bt, s in composite.items()}
@@ -115,6 +116,16 @@ class CompositeClassifier(BaseClassifier):
             confidence = 0.0
             secondary = []
 
+        # Panel position override: if the document has the strong marker
+        # "屏位布置图" / "屏位图", PROTECTION_DIAGRAM keyword hits are
+        # false positives from cabinet labels. Override the tiebreak.
+        if (primary_bt == BusinessType.PROTECTION_DIAGRAM
+                and self._has_panel_position_marker(doc)):
+            primary_bt = BusinessType.PANEL_POSITION
+            primary_score = normalised[primary_bt]
+            confidence = min(primary_score * 0.8 + 0.2, 1.0)
+            secondary = [(bt, s) for bt, s in ranked if bt != primary_bt][:3]
+
         return Classification(
             primary=primary_bt,
             confidence=round(confidence, 4),
@@ -129,6 +140,16 @@ class CompositeClassifier(BaseClassifier):
         for e in doc.entities:
             t = getattr(e, 'text', '') or ''
             if '厂家图册' in t or '产品说明书' in t or '安装使用说明书' in t:
+                return True
+        return False
+
+
+    @staticmethod
+    def _has_panel_position_marker(doc: 'Document') -> bool:
+        """Check if the document text contains panel_position strong markers."""
+        for e in doc.entities:
+            t = getattr(e, 'text', '') or ''
+            if '屏位布置图' in t or '屏位图' in t:
                 return True
         return False
 

@@ -50,7 +50,12 @@ _KEYWORD_TABLE: dict[BusinessType, list[str]] = {
         '监控信号',
     ],
     BusinessType.PANEL_LAYOUT: [
-        '屏面布置',
+        '屏面布置', '屏柜',
+        '正面', '背面', '前门', '后门',  # panel face labels
+    ],
+    BusinessType.PANEL_POSITION: [
+        '屏位布置', '屏位图',
+        '屏位编号', '屏位表',
     ],
     BusinessType.MONITORING_SYSTEM: [
         '状态监测', '在线监测', '监测系统',
@@ -94,6 +99,7 @@ _STRONG_MARKERS: dict[BusinessType, list[str]] = {
     BusinessType.CABLE_SCHEDULE: ['电缆清册', '电缆联系图'],
     BusinessType.PROTECTION_DIAGRAM: ['保护原理图'],
     BusinessType.PANEL_LAYOUT: ['屏面布置图'],
+    BusinessType.PANEL_POSITION: ['屏位布置图', '屏位图'],
     BusinessType.MONITORING_SYSTEM: ['状态监测系统', '通风控制系统'],
     BusinessType.MANUFACTURER_CATALOG: ['厂家图册', '产品说明书', '安装使用说明书'],
     BusinessType.UNKNOWN: ['目录', '卷册说明'],

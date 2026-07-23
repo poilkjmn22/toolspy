@@ -18,7 +18,8 @@ Business types:
   - terminal_strip      (端子排图)
   - cable_schedule      (电缆清册 / 接线表 / 电缆联系图)
   - protection_diagram  (保护 / 测控信号回路图)
-  - panel_layout        (屏位 / 屏柜布置图)
+    - panel_layout        (屏面布置图)
+    - panel_position      (屏位布置图)
   - monitoring_system   (状态监测 / 通风控制 / SF6 监测)
   - unknown             (目录 / 封面 / 总说明 — no business value)
 """

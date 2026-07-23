@@ -121,7 +121,8 @@ class GeometryClassifier(BaseClassifier):
                     1.0,
                 )
 
-        # panel_layout: BlockRef-heavy, sparse lines (equipment blocks)
+        # panel_layout (屏面布置图): BlockRef-heavy, sparse lines (equipment blocks)
+        # Content: devices + tables inside a panel face layout
         panel_layout = 0.0
         if total_geom > 0:
             block_ratio = n_block / total_geom
@@ -131,6 +132,29 @@ class GeometryClassifier(BaseClassifier):
                     0.5 * min(block_ratio * 2.0, 1.0)
                     + 0.3 * min(n_block / 30.0, 1.0)
                     + 0.2 * min(n_text / 50.0, 1.0),
+                    1.0,
+                )
+
+        # panel_position (屏位布置图): floor plan / cabinet position layout
+        # Signature: high line ratio (cabinet rectangles), moderate text
+        # (labels), no EED (no cable wiring), no circles (no terminal markers),
+        # horizontals dominate (rows of cabinets).
+        panel_position = 0.0
+        if n_line > 0 and total_geom >= 50:
+            line_ratio = n_line / total_geom
+            text_ratio = n_text / total_geom
+            h_ratio = n_h / n_line
+            no_eed = total_eed == 0
+            few_circles = n_circ < 5
+            # Typical: line_ratio 0.5-0.9, text_ratio 0.05-0.3,
+            # h_ratio > 0.5, no EED, few circles
+            if (line_ratio > 0.5 and text_ratio > 0.05
+                    and h_ratio > 0.5 and no_eed and few_circles):
+                panel_position = min(
+                    0.35 * min(line_ratio * 1.2, 1.0)
+                    + 0.25 * min(text_ratio * 3.0, 1.0)
+                    + 0.25 * min(h_ratio, 1.0)
+                    + 0.15 * (1.0 - min(n_v / n_line, 1.0)),
                     1.0,
                 )
 
@@ -166,6 +190,7 @@ class GeometryClassifier(BaseClassifier):
             BusinessType.CABLE_SCHEDULE: cable_schedule,
             BusinessType.PROTECTION_DIAGRAM: protection_diagram,
             BusinessType.PANEL_LAYOUT: panel_layout,
+            BusinessType.PANEL_POSITION: panel_position,
             BusinessType.MONITORING_SYSTEM: monitoring_system,
             BusinessType.MANUFACTURER_CATALOG: 0.0,
             BusinessType.UNKNOWN: unknown,

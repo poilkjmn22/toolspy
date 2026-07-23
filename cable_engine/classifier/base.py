@@ -20,7 +20,8 @@ class BusinessType(str, Enum):
     TERMINAL_STRIP = 'terminal_strip'          # 端子排图
     CABLE_SCHEDULE = 'cable_schedule'          # 电缆清册 / 接线表
     PROTECTION_DIAGRAM = 'protection_diagram'  # 保护 / 测控回路
-    PANEL_LAYOUT = 'panel_layout'              # 屏位 / 屏柜布置图
+    PANEL_LAYOUT = 'panel_layout'              # 屏面布置图（屏柜正面/背面设备布局）
+    PANEL_POSITION = 'panel_position'          # 屏位布置图（屏位编号/位置分配）
     MONITORING_SYSTEM = 'monitoring_system'    # 状态监测 / 通风 / SF6
     MANUFACTURER_CATALOG = 'manufacturer_catalog'  # 厂家图册（含多类型图纸）
     UNKNOWN = 'unknown'                        # 目录 / 封面 / 总说明
@@ -32,6 +33,7 @@ ALL_BUSINESS_TYPES: tuple[BusinessType, ...] = (
     BusinessType.CABLE_SCHEDULE,
     BusinessType.PROTECTION_DIAGRAM,
     BusinessType.PANEL_LAYOUT,
+    BusinessType.PANEL_POSITION,
     BusinessType.MONITORING_SYSTEM,
     BusinessType.MANUFACTURER_CATALOG,
     BusinessType.UNKNOWN,

@@ -242,6 +242,21 @@ class CableViewer:
         return None
 
     # ------------------------------------------------------------------
+    # V8.5: Panel layout tree (屏面布置图)
+    # ------------------------------------------------------------------
+    def get_document_layout(self, content_hash: str) -> Optional[dict]:
+        """Return the panel layout tree for a document, if available.
+        Returns a dict with 'roots' (list of cabinet → area → device)."""
+        import json
+        raw = self._store.get_panel_layout(content_hash)
+        if raw is None:
+            return None
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return None
+
+    # ------------------------------------------------------------------
     # Text search (V6.7+)
     # ------------------------------------------------------------------
     def search_document_text(self, query: str, limit: int = 200) -> list[dict]:
