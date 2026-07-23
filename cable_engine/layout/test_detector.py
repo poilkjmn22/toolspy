@@ -403,16 +403,16 @@ def test_grouping_integration():
 
 def test_front_back_cabinets():
     """Left cabinet → front face, right cabinet → back face."""
-    cab_left = LayoutNode(id='cab_l', node_type=LayoutNodeType.CABINET,
-                          bbox=BBox(0, 0, 100, 200), name='')
-    cab_right = LayoutNode(id='cab_r', node_type=LayoutNodeType.CABINET,
-                           bbox=BBox(200, 0, 100, 200), name='')
+    cab_front = LayoutNode(id='cab_f', node_type=LayoutNodeType.CABINET,
+                           bbox=BBox(0, 100, 100, 200), name='')
+    cab_back = LayoutNode(id='cab_b', node_type=LayoutNodeType.CABINET,
+                          bbox=BBox(200, 300, 100, 200), name='')
     from .detector import _identify_front_back
-    _identify_front_back([cab_left, cab_right])
-    assert cab_left.data.get('face') == 'front'
-    assert cab_left.name == '正面'
-    assert cab_right.data.get('face') == 'back'
-    assert cab_right.name == '背面'
+    _identify_front_back([cab_front, cab_back])
+    assert cab_front.data.get('face') == 'front'
+    assert cab_front.name == '正面'
+    assert cab_back.data.get('face') == 'back'
+    assert cab_back.name == '背面'
     print('  ✓ test_front_back_cabinets')
 
 

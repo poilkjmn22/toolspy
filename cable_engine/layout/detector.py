@@ -102,7 +102,7 @@ def _apply_grouping(
 def _identify_front_back(cabinets: list[LayoutNode]) -> None:
     if len(cabinets) < 2:
         return
-    sorted_cabs = sorted(cabinets, key=lambda n: n.bbox.x)
+    sorted_cabs = sorted(cabinets, key=lambda n: n.bbox.y)
     sorted_cabs[0].data['face'] = 'front'
     if not sorted_cabs[0].name:
         sorted_cabs[0].name = '正面'
