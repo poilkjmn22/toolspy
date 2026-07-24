@@ -98,8 +98,7 @@ def _classify_group(devices: list[DeviceCandidate],
     x_range = max(cxs) - min(cxs)
     y_range = max(cys) - min(cys)
 
-    if x_range <= _X_TOL * 2:
-        # Column: x-aligned
+    if x_range <= _X_TOL * 3:
         score, evidence = _score_column(cxs, cys, widths, heights, cab_bbox)
         if score >= 0.4:
             return DeviceGroup(
@@ -153,7 +152,9 @@ def _score_column(cxs, cys, widths, heights, cab_bbox) -> tuple[float, list[str]
         score += 0.15
         evidence.append('h_consist')
 
-    gaps = [cys[i] - cys[i + 1] for i in range(len(cys) - 1)]
+    sorted_by_y = sorted(zip(cys, cxs, widths, heights), key=lambda x: -x[0])
+    gaps = [sorted_by_y[i][0] - sorted_by_y[i + 1][0]
+            for i in range(len(sorted_by_y) - 1)]
     if gaps and all(g > 2.0 for g in gaps):
         if len(gaps) >= 2:
             s = statistics.stdev(gaps) if len(gaps) >= 2 else 0.0

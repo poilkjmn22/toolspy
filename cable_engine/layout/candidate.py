@@ -27,6 +27,7 @@ from ..ir import (
 )
 from ..ir.entities import BBox
 from .primitives.bbox import bbox_contains_center, bbox_overlap_ratio
+from .primitives.line import detect_long_lines
 from .primitives.rectangle import detect_rectangles
 
 
@@ -245,11 +246,112 @@ def detect_text_devices(doc: Document, container: BBox,
 # ---------------------------------------------------------------------------
 
 
+def detect_spine_devices(doc: Document, container: BBox,
+                         ) -> list[DeviceCandidate]:
+    """Spine-based open-rect device detection → DeviceCandidate(0.75).
+
+    Open-rect devices share a common vertical spine and are formed by
+    pairs of short horizontal segments at consecutive y-positions. The
+    fourth side is either a far-side vertical line or the container edge.
+
+    Common in back-face terminal strips of panel layout drawings.
+    Ported from the legacy ``_detect_open_rect_devices`` algorithm.
+    """
+    all_verts, all_hors = detect_long_lines(doc, min_length=3.0)
+
+    # Short horizontals (<50u or touching container edge)
+    hors_short = [
+        h for h in all_hors
+        if container.y - 3 <= h.y <= container.y + container.h + 3
+        and h.start >= container.x - 5 and h.end <= container.x + container.w + 5
+        and (
+            h.length < 50
+            or abs(h.end - (container.x + container.w)) <= 3.0
+            or abs(h.start - container.x) <= 3.0
+        )
+    ]
+
+    # Long vertical spines (>=100u) inside the container
+    verts_long = [
+        v for v in all_verts
+        if v.length >= 100
+        and v.x >= container.x - 2 and v.x <= container.x + container.w + 2
+    ]
+
+    if not verts_long or not hors_short:
+        return []
+
+    # Group horizontals by their rounded x-span
+    segs_by_span: dict[tuple[float, float], list[float]] = {}
+    for h in hors_short:
+        a, b = round(h.start, 0), round(h.end, 0)
+        if a > b:
+            a, b = b, a
+        segs_by_span.setdefault((a, b), []).append(h.y)
+
+    out: list[DeviceCandidate] = []
+    dev_id = 0
+
+    for spine in verts_long:
+        sx = spine.x
+        for (x1, x2), ys in segs_by_span.items():
+            if abs(x1 - sx) > 2.0 and abs(x2 - sx) > 2.0:
+                continue
+            far_x = x2 if abs(x1 - sx) <= 2.0 else x1
+            width = abs(x2 - x1)
+            if width < 2:
+                continue
+
+            ys_sorted = sorted(set(ys), reverse=True)
+            for i in range(len(ys_sorted) - 1):
+                y_top = ys_sorted[i]
+                y_bot = ys_sorted[i + 1]
+                h = y_top - y_bot
+                if h < 5 or h > 100:
+                    continue
+
+                has_v = any(
+                    abs(v.x - far_x) < 1.0
+                    and v.start <= y_bot + 2 and v.end >= y_top - 2
+                    for v in all_verts
+                )
+                if not has_v:
+                    at_edge = abs(far_x - (container.x + container.w)) <= 3.0 \
+                              or abs(far_x - container.x) <= 3.0
+                    if not at_edge:
+                        continue
+
+                bbox = BBox(x=min(x1, far_x), y=y_bot, w=width, h=h)
+                if not bbox_contains_center(container, bbox):
+                    continue
+
+                texts = _texts_in_bbox(doc, bbox)
+                if not texts:
+                    continue
+
+                out.append(DeviceCandidate(
+                    id=f'sp_{dev_id}', bbox=bbox,
+                    texts=texts, score=0.75,
+                    source='spine_device',
+                ))
+                dev_id += 1
+
+    return out
+
+
 def build_device_candidates(doc: Document, container: BBox,
                             ) -> list[DeviceCandidate]:
-    """Run all detectors → deduplicated DeviceCandidates."""
+    """Run all detectors → deduplicated DeviceCandidates.
+
+    Pipeline order matters for dedup:
+      closed_rects(0.95) >> spine(0.75) > U_shape(0.70) > L_shape(0.50) > text(0.40)
+    Spine devices beat overlapping coarse U/L-shapes by higher score
+    (dedup sorts descending).
+    """
     pool = CandidatePool()
     for d in detect_closed_rects(doc, container):
+        pool.add_device(d)
+    for d in detect_spine_devices(doc, container):
         pool.add_device(d)
     for d in detect_open_shapes(doc, container):
         pool.add_device(d)
@@ -383,6 +485,25 @@ def _r(v: float) -> float:
     return round(v, 1)
 
 
+def _texts_in_bbox(doc: Document, bbox: BBox) -> list[tuple[str, float, float]]:
+    """Return text entities whose insertion point falls inside *bbox*."""
+    out: list[tuple[str, float, float]] = []
+    for e in doc.entities:
+        if not isinstance(e, (TextEntity, AttributeEntity)):
+            continue
+        t = (e.text or '').strip()
+        if not t or len(t) > 20:
+            continue
+        cf = getattr(e, 'custom_fields', None) or {}
+        ex = cf.get('x')
+        ey = cf.get('y')
+        if ex is None or ey is None:
+            continue
+        if bbox.x <= ex <= bbox.x + bbox.w and bbox.y <= ey <= bbox.y + bbox.h:
+            out.append((t, ex, ey))
+    return out
+
+
 def _texts_near(doc: Document, x: float, y: float, radius: float,
                 ) -> list[tuple[str, float, float]]:
     out: list[tuple[str, float, float]] = []
@@ -408,5 +529,6 @@ __all__ = [
     'DeviceCandidate', 'SymbolCandidate', 'CandidatePool',
     'detect_closed_rects', 'detect_open_shapes',
     'detect_circle_symbols', 'detect_text_devices',
+    'detect_spine_devices',
     'build_device_candidates',
 ]

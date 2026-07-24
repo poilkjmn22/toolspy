@@ -1,27 +1,17 @@
 """cable_engine.layout — LayoutTree: spatial-containment tree for panel layout.
 
-Layers:
-  types.py           — LayoutTree / LayoutNode / LayoutNodeType (legacy compat)
-  model.py           — LayoutNode / LayoutNodeType / LayoutGroupType (canonical)
-  grouping/          — DeviceSpatialGraph, detect_layout_groups (legacy sweep)
-  semantics/         — DeviceSemanticResolver, GroupSemanticResolver
-  candidate.py       — DeviceCandidate, CandidatePool (V8.1)
-  clustering.py      — DBSCANClusterer (V8.1)
-  associator.py      — TextAssociator (V8.1)
-  detector.py        — build_layout_tree(doc) → LayoutTree from Document IR
-  stage.py           — LayoutStage plugging into the pipeline
+Detection pipeline:
+  doc.entities  →  detect_rectangles / detect_long_lines
+               →  detect_cabinets  →  detect_areas_v2
+               →  candidate.build_device_candidates  →  DBSCANClusterer
+               →  TextAssociator  →  GROUP + DEVICE nodes
 
-V8.1 adds CandidatePool + DBSCAN clustering:
-  ClosedRectDetector  ─→ DeviceCandidate(0.95)
-  OpenShapeDetector   ─→ DeviceCandidate(L=0.5, U=0.7)
-  CircleDetector      ─→ SymbolCandidate → DeviceCandidate(0.60)
-  TextDetector        ─→ DeviceCandidate(0.40)
-          ↓
-    CandidatePool.dedup()
-          ↓
-    DBSCANClusterer(eps=30, min_samples=2)
-          ↓
-    DeviceGroup (COLUMN / ROW / GRID / FREEFORM)
+Candidate sources (pool → dedup → DBSCAN):
+  detect_closed_rects  ─→ DeviceCandidate(0.95)
+  detect_spine_devices ─→ DeviceCandidate(0.75)
+  detect_open_shapes   ─→ DeviceCandidate(L=0.5, U=0.7)
+  detect_circle_symbols─→ SymbolCandidate → DeviceCandidate(0.60)
+  detect_text_devices  ─→ DeviceCandidate(0.40)
 
 Quick start:
     from cable_engine.layout import build_layout_tree, LayoutTree, LayoutNodeType

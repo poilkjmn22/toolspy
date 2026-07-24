@@ -1,4 +1,4 @@
-# cable_engine 架构文档 (V8.0)
+# cable_engine 架构文档 (V8.2)
 
 ## 1. 系统概述
 
@@ -6,9 +6,11 @@
 DWG 文件 → DWGLoader (dwgread -O JSON) → Document IR → TopologyStage → cable.db (SQLite)
                                                                           ↓
                                                         tools/cable_match_viewer/ (aiohttp)
+                                                                          ↓
+                                                   LayoutStage → panel_layout (SQLite)
 ```
 
-单一 `TopologyStage` 负责文档分类、柜体分析和分析器分发。V8 引入了 **GeometryGraph**（纯几何图结构）来替代 V7 过程式的 `_cabinet_path_trace()` 算法。
+单一 `TopologyStage` 负责文档分类、柜体分析和分析器分发。V8 引入了 **GeometryGraph**（纯几何图结构）来替代 V7 过程式的 `_cabinet_path_trace()` 算法。V8.2 在 LayoutStage 中引入了基于 **CandidatePool** + **DBSCAN** 的设备检测管线，替代了 V8.0 的多阶段配置式检测。
 
 ## 2. 文档分类
 
@@ -399,7 +401,7 @@ TerminalStripAnalyzer.analyze(doc)
 
 电缆清册文档的存根分析器。对清册中每条电缆记录生成单行 `cable_topology` 条目，包含 `cable_id`、`source_type='cable_schedule'`，端子/回路字段为空。查看器使用这些记录构建可浏览的电缆索引。
 
-### 7.4 LayoutStage — 屏面布置图布局树
+### 7.4 LayoutStage — 屏面布置图布局树 (V8.2)
 
 `LayoutStage`（`cable_engine/layout/stage.py`）在 **TopologyStage 之后**运行，仅对 `PANEL_LAYOUT` 分类的文档进行处理。其构建一个分层的 **LayoutTree**（空间包含树，描述屏面布置图的物理结构），以 JSON 格式持久化到 `panel_layout` 表。
 
@@ -438,26 +440,32 @@ class LayoutNodeType(Enum):
     TABLE       = 'TABLE'        #（预留——不再生成）
     TITLE_BLOCK = 'TITLE_BLOCK'  # 标题栏（预留）
 ```
-**节点树结构**（正面柜含子分组；背面柜含开放矩形设备）：
+**节点树结构**（V8.2 — 含 GROUP 节点和正/背面标注）：
 
 ```
 
-CABINET "1号1000kV继电器小室高抗电能表柜"（正面 — front face，通过标题矩形命名）
+CABINET "1号1000kV继电器小室高抗电能表柜" (face=front，通过标题矩形命名)
   ├── DEVICE "M1 / DTZ178 / 张北I线 / 电抗器 / 本期"
   ├── DEVICE "M2 / DTZ178 / 张北II线 / 电抗器 / 本期"
   ├── DEVICE "M3 / DTZ178 / 预留1"
   └── DEVICE "M4 / DTZ178 / 预留2"
 
-CABINET ""（背面 — back face，无标题矩形，无名）
-  ├── DEVICE "ZDK ... DK4"   （闭合矩形检测）
-  ├── DEVICE "1D ... 12D"    （开放矩形，x=-64 脊柱）
-  └── DEVICE "GZ11"          （闭合矩形，底部）
-
+CABINET "" (face=back，无标题矩形，无名)
+  ├── PANEL_AREA "" （水平分隔线创建的区域）
+  │   ├── GROUP [VERTICAL_COLUMN] "TERMINAL_COLUMN"
+  │   │   ├── DEVICE "2D"
+  │   │   ├── DEVICE "4D"
+  │   │   └── DEVICE "6D"
+  │   └── GROUP [VERTICAL_COLUMN] "TERMINAL_COLUMN"
+  │       ├── DEVICE "1D"
+  │       ├── DEVICE "3D"
+  │       └── DEVICE "5D"
+  └── DEVICE "GZ11"          （独立设备，未分组）
 ```
 
 #### 7.4.2 检测算法（`build_layout_tree`）
 
-检测器（`cable_engine/layout/detector.py`）是一个多阶段空间管线：
+检测器（`cable_engine/layout/detector.py`）采用 V8.2 **CandidatePool + DBSCAN** 管线：
 
 ```
 Document IR 实体
@@ -475,11 +483,6 @@ Document IR 实体
     │   输出: list[LongLine] (verts, hors)
     │
     ▼
-第2b步 — 全量短线检测 (detect_long_lines, min_length=3.0)
-    │   相同逻辑，更细粒度——用于开放矩形设备检测
-    │   输出: list[LongLine] (all_verts, all_hors)
-    │
-    ▼
 第3步 — 柜体检测 (detect_cabinets)
     │   A. 基于矩形: 面积 > 10,000 u²，高宽比 1.5-5.0
     │      （屏柜高窄比 ~3:1；排除图幅边框 ~0.7）
@@ -491,81 +494,78 @@ Document IR 实体
     │   输出: list[LayoutNode] (type=CABINET)
     │
     ▼
-第4步 — 逐柜分析（无文档级表格检测）
-    │  （表格检测已移除——专注于柜面 + 设备）
-    │
-    ├─ 4a. 柜体内部结构 (_detect_cabinet_interior)
-    │     宽度≥柜体80% 且 高度≤15u 的内部矩形 → 标题矩形
-    │     宽度≥柜体50% 且 高度≥柜体40% 的内部矩形 → 设备区
-    │     拒绝 >柜体 bbox 110% 的矩形（防止图幅边框被误用）
-    │
-    ├─ 4b. 区域检测 (detect_areas_v2)
-    │     若找到设备区矩形: 使用其 bbox 作为 PANEL_AREA
-    │     否则: 水平分隔线（跨度≥柜体宽度50%）
-    │     → PANEL_AREA 节点（或空——设备直接挂 CABINET 下）
-    │
-    ├─ 4c. 设备子分组检测 (_detect_device_sub_groups)
-    │     查找设备区内部的子矩形（最小30u，≤设备区70%）
-    │     每个子矩形 → PANEL_AREA
-    │     顶部边缘附近的标签文本 → 分组名称（"左侧"、"右侧"）
-    │     过滤: 标签长度 >15 字符的分组被拒绝（避免版权声明）
-    │
-    ├─ 4d. 设备检测 — 两个来源合并:
-    │
-    │   来源 A — 闭合矩形 (detect_devices)
-    │     小矩形（两侧 3-150u），内部有文本（中心点包含关系）
-    │     下界 3.0u 处理窄背板设备（ZDK/DK 系列: 3.5×9）
-    │     BlockRef 实体 → 最近的小矩形
-    │     多行文本: 矩形内所有文本用 " / " 拼接
-    │       如 "M1 / DTZ178 / 张北I线 / 电抗器 / 本期"
-    │
-    │   来源 B — 开放矩形 (_detect_open_rect_devices)
-    │     检测三边 + 共享垂直脊柱的开放矩形设备（常见于背面布置）
-    │     算法:
-    │       a. 查找柜内短水平线（<50u）
-    │       b. 查找长垂直脊柱（≥100u）作为参考边
-    │       c. 对每个水平线跨度分组（按四舍五入的起止点 x 分组）:
-    │          将脊柱匹配到任一端点 2u 范围内
-    │          far_x = 对侧端点
-    │          对每对连续的 y 层级（间距 ≥5）:
-    │            检查 far_x 处是否存在覆盖该区间的垂直线
-    │            使用 x1（四舍五入的跨度起点）创建设备 bbox
-    │              以便与跨度边缘位置的文本对齐
-    │            通过 _find_device_name_by_text 命名
-    │
-    │   合并 (_merge_devices):
-    │     按 bbox 重叠 >0.4 去重；优先保留有名称的
-    │
-    │   设备分配:
-    │     如有子分组: 通过 _bbox_contains(group, device) 分配
-    │     否则: 设备直接挂到 AREA 或 CABINET 节点下
-    │
-    └─ 结果: CABINET 包含嵌套的 PANEL_AREA > DEVICE 树
+第4步 — 正/背面识别 (_identify_front_back)
+    │   在柜体底部下方查找"正面"/"背面"文本，按最近距离匹配
+    │   无匹配文本时使用 y 排序回退（上为正面，下为背面）
+    │   存入 cab.data.face: 'front' / 'back'
     │
     ▼
-第5步 — 树组装 (build_layout_tree)
-    CABINET 节点 → 树根节点
-    ↓
+第5步 — 逐柜内部结构分析
+    │
+    ├─ 5a. 柜体内部矩形 (detect_cabinet_interior)
+    │     宽度 ≥ 柜体 80% 且 高度 ≤ 15u → 标题矩形
+    │     宽度 ≥ 柜体 50% 且 高度 ≥ 柜体 40% → 设备区
+    │
+    ├─ 5b. 区域检测 (detect_areas_v2)
+    │     若找到设备区矩形: 使用其 bbox 作为 PANEL_AREA
+    │     否则: 水平分隔线（跨度 ≥ 柜体宽度 50%）
+    │     → PANEL_AREA 节点（或无——设备直接挂 CABINET 下）
+    │
+    └─ 5c. 设备检测与分组 (_apply_grouping_v2)
+         对每个 AREA（或整个 CABINET）运行：
+          │
+          ├─ build_device_candidates
+          │   5 级候选生成 + CandidatePool 去重
+          │
+          │   得分层级（Pipeline 顺序）:
+          │     detect_closed_rects    → 0.95  闭合矩形
+          │     detect_spine_devices   → 0.75  开放矩形（脊柱匹配）
+          │     detect_U_shapes        → 0.70  U 形（3 段，平行端）
+          │     detect_L_shapes        → 0.50  L 形（2 段，90° 端接）
+          │     detect_text_devices    → 0.40  文本回退（无矩形包围）
+          │
+          │   去重: CandidatePool 按得分保留，新候选与已有候选
+          │     重叠率 >0.2 时丢弃（低分者淘汰）
+          │
+          ├─ TextAssociator.associate_devices
+          │   将文本关联到设备: 最高文本 = name，其余 = description
+          │
+          ├─ DBSCANClusterer (eps=30, min_samples=2)
+          │   对 [cx, cy, w*0.1, h*0.1] 进行聚类
+          │   → DeviceGroup[] (VERTICAL_COLUMN / HORIZONTAL_ROW /
+          │                     GRID / FREEFORM)
+          │
+          └─ TextAssociator.associate_groups
+               分组标签（区域内的位置描述）
+    
+第6步 — 语义标注 (_annotate_groups)
+    GroupSemanticResolver 为 GROUP 节点分配语义类型
+    (TERMINAL_COLUMN / METER_GRID / DEVICE_PANEL 等)
+    │
+    ▼
     LayoutTree { roots: [...] }
 ```
 
-#### 7.4.3 关键辅助函数
+#### 7.4.3 关键辅助函数 (V8.2)
 
-| 函数 | 用途 | 核心逻辑 |
-|------|------|----------|
-| `detect_rectangles(doc)` | 从 LINE/POLYLINE 查找轴对齐矩形 | 闭合 4 点多段线或 4 段 LINE 链 |
-| `detect_long_lines(doc, min_length)` | 将长线分类为水平/垂直 | `\|dy\| < 2` → 水平；`\|dx\| < 2` → 垂直 |
-| `detect_cabinets(doc, rects, verts, hors)` | 柜体边界候选 | 矩形面积 >10k u² + 高宽比 1.5-5.0；配对垂直线 dx 140-240；矩形优先于配对垂直线；图幅边框 >90% 排除 |
-| `_detect_cabinet_interior(cab, rects)` | 柜体内部标题矩形和设备区 | 全宽薄矩形 = 标题；大内部矩形 = 设备区；拒绝 >柜体 bbox 110% 的矩形 |
-| `detect_areas_v2(doc, cab, hors, interior)` | 创建设备安装区域 | 优先使用内部矩形；分隔线回退 |
-| `_detect_device_sub_groups(doc, area, rects)` | 设备区内部的子矩形 | 最小 30u，≤70% 面积；顶部边缘文本作为标签；过滤 >15 字符标签 |
-| `detect_devices(doc, rects, container)` | 在容器内查找设备矩形 | 小矩形（3-150u）+ BlockRef 最近矩形；中心点包含关系 |
-| `_detect_open_rect_devices(doc, container, verts, hors)` | 三边+脊柱共享边开放矩形设备 | 短水平线按跨度分组；长垂直脊柱作为参考；远 x 垂直线闭合检查；bbox x 使用四舍五入的 x1 |
-| `_merge_devices(a, b)` | 合并两个设备列表，按重叠去重 | 重叠率 >0.4 → 重复 |
-| `_find_device_name_by_text(doc, bbox)` | 多行文本聚合 | 矩形内所有文本，从上到下排序，用 " / " 拼接 |
-| `_bbox_contains(outer, inner)` | 严格包含关系检查 | `outer.[x,y,w,h]` 完全包含 `inner` |
-| `_bbox_contains_center(outer, inner)` | 中心点包含关系 | Inner 的质心在 outer 内（5u 边距） |
-
+| 函数 | 模块 | 用途 |
+|------|------|------|
+| `detect_rectangles(doc)` | `primitives/rectangle.py` | 从 LINE/POLYLINE 查找轴对齐矩形 |
+| `detect_long_lines(doc, min_length)` | `primitives/line.py` | 将长线分类为水平/垂直 |
+| `detect_cabinets(doc, rects, verts, hors)` | `detectors/cabinet.py` | 柜体边界候选（矩形优先 + 配对垂直线回退） |
+| `detect_cabinet_interior(cab, rects)` | `detectors/area.py` | 柜体内部标题矩形和设备区 |
+| `detect_areas_v2(doc, cab, hors, interior)` | `detectors/area.py` | 创建设备安装区域（优先内部矩形，分隔线回退） |
+| `_identify_front_back(cabinets, doc)` | `detector.py` | 文本匹配正/背面，无匹配时 y 排序 |
+| `build_device_candidates(doc, bbox)` | `candidate.py` | 5 级候选生成器（闭合 → 脊柱 → U → L → 文本） |
+| `detect_closed_rects(doc, bbox)` | `candidate.py` | 闭合矩形设备（得分 0.95） |
+| `detect_spine_devices(doc, bbox)` | `candidate.py` | 脊柱匹配开放矩形（得分 0.75） |
+| `detect_U_shapes(doc, bbox)` | `candidate.py` | U 形设备检测（得分 0.70） |
+| `detect_L_shapes(doc, bbox)` | `candidate.py` | L 形设备检测（得分 0.50） |
+| `detect_text_devices(doc, bbox)` | `candidate.py` | 文本回退设备（得分 0.40） |
+| `CandidatePool` | `candidate.py` | 多源候选去重（按得分 + 重叠率） |
+| `TextAssociator` | `associator.py` | 文本关联（name/description + 分组标签） |
+| `DBSCANClusterer` | `clustering.py` | DBSCAN 空间聚类（eps=30, min_samples=2） |
+| `_score_column` | `clustering.py` | 列评分（x 对齐 + 等宽/等高 + 等间距） |
 #### 7.4.4 存储
 
 布局树序列化为 JSON（`LayoutNode` 数据类 → `asdict()` → JSON），存储在 `panel_layout` 表中：
@@ -608,11 +608,11 @@ V8.2 在 CABINET/PANEL_AREA 与 DEVICE 之间引入 **GROUP** 节点层。GROUP 
 ```
 CABINET (屏柜)
   ├── PANEL_AREA (安装区域)
-  │   ├── GROUP [VERTICAL_COLUMN] "TERMINAL_COLUMN"   ← V8.2 新增
+  │   ├── GROUP [VERTICAL_COLUMN] "TERMINAL_COLUMN"   ← V8.2 GROUP
   │   │   ├── DEVICE "2D"
   │   │   ├── DEVICE "4D"
   │   │   └── DEVICE "6D"
-  │   └── GROUP [GRID] "METER_GRID"                   ← V8.2 新增
+  │   └── GROUP [GRID] "METER_GRID"                   ← V8.2 GROUP
   │       ├── DEVICE "M1"
   │       ├── DEVICE "M2"
   │       ├── DEVICE "DH1"
@@ -622,14 +622,14 @@ CABINET (屏柜)
 
 #### 7.5.1 数据结构
 
-`model.py` 新增类型：
+`model.py` 中的类型：
 
 | 类型 | 说明 |
 |------|------|
 | `LayoutNodeType.GROUP` | 表示空间设备集群的节点类型 |
 | `LayoutGroupType` | 排布模式枚举：`VERTICAL_COLUMN` / `HORIZONTAL_ROW` / `GRID` / `FREEFORM` |
 
-`LayoutNode` 新增可选字段 `group_type: Optional[LayoutGroupType]`，仅对 `node_type == GROUP` 的节点有意义。
+`LayoutNode` 可选字段 `group_type: Optional[LayoutGroupType]`，仅对 `node_type == GROUP` 的节点有意义。
 
 `node.data` 中存储的元数据：
 
@@ -641,74 +641,68 @@ CABINET (屏柜)
 | `grid_dims` | dict | 仅 GRID：`{cols: N, rows: N}` |
 | `group_semantic` | dict | GroupSemanticResolver 输出的语义类型 |
 
-#### 7.5.2 空间聚类管线
+#### 7.5.2 DBSCAN 空间聚类
 
-`cable_engine/layout/grouping/clustering.py` 中的 4 阶段聚类管线替代了 V8.0/V8.1 基于包围盒的纯包含关系。新算法采用**扫描分组法**（sweep-based），无需连通分量初始初筛：
+`_apply_grouping_v2()` 使用 sklearn DBSCAN 替代 V8.0/V8.1 的包围盒分组和 V8.2 原型的扫描分组法（`grouping/` 已删除）：
 
 ```
-detect_layout_groups(devices, cab_bbox)
+_apply_grouping_v2(parent, cab_bbox, doc)
   │
-  ├─ Phase 1 — GRID 检测（对所有未分组设备）
-  │   _find_all_grids → 尝试所有设备对作为锚点间距
-  │   _match_grid     → 按间距匹配网格对齐的设备
-  │   _score_grid     → 聚类 x/y 中心验证 Nx×Ny = total
-  │   条件: ≥4 设备，cols≥2，rows≥2，总个数完全匹配
+  ├─ build_device_candidates(doc, container)
+  │   → 5 级候选（闭合 0.95 → 脊柱 0.75 → U 0.70 → L 0.50 → 文本 0.40）
+  │   → CandidatePool 去重（重叠 >0.2 时低分淘汰）
   │
-  ├─ Phase 2 — COLUMN 扫描（剩余设备）
-  │   _x_sweep        → 按 x 中心分组（tol=4.0）
-  │   _split_gap_y    → y 间隙 >40u 处分割
-  │   _score_column   → x 对齐 + 等宽 + 等高 + 等间距评分
-  │   条件: ≥2 设备，评分 ≥0.4
+  ├─ TextAssociator.associate_devices
+  │   → 每个候选获得 name + description
   │
-  ├─ Phase 3 — ROW 扫描（剩余设备）
-  │   _y_sweep        → 按 y 中心分组（tol=4.0）
-  │   _split_gap_x    → x 间隙 >40u 处分割
-  │   _score_row      → y 对齐 + 等高 + 等宽 + 等间距评分
-  │   条件: ≥2 设备，评分 ≥0.4
+  ├─ DBSCANClusterer.cluster(candidates, cab_bbox)
+  │   特征向量: [cx, cy, w*0.1, h*0.1]
+  │   参数: eps=30, min_samples=2
+  │   │
+  │   ├─ DBSCAN 聚类
+  │   ├─ 后分类: 每组按几何特征分类为
+  │   │   VERTICAL_COLUMN / HORIZONTAL_ROW / GRID / FREEFORM
+  │   │   评分: x/y 对齐 + 尺寸一致性 + 等间距
+  │   └─ _score_column: 按 cy 降序排序计算间距
+  │       （修复: 排序前为未排序导致标签文本产生负间距）
   │
-  └─ Phase 4 — FREEFORM 回退（剩余设备，须空间连通）
-      _connected_components → 50u 半径半径图 → DFS
-      _build_freeform       → 最小 2 设备
-      → FREEFORM 组
+  ├─ TextAssociator.associate_groups
+  │   → 分组位置标签（left / right 等）
+  │
+  └─ _build_group_node / _build_device_node
+      → 未分组设备直接作为 DEVICE 节点
+      → 已分组设备归入 GROUP 节点
 ```
 
-**关键参数**：
+**DBSCAN 关键参数**：
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `X_TOL` | 4.0 | x 中心对齐容差 |
-| `Y_TOL` | 4.0 | y 中心对齐容差 |
-| `W_DIFF_TOL` | 8.0 | 宽度一致性容差 |
-| `H_DIFF_TOL` | 6.0 | 高度一致性容差 |
-| `SPACING_STD_TOL` | 5.0 | 间距标准差容差 |
-| `MIN_COUNT` | 2 | 形成分组的最少设备数 |
-| `GAP_MAX` | 40.0 | 列/行内最大允许间隙 |
+| `eps` | 30.0 | 邻域半径（DWG 单位） |
+| `min_samples` | 2 | 形成核心点所需最少样本数 |
+| `W_DIFF_TOL` | 8.0 | 组内宽度一致性容差（后分类） |
+| `H_DIFF_TOL` | 6.0 | 组内高度一致性容差（后分类） |
+| `SPACING_STD_TOL` | 5.0 | 间距标准差容差（后分类） |
+| `GAP_MAX` | 40.0 | 列/行内最大允许间隙（后分类） |
 | `SCORE_THRESHOLD` | 0.40 | 形成分组的最少评分 |
 
-**为什么 GRID 先于 COLUMN/ROW**：
+**特征向量设计**：
 
-GRID 检测在所有未分组设备上运行。如果先运行 COLUMN/ROW，2×2 网格（如 M1/M2/DH1/DH2）会被拆分成两个独立的垂直列（左列 M1-DH1，右列 M2-DH2），失去网格识别能力。
+使用 `[cx, cy, w*0.1, h*0.1]` 而非原始 `[cx, cy]`：
+- w/h 缩放因子 0.1 防止尺寸差异主导聚类（CAD 设备尺寸范围 6u–30u）
+- 尺寸信息帮助分离相邻但尺寸不同的设备列
 
-**为什么扫描法而非连通分量**：
+**后分类流程**：
 
-V8.1 原型使用连通分量作为初始初筛（半径 50u），但背面柜中左右两列设备（如 1D-5D 列和 2D-12D 列）距离 <100u，被合并为一个连通分量，导致模式分类失败。扫描法通过直接检查 x/y 对齐避免了这一问题。
+DBSCAN 产生无标签簇 → 每簇按几何特征评分为四种模式之一：
+1. **GRID**：x 簇 ≥2 且 y 簇 ≥2，总设备数 = cols × rows
+2. **VERTICAL_COLUMN**：x 对齐 + 等宽 + 等高 + 等间距（`_score_column`）
+3. **HORIZONTAL_ROW**：y 对齐 + 等高 + 等宽 + 等间距
+4. **FREEFORM**：其余簇（回退）
 
-#### 7.5.3 基于文本的设备回退
+后分类的一致性检查严格于 DBSCAN 的聚类（如 w/h 差 ≤8/6u），确保 FREEFORM 组仅包含真正相似的设备。
 
-`_detect_text_devices()`（`detectors/device.py`）为缺乏包围矩形的文本创建 DEVICE 节点：
-
-```
-_detect_text_devices(doc, container)
-  │
-  ├─ 收集容器内所有 TextEntity / AttributeEntity（≤20 字符）
-  ├─ 排除与已有 DEVICE bbox 重复的文本（重叠率 >0.2）
-  ├─ 估算 bbox：width = len(text) × 10u，height = 15u
-  └─ 生成 source='text' 的 DEVICE 节点
-```
-
-该回退捕捉端子排名称（"端子排"、"DH1"、"DH2"）等无闭合矩形包围的文本。
-
-#### 7.5.4 语义分类
+#### 7.5.3 语义分类
 
 `GroupSemanticResolver`（`semantics/group_type.py`）为 GROUP 节点分配语义类型：
 
@@ -723,30 +717,20 @@ _detect_text_devices(doc, container)
 
 评分机制按 `weight × match_ratio` 累加，最高分胜出。
 
-#### 7.5.5 管线集成
-
-`_apply_grouping()`（`detector.py`）在 `build_layout_tree` 构建完 CABINET → PANEL_AREA → DEVICE 树后运行：
-
-1. 通过 `_collect_leaf_devices(parent)` 收集 PANEL_AREA 或 CABINET 的直接子 DEVICE。
-2. 如设备数 ≥3，调用 `detect_layout_groups()` 进行 4 阶段聚类。
-3. 将已分组的设备从 parent 中移除，替换为 GROUP 节点。
-4. 对 GROUP 节点调用 `annotate_groups()`（GroupSemanticResolver），写入 `node.data['group_semantic']`。
-5. `_apply_grouping` 在 PANEL_AREA 级和 CABINET 级分别调用——`_collect_leaf_devices` 仅返回直接子 DEVICE（避免递归进入子 PANEL_AREA）。
-
-#### 7.5.6 存储与序列化
+#### 7.5.4 存储与序列化
 
 `LayoutStage._node_to_dict()` 为 GROUP 节点序列化 `group_type` 字段：
 
 ```json
 {
-  "id": "group_v",
+  "id": "dbscan_0",
   "type": "GROUP",
   "group_type": "VERTICAL_COLUMN",
   "name": "",
   "bbox": {"x": 50, "y": 10, "w": 30, "h": 120},
   "children": [...],
   "data": {
-    "score": 1.0,
+    "score": 0.9,
     "evidence": ["x_align", "w_consist", "h_consist", "count:6", "left_edge"],
     "position": "left",
     "group_semantic": {
@@ -758,9 +742,9 @@ _detect_text_devices(doc, container)
 }
 ```
 
-#### 7.5.7 查看器渲染
+#### 7.5.5 查看器渲染
 
-`tools/cable_match_viewer/server.py` 中的 `_renderNodes` 函数将 GROUP 节点渲染为：
+`tools/cable_match_viewer/server.py` 中的 `renderLayoutTree` 函数将 GROUP 节点渲染为：
 
 | 视觉元素 | 说明 |
 |----------|------|
@@ -768,6 +752,7 @@ _detect_text_devices(doc, container)
 | 语义标签 + 位置 | 如 `METER_GRID`，位置附加 `left`, `top`, `right`, `bottom`, `center` |
 | 网格尺寸 | GRID 节点显示 `2×2` |
 | 分组评分 | 数据中的 `score.round(2)` 作为可信度提示 |
+| 正/背面标识 | 使用 `cab.data.face` — `front` = 柜体名称, `back` = "背面" |
 
 ## 8. 柜体语义层
 
@@ -842,18 +827,18 @@ cable_engine/
 │   ├── __init__.py              # 公开 API 导出（含 LayoutGroupType）
 │   ├── types.py                 # LayoutTree, LayoutNode, LayoutNodeType（遗留兼容）
 │   ├── model.py                 # LayoutNode, LayoutNodeType, LayoutGroupType（规范）
-│   ├── detector.py              # 6 步空间检测管线 + _apply_grouping
-│   ├── stage.py                 # LayoutStage（序列化 group_type）
+│   ├── detector.py              # V8.2 检测管线 + _apply_grouping_v2
+│   ├── stage.py                 # LayoutStage（序列化）
+│   ├── candidate.py             # DeviceCandidate + 5 级生成器 + CandidatePool
+│   ├── associator.py            # TextAssociator（name/description + 分组标签）
+│   ├── clustering.py            # DBSCANClusterer + _score_column
 │   ├── cabinet.py               # PhysicalCabinet 包装器
-│   ├── test_detector.py         # 15 个单元测试（分组、GRID、文本设备等）
+│   ├── test_detector.py         # 23 个单元测试
 │   ├── demo.py                  # CLI demo
 │   ├── detectors/               # 空间检测模块
 │   │   ├── __init__.py          # 初始化
-│   │   └── device.py            # detect_devices, open-rect, BlockRef, text-device、merge
-│   ├── grouping/                # ← V8.2 设备空间聚类
-│   │   ├── __init__.py          # 导出 DeviceSpatialGraph, detect_layout_groups
-│   │   ├── clustering.py        # 4 阶段扫描聚类（GRID→COLUMN→ROW→FREEFORM）
-│   │   └── spatial_graph.py     # DeviceSpatialGraph 空间索引
+│   │   ├── cabinet.py           # detect_cabinets, 配对垂直线, 合并
+│   │   └── area.py              # 区域检测 + 柜体内部结构
 │   ├── primitives/              # 矩形、线段原语
 │   │   ├── __init__.py
 │   │   ├── bbox.py              # BBox 工具函数
@@ -861,7 +846,8 @@ cable_engine/
 │   │   └── rectangle.py         # DetectedRect / detect_rectangles
 │   └── semantics/               # ← V8.2 弱语义标注层
 │       ├── __init__.py          # 初始化
-│       └── group_type.py        # GroupSemanticResolver + 语义模式
+│       ├── group_type.py        # GroupSemanticResolver + 语义模式
+│       └── device_type.py       # 设备类型分类（预留）
 ├── loaders/
 │   ├── dwg_loader.py            # dwgread -O JSON + ezdxf 回退
 │   └── pdf_loader.py            # pypdfium2（延期）
@@ -893,21 +879,15 @@ tools/cable_match_viewer/
 | **基于面积的图幅边框排除** | 图幅边框排除使用面积比（>90%），而非基于尺寸（最大尺寸的 70%）。防止过滤掉占据图幅大部分的合理大型柜体。 |
 | **柜体高宽比过滤 (1.5-5.0)** | 柜体正面高窄（h/w≈3:1）；排除图幅边框（h/w≈0.7）和宽内框。 |
 | **基于矩形柜体优先于配对垂直线** | 当两种来源产生重叠候选时，合并优先选择基于矩形的；配对垂直线仅作为开放柜体的回退方案。 |
-| **设备区矩形必须在柜体内** | 内部区域分析拒绝 >柜体 bbox 110% 的矩形，防止图幅边框被用作小型柜体的设备区。 |
-| **设备最小尺寸 3.0u** | 从 8u 下调以处理窄背板设备（ZDK/DK 系列：3.5×9）。正面设备（17×28）不受影响。 |
-| **开放矩形设备检测** | 与长垂直脊柱共享一条边的设备（3 条绘制边 + 脊柱作为第 4 条），通过短水平线 + far-x 垂直线检测。覆盖背面布置中设备沿公共垂直分隔线绘制的场景。 |
-| **开放矩形 bbox x 使用四舍五入的 x1** | bbox 原点使用四舍五入的水平跨度起点（x1）而非原始脊柱坐标（sx）。修复了当脊柱坐标（-63.78）导致 bbox 位于文本锚点（-63.85）左侧时文本超出 bbox 的问题。 |
-| **无文档级表格检测** | 已移除。专注于前后柜面及其设备矩形。设备表将在需要时重新添加。 |
-| **设备子分组检测** | 设备区内部的子矩形被检测为设备分组（PANEL_AREA 子节点）。子矩形顶部边缘附近的文本标签成为分组名称（"左侧"、"右侧"）。标签 >15 字符的分组被过滤（避免版权声明）。 |
-| **多行设备名称聚合** | 设备边界框内的所有文本实体用" / "分隔符合并。一个设备可能有多行文本（如"M1"+"DTZ178"+"张北I线"），共同标识它。 |
-| **V8.2 GROUP 节点介于 AREA 与 DEVICE 之间** | GROUP 是空间集群节点，携带 `group_type`（排布模式）和语义类型。不改动现有 CABINET/AREA/DEVICE 层级，通过 `parent.children` 插入。 |
-| **扫描法聚类优先于连通分量** | 连通分量在左右列设备距离 <100u 时合并它们，导致模式分类失败。扫描法（x-sweep、y-sweep）直接检查对齐，不受相邻列干扰。 |
-| **GRID 先于 COLUMN/ROW** | 若先运行 COLUMN 扫描，2×2 网格（M1-M2-DH1-DH2）被拆分为两列。先运行 GRID 可将完整网格作为单个 GROUP 保留。 |
-| **`min_count=2` + `SCORE_THRESHOLD=0.40`** | 覆盖 2 设备列/行（如 1D-3D 两段列）和 2×2 网格。较高的阈值（如 0.50）会漏检 3 设备列（1D-3D-5D 评分 ≈0.45）。 |
-| **`GAP_MAX=40.0` 间隙分割** | 防止非同一列的设备（如 GZ11 距 1D-5D 列 ~100u）被归入同一列。 |
-| **`_detect_text_devices` 仅作回退** | 基于矩形的设备检测优先。文本设备仅在文本插入点未被现有矩形设备包围时创建，避免重复。 |
-| **`_collect_leaf_devices` 仅返回直接子 DEVICE** | 防止 `_apply_grouping` 在 AREA 级和 CABINET 级重复分组同一设备。AREA 级只分组本 AREA 的直接子设备，CABINET 级只分组直接挂在 CABINET 下的设备。 |
-| **GroupSemanticResolver 评分制** | 与 DeviceSemanticResolver 一致——每个信号贡献权重分数，最高分胜出。证据列表可追溯决策过程。 |
+| **CandidatePool 得分层级** | 闭合矩形(0.95) > 脊柱开放(0.75) > U 形(0.70) > L 形(0.50) > 文本回退(0.40)。去重时按重叠率 >0.2 淘汰低分者。脊柱设备得分高于 U 形，确保开放矩形替换合并的 U 形候选。 |
+| **脊柱设备检测** | 替代旧版 `_detect_open_rect_devices`。配对短水平线与共享垂直线，生成 DeviceCandidate(0.75)。dbscan 群内左侧有 6 个此类设备（2D-12D），宽度 6u。 |
+| **DBSCAN 特征向量含缩放尺寸** | `[cx, cy, w*0.1, h*0.1]` 中 w/h 缩放因子 0.1 防止尺寸差异主导聚类。相邻而尺寸不同的设备列可被分离。 |
+| **后分类一致性检查严于 DBSCAN** | DBSCAN 宽聚（eps=30），后分类筛选（w/h 差 ≤8/6u）。标签文本（如"左侧"宽 20u）与脊柱设备（宽 6u）在同一簇时，尺寸差导致 FREEFORM 回退。 |
+| **文本匹配正/背面识别** | 在柜体底部下方查找"正面"/"背面"文本（dx ≤ 宽度 60%，dy ≤ 200u）。替代旧版 y 排序法，修复 D0206-20 两柜 y 相同的问题。 |
+| **无文档级表格检测** | 已移除。专注于前后柜面及其设备矩形。 |
+| **V8.2 GROUP 节点介于 AREA 与 DEVICE 之间** | GROUP 是空间集群节点，携带 `group_type`（排布模式）和语义类型。不改动现有 CABINET/AREA/DEVICE 层级。 |
+| **DBSCAN 替代扫描聚类** | 旧版扫描聚类（`grouping/` 目录）已删除。DBSCAN(eps=30) 无需显式 GRID→COLUMN→ROW 阶段顺序，后分类逻辑分配模式类型。 |
+| **GroupSemanticResolver 评分制** | 每个信号贡献权重分数，最高分胜出。证据列表可追溯决策过程。 |
 
 ## 12. 已知限制
 
@@ -918,22 +898,16 @@ tools/cable_match_viewer/
 - **仅 DWG**：PDF 支持延期（暂无 RasterizeStage / OcrStage）。
 - **匿名块文本**：匿名块内部的 TEXT/ATTRIB 仍不可见。
 
-### 屏面布置图 (PANEL_LAYOUT)
+### 屏面布置图 (PANEL_LAYOUT) — V8.2
 
-- **柜体检测脆弱**：配对垂直线方法（相邻垂直线 dx 140-240）基于经验，可能漏检非标准宽度或仅用矩形绘制的柜体。
-- **子分组依赖子矩形**：如果图纸使用视觉排布（设备组周围无显式矩形），`_detect_device_sub_groups` 将返回空，设备直接挂在主柜体节点下。
-- **设备名称完整性**：多行文本聚合合并设备边界框内的所有文本。如果无关文本恰好空间重合，会产生杂音名称。
-- **背面设备命名**：开放矩形设备依赖 `_find_device_name_by_text`，要求文本严格位于 bbox 内。如文本标签因浮点偏差略微超出 bbox，该设备将被丢弃（常见情况已通过使用四舍五入跨度 x1 修复，边界情况仍可能发生）。
-- **无基于文本的设备分组**：当前算法完全依赖包含关系几何（矩形套矩形）。不通过文本相似度、邻近聚类或标签关联来分组设备。
+- **柜体检测脆弱**：配对垂直线方法（相邻垂直线 dx 140-240）基于经验，可能漏检非标准宽度或短竖线柜体（如 D0206-20 前柜竖线 65u < 100u 阈值）。
+- **设备名称完整性**：TextAssociator 使用最高文本作为 name，其余为 description。如果无关文本恰好在设备上方，会产生杂音名称。
+- **背面设备命名**：脊柱设备依赖文本严格位于 bbox 内。如文本标签因浮点偏差略微超出 bbox，该设备将被丢弃（已通过 `_texts_in_bbox` 修复常见情况，边界情况仍可能发生）。
+- **DBSCAN 标签文本干扰**：分组标签（如"左侧"）与设备在同一簇内时，其较大宽度（~20u vs 6u）导致一致性检查失败 → FREEFORM 回退。`_score_column` 通过 cy 降序排序缓解此问题。
+- **传感器类型区分**：`detect_closed_rects` 发现所有闭合矩形，但未区分传感器（温湿度/烟雾）与端子排设备。需设备级语义分类。
 - **PANEL_POSITION 分析器缺失**：屏位布置图已分类但尚无空间分析器。
-- **无交叉验证**：布局树独立按图纸生成。没有跨文档验证（例如验证同一设备在正面/背面视图中一致出现）。
-
-### V8.2 LayoutGroup
-
-- **短母线列**：当水平母线线未跨越完整距离时，远程侧端子可能无法找到（超出 x_tol）。
-- **仅 x=-349.3 列检测到母线**：目前 `_cabinet_path_trace` 仅在 30 单位范围内找到母线——仅一列符合条件。
-- **GRID 检测要求完整填充**：网格设备数必须严格等于 `cols × rows`。非全填充网格（如 2×3 但只有 5 个设备）将被漏检。
-- **FREEFORM 回退无评分**：连通分量回退分组不进行模式评分。任何 50u 半径内 ≥2 设备均被分组。
-- **基于文本的设备尺寸粗糙**：`width = len(text) × 10u, height = 15u` 是经验值，非精确尺寸。长文本（>20 字符）被跳过。
+- **无交叉验证**：布局树独立按图纸生成。没有跨文档验证。
+- **GRID 后分类要求完整填充**：网格设备数必须严格等于 `cols × rows`。非全填充网格（如 2×3 但只有 5 个设备）将被漏检。
+- **FREEFORM 回退无模式评分**：DBSCAN 噪声点独立标注，未分组的剩余设备不做聚类。
 - **语义分类仅匹配前缀**：`GroupSemanticResolver` 依赖设备名称前缀（`2D`、`DTZ`、`DK` 等），不支持后缀匹配或正则表达式。
-- **无跨设备属性关联**：`Signal 3`（子设备属性）在当前场景下几乎为空——设备在分组时尚未被 `DeviceSemanticResolver` 标注。需管道重新排序才能生效。
+- **detectors/device.py 遗留代码**：`detectors/device.py` 中的旧式 `detect_devices`、`_detect_open_rect_devices`、`_merge_devices` 不再被调用。待后续清理。

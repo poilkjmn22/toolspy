@@ -858,8 +858,11 @@ function renderLayoutTree(layout) {
   html += '<div style="font-size:12px;">';
 
   for (const cab of cabinets) {
-    const isFront = cab.name ? true : false;
-    const label = isFront ? `${escHtml(cab.name)} (正面)` : '背面';
+    const cabFace = cab.data && cab.data.face;
+    const isFront = cabFace ? cabFace === 'front' : (cab.name ? true : false);
+    const label = isFront
+      ? `${escHtml(cab.name || '正面')} (正面)`
+      : (cab.name ? `${escHtml(cab.name)} (背面)` : '背面');
     html += `<div style="margin:4px 0;padding:6px 8px;background:#fff;border:1px solid #e0e0e0;border-radius:4px;">
       <div style="font-weight:600;color:#1565c0;">${label}</div>`;
     html += _renderNodes(cab.children || [], 1);

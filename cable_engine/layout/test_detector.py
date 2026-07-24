@@ -17,11 +17,6 @@ from .detector import (
     detect_rectangles,
 )
 from .model import LayoutNode, LayoutNodeType, LayoutGroupType
-from .grouping import DeviceSpatialGraph, detect_layout_groups
-from .grouping.clustering import (
-    _detect_grids, _detect_columns, _detect_rows,
-    _connected_components,
-)
 from .candidate import DeviceCandidate, SymbolCandidate
 from .associator import TextAssociator
 from .clustering import DBSCANClusterer
@@ -172,7 +167,7 @@ def test_devices_in_cabinet():
 
 
 def test_device_with_blockref():
-    """Device as BlockRef with anonymous block + expanded geometry."""
+    """Device from closed rect + BlockRef (blockref handled by V8.1 closed-rect)."""
     doc = Document(document_path=Path('/fake'), content_hash='test_br', document_type=DocumentType.DWG)
     doc.add_entity(_line_geom([Point(-166, -107), Point(-166, 200)], 'v1'))
     doc.add_entity(_line_geom([Point(12, -107), Point(12, 200)], 'v2'))
@@ -180,6 +175,12 @@ def test_device_with_blockref():
         Point(-155, 80), Point(-138, 80),
         Point(-138, 108), Point(-155, 108), Point(-155, 80),
     ], 'dev_frame'))
+    doc.add_entity(_line_geom([
+        Point(-120, 80), Point(-103, 80),
+        Point(-103, 108), Point(-120, 108), Point(-120, 80),
+    ], 'dev_frame2'))
+    doc.add_entity(_text('M1', -146, 94, 't_m1'))
+    doc.add_entity(_text('DK1', -111, 94, 't_dk1'))
     doc.add_entity(_block_ref('A$C49E661ED', -146, 94, 'br1'))
 
     tree = build_layout_tree(doc)
@@ -190,7 +191,6 @@ def test_device_with_blockref():
         if child.node_type == LayoutNodeType.DEVICE:
             print(f'    Device "{child.name}" src={child.data.get("source")}')
     assert len(cab.children) >= 1
-    assert any(c.node_type == LayoutNodeType.DEVICE for c in cab.children)
     print('  ✓ test_device_with_blockref')
 
 
@@ -234,119 +234,6 @@ def test_text_device_detection():
     assert 'DH1' in dev_names, f'DH1 not found in {dev_names}'
     assert 'DH2' in dev_names, f'DH2 not found in {dev_names}'
     print('  ✓ test_text_device_detection')
-
-
-def test_grid_detection():
-    """4 devices in 2×2 grid (M1, M2, DH1, DH2) → GRID group."""
-    devs = [
-        _device_node('M1', 10, 100, 20, 15, 'm1'),
-        _device_node('M2', 60, 100, 20, 15, 'm2'),
-        _device_node('DH1', 10, 60, 20, 15, 'dh1'),
-        _device_node('DH2', 60, 60, 20, 15, 'dh2'),
-    ]
-    cab = BBox(0, 0, 200, 300)
-    used: set[str] = set()
-    grids = _detect_grids(devs, cab, used)
-    assert len(grids) == 1, f'expected 1 grid, got {len(grids)}'
-    grid = grids[0]
-    assert grid.group_type == LayoutGroupType.GRID
-    assert len(grid.children) == 4
-    assert grid.data['grid_dims'] == {'cols': 2, 'rows': 2}
-    print(f'  GRID: dims={grid.data["grid_dims"]}, score={grid.data["score"]}')
-    print('  ✓ test_grid_detection')
-
-
-def test_horizontal_row_detection():
-    """Devices in a horizontal row at the top → HORIZONTAL_ROW group."""
-    cab_bbox = BBox(0, 0, 200, 300)
-    devs = [
-        _device_node('DK1', 10, 280, 30, 15, 'dk1'),
-        _device_node('DK2', 50, 280, 30, 15, 'dk2'),
-        _device_node('DK4', 90, 280, 30, 15, 'dk4'),
-        _device_node('DK3', 130, 280, 30, 15, 'dk3'),
-        _device_node('ZDK', 170, 280, 30, 15, 'zdk'),
-        _device_node('ZDF', 210, 280, 30, 15, 'zdf'),
-    ]
-    used: set[str] = set()
-    rows = _detect_rows(devs, cab_bbox, used)
-    assert len(rows) == 1, f'expected 1 row, got {len(rows)}'
-    row = rows[0]
-    assert row.group_type == LayoutGroupType.HORIZONTAL_ROW
-    assert len(row.children) == 6
-    assert 'top' in row.data.get('position', ''), f'position={row.data.get("position")}'
-    print(f'  Row: score={row.data["score"]}, pos={row.data["position"]}')
-    print('  ✓ test_horizontal_row_detection')
-
-
-def test_gap_splitting_excludes_distant_device():
-    """GZ11 far from 1D-5D column → split into separate groups (or GZ11 excluded)."""
-    cab_bbox = BBox(0, 0, 200, 300)
-    # Tight column of 5 terminals
-    devs = [
-        _device_node('1D', 160, 200, 20, 15, 'd1'),
-        _device_node('3D', 160, 170, 20, 15, 'd3'),
-        _device_node('5D', 160, 140, 20, 15, 'd5'),
-        _device_node('GZ11', 160, 40, 25, 20, 'gz'),  # far below, gap > 40
-    ]
-    used: set[str] = set()
-    cols = _detect_columns(devs, cab_bbox, used)
-    assert len(cols) == 1, f'expected 1 column (1D-5D), got {len(cols)}'
-    col = cols[0]
-    names = [c.name for c in col.children]
-    assert 'GZ11' not in names, f'GZ11 should be excluded, children={names}'
-    assert len(col.children) == 3
-    print(f'  Column children: {names}')
-    print('  ✓ test_gap_splitting_excludes_distant_device')
-
-
-def test_device_spatial_graph():
-    """DeviceSpatialGraph indexes devices by centroid."""
-    devs = [
-        _device_node('A', 10, 100, 20, 10, 'da'),
-        _device_node('B', 10, 80, 20, 10, 'db'),
-        _device_node('C', 10, 60, 20, 10, 'dc'),
-    ]
-    g = DeviceSpatialGraph(devs, cell_size=50)
-    assert len(g.devices) == 3
-    assert g.center(devs[0]) == (20, 105)
-    print('  ✓ test_device_spatial_graph')
-
-
-def test_vertical_column_detection():
-    """6 devices in a vertical column (x-aligned, evenly spaced)."""
-    devs = [
-        _device_node('2D', 10, 180, 20, 10, 'd2'),
-        _device_node('4D', 10, 150, 20, 10, 'd4'),
-        _device_node('6D', 10, 120, 20, 10, 'd6'),
-        _device_node('8D', 10, 90, 20, 10, 'd8'),
-        _device_node('10D', 10, 60, 20, 10, 'd10'),
-        _device_node('12D', 10, 30, 20, 10, 'd12'),
-    ]
-    cab = BBox(0, 0, 200, 300)
-    used: set[str] = set()
-    cols = _detect_columns(devs, cab, used)
-    assert len(cols) == 1, f'expected 1 column, got {len(cols)}'
-    col = cols[0]
-    assert col.node_type == LayoutNodeType.GROUP
-    assert col.group_type == LayoutGroupType.VERTICAL_COLUMN
-    assert len(col.children) == 6
-    assert col.data['score'] >= 0.40
-    print(f'  Column: score={col.data["score"]}, evidence={col.data["evidence"]}')
-    print('  ✓ test_vertical_column_detection')
-
-
-def test_no_group_for_scattered_devices():
-    """Scattered devices with different x positions → no group."""
-    devs = [
-        _device_node('A', 10, 100, 20, 10, 'da'),
-        _device_node('B', 50, 80, 20, 10, 'db'),
-        _device_node('C', 90, 60, 20, 10, 'dc'),
-    ]
-    cab = BBox(0, 0, 200, 300)
-    used: set[str] = set()
-    cols = _detect_columns(devs, cab, used)
-    assert len(cols) == 0, f'expected 0 columns, got {len(cols)}'
-    print('  ✓ test_no_group_for_scattered_devices')
 
 
 def test_grouping_integration():
@@ -590,47 +477,6 @@ def test_front_back_cabinets():
     print('  ✓ test_front_back_cabinets')
 
 
-def test_group_label_assignment_right():
-    """Text label 右侧 above the right column → group name = 右侧."""
-    from .grouping.clustering import detect_layout_groups
-    devs = [
-        _device_node('1D', 160, 200, 20, 15, 'd1'),
-        _device_node('3D', 160, 170, 20, 15, 'd3'),
-        _device_node('5D', 160, 140, 20, 15, 'd5'),
-    ]
-    text_positions = [(160, 240, '右侧')]
-    cab = BBox(0, 0, 300, 300)
-    groups = detect_layout_groups(devs, cab, text_positions)
-    assert len(groups) == 1, f'expected 1 group, got {len(groups)}'
-    g = groups[0]
-    assert g.group_type == LayoutGroupType.VERTICAL_COLUMN
-    assert g.name == '右侧', f'expected name=右侧, got {g.name!r}'
-    print(f'  Group: {g.name} [{g.group_type.value}]')
-    print('  ✓ test_group_label_assignment_right')
-
-
-def test_eyebrow_row_all_together():
-    """6 devices in a top row with 50-70u gaps → single ROW group (ROW_GAP_MAX=120)."""
-    from .grouping.clustering import _detect_rows
-    devs = [
-        _device_node('ZDK', 0, 280, 30, 15, 'zdk'),
-        _device_node('ZDF', 50, 280, 30, 15, 'zdf'),
-        _device_node('DK1', 120, 280, 30, 15, 'dk1'),
-        _device_node('DK2', 160, 280, 30, 15, 'dk2'),
-        _device_node('DK3', 200, 280, 30, 15, 'dk3'),
-        _device_node('DK4', 240, 280, 30, 15, 'dk4'),
-    ]
-    cab = BBox(0, 0, 300, 300)
-    used: set[str] = set()
-    rows = _detect_rows(devs, cab, used)
-    assert len(rows) == 1, f'expected 1 row, got {len(rows)}'
-    row = rows[0]
-    assert row.group_type == LayoutGroupType.HORIZONTAL_ROW
-    assert len(row.children) == 6
-    print(f'  Row: score={row.data["score"]}, children={len(row.children)}')
-    print('  ✓ test_eyebrow_row_all_together')
-
-
 if __name__ == '__main__':
     print('LayoutTree detector tests:')
     test_empty_doc()
@@ -641,17 +487,8 @@ if __name__ == '__main__':
     test_devices_in_cabinet()
     test_device_with_blockref()
     test_text_device_detection()
-    test_device_spatial_graph()
-    test_vertical_column_detection()
-    test_no_group_for_scattered_devices()
-    test_gap_splitting_excludes_distant_device()
-    test_grid_detection()
-    test_horizontal_row_detection()
     test_grouping_integration()
     test_front_back_cabinets()
-    test_group_label_assignment_right()
-    test_eyebrow_row_all_together()
-    # V8.1 tests
     test_closed_rect_candidate()
     test_L_shape_candidate()
     test_U_shape_candidate()

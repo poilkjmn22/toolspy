@@ -1,4 +1,4 @@
-# cable_engine Architecture (V8.0)
+# cable_engine Architecture (V8.2)
 
 ## 1. System Overview
 
@@ -6,9 +6,11 @@
 DWG file → DWGLoader (dwgread -O JSON) → Document IR → TopologyStage → cable.db (SQLite)
                                                                     ↓
                                                   tools/cable_match_viewer/ (aiohttp)
+                                                                    ↓
+                                                             LayoutStage → panel_layout (SQLite)
 ```
 
-A single `TopologyStage` orchestrates classification, cabinet analysis, and analyzer dispatch. V8 introduces a **GeometryGraph** — a pure graph layer — to replace the V7 procedural `_cabinet_path_trace()` algorithm.
+A single `TopologyStage` orchestrates classification, cabinet analysis, and analyzer dispatch. V8 introduces a **GeometryGraph** — a pure graph layer — to replace the V7 procedural `_cabinet_path_trace()` algorithm. V8.2 introduces a **CandidatePool + DBSCAN** device detection pipeline in LayoutStage, replacing the V8.0 multi-stage configurable detector.
 
 ## 2. Document Classification
 
@@ -400,7 +402,7 @@ Each collected text along the vertical column is classified by priority:
 
 A stub analyzer for cable schedule documents (`CABLE_SCHEDULE` type). For each cable entry found in the schedule, it emits a single `cable_topology` record with `cable_id`, `source_type='cable_schedule'`, and empty terminal/loop fields. Used by the viewer for a browsable cable index.
 
-### 7.4 LayoutStage — Panel Layout Tree (屏面布置图)
+### 7.4 LayoutStage — Panel Layout Tree (屏面布置图) (V8.2)
 
 `LayoutStage` (`cable_engine/layout/stage.py`) runs **after** `TopologyStage` and only for `PANEL_LAYOUT` classified documents. It builds a hierarchical **LayoutTree** — a spatial containment tree capturing the physical structure of a panel face drawing — and persists it as JSON to the `panel_layout` table.
 
@@ -439,28 +441,35 @@ class LayoutNodeType(Enum):
     TITLE_BLOCK = 'TITLE_BLOCK'  # Title block (reserved)
 ```
 
-**Node tree structure** (front cabinet with sub-groups; back cabinet includes open-rect devices):
+**Node tree structure** (V8.2 — includes GROUP nodes and front/back face labels):
 
 ```
 
-CABINET "1号1000kV继电器小室高抗电能表柜" (正面 — front face, named via header rect)
+CABINET "1号1000kV继电器小室高抗电能表柜" (face=front, named via header rect)
   ├── DEVICE "M1 / DTZ178 / 张北I线 / 电抗器 / 本期"
   ├── DEVICE "M2 / DTZ178 / 张北II线 / 电抗器 / 本期"
   ├── DEVICE "M3 / DTZ178 / 预留1"
   └── DEVICE "M4 / DTZ178 / 预留2"
 
-CABINET "" (背面 — back face, unnamed, no header rect)
-  ├── DEVICE "ZDK ... DK4"   (closed rectangle detection)
-  ├── DEVICE "1D ... 12D"    (open-rectangle, spine at x=-64)
-  └── DEVICE "GZ11"          (closed rectangle, bottom)
+CABINET "" (face=back, unnamed, no header rect)
+  ├── PANEL_AREA "" (horizontal divider area)
+  │   ├── GROUP [VERTICAL_COLUMN] "TERMINAL_COLUMN"
+  │   │   ├── DEVICE "2D"
+  │   │   ├── DEVICE "4D"
+  │   │   └── DEVICE "6D"
+  │   └── GROUP [VERTICAL_COLUMN] "TERMINAL_COLUMN"
+  │       ├── DEVICE "1D"
+  │       ├── DEVICE "3D"
+  │       └── DEVICE "5D"
+  └── DEVICE "GZ11"          (standalone, ungrouped)
+
+```
+#### 7.4.2 Detection Algorithm (`build_layout_tree`) — V8.2
+
+The detector (`cable_engine/layout/detector.py`) uses the V8.2 **CandidatePool + DBSCAN** pipeline:
 
 ```
 
-#### 7.4.2 Detection Algorithm (`build_layout_tree`)
-
-The detector (`cable_engine/layout/detector.py`) is a multi-stage spatial pipeline:
-
-```
 Document IR entities
     │
     ▼
@@ -476,98 +485,84 @@ Step 2 — Long line detection (detect_long_lines, min_length=50.0)
     │   Output: list[LongLine] (verts, hors)
     │
     ▼
-Step 2b — All-line detection (detect_long_lines, min_length=3.0)
-    │   Same logic at finer granularity — used for open-rect devices
-    │   Output: list[LongLine] (all_verts, all_hors)
-    │
-    ▼
 Step 3 — Cabinet detection (detect_cabinets)
-    │   A. Rectangle-based: rects area > 10,000 u², aspect-ratio h/w 1.5-5.0
-    │      (cabinet faces are tall/narrow ~3:1; rejects page borders ~0.7)
-    │   B. Paired-vertical: neighboring verticals (dx 140-240, overlap > 50%)
-    │      Fallback for open-face cabinets (no closed rect)
-    │   C. Merge: rect-based preferred over paired-vertical when overlapping
-    │      candidates exist (>50% overlap). Post-filter removes paired-vertical
-    │      candidates overlapping rect-based ones.
-    │   Page-border rejection: area > 90% of drawing → rejected
+    │   A. Rectangle-based: area > 10,000 u², aspect-ratio 1.5-5.0
+    │   B. Paired-vertical: dx 140-240, overlap > 50%
+    │   C. Merge: rect-based > paired-vertical when overlapping
+    │   Page-border: area > 90% of drawing → rejected
     │   Output: list[LayoutNode] (type=CABINET)
     │
     ▼
-Step 4 — Per-cabinet analysis (no document-level tables)
-    │   (Table detection was removed — focus is cabinet face + devices)
-    │
-    ├─ 4a. Cabinet interior (_detect_cabinet_interior)
-    │     Inner rects ≥ 80% cab-width & ≤ 15u high → header_rects
-    │     Inner rects ≥ 50% cab-width & ≥ 40% cab-height → device_area
-    │     Rejects rects >110% of cabinet bbox (prevents page border use)
-    │
-    ├─ 4b. Area detection (detect_areas_v2)
-    │     If device_area found: use its bbox as the PANEL_AREA
-    │     Otherwise: horizontal divider lines spanning ≥ 50% cab-width
-    │     → PANEL_AREA node (or none → devices attach directly to CABINET)
-    │
-    ├─ 4c. Device sub-group detection (_detect_device_sub_groups)
-    │     Find sub-rectangles inside device area (min 30u, ≤ 70% of area)
-    │     Each sub-rect → PANEL_AREA
-    │     Label text near top edge → group name ("左侧", "右侧")
-    │     Filter: groups with label length >15 chars are rejected
-    │       (avoids copyright notice being treated as a group label)
-    │
-    ├─ 4d. Device detection — two sources merged:
-    │
-    │   Source A — closed rectangles (detect_devices)
-    │     Small rects (3-150u both sides) with text inside (center-point
-    │     containment). Lower bound 3.0u handles narrow back-face devices
-    │     (ZDK/DK series: 3.5×9). BlockRef entities → nearest small rect.
-    │     Multi-line text: ALL text inside rect joined with " / "
-    │       e.g. "M1 / DTZ178 / 张北I线 / 电抗器 / 本期"
-    │
-    │   Source B — open rectangles (_detect_open_rect_devices)
-    │     Detects 3-side + shared-vertical-spine devices common in back-face
-    │     layouts. Algorithm:
-    │       a. Find short horizontals (< 50u) inside cabinet
-    │       b. Find long vertical spines (≥ 100u) as reference edges
-    │       c. For each horizontal-span group (grouped by rounded start/end x):
-    │          Match a spine within 2u of either endpoint
-    │          far_x = opposite endpoint
-    │          For each consecutive pair of y-levels (spacing ≥ 5):
-    │            Check a vertical exists at far_x covering the interval
-    │            Create device bbox using x1 (rounded span start) for
-    │              tolerance with text at span-edge positions
-    │            Name via _find_device_name_by_text
-    │
-    │   Merge (_merge_devices):
-    │     Dedup by bbox overlap > 0.4; prefer named over unnamed
-    │
-    │   Device assignment:
-    │     If sub-groups exist: assign via _bbox_contains(group, device)
-    │     Otherwise: attach devices directly to AREA or CABINET node
-    │
-    └─ Result: CABINET with nested PANEL_AREA > DEVICE tree
+Step 4 — Front/back identification (_identify_front_back)
+    │   Finds "正面"/"背面" text below each cabinet bottom edge
+    │   (within 200u, within 60% of width). Falls back to y-sort.
+    │   Stores face in cab.data.face: 'front' / 'back'
     │
     ▼
-Step 5 — Tree assembly (build_layout_tree)
-    CABINET nodes → tree roots
-    ↓
+Step 5 — Per-cabinet interior + device pipeline
+    │
+    ├─ 5a. Interior (detect_cabinet_interior)
+    │     Header rects (≥80% width, ≤15u high)
+    │     Device area (≥50% width, ≥40% height)
+    │
+    ├─ 5b. Area detection (detect_areas_v2)
+    │     Interior rect → PANEL_AREA, or horizontal dividers
+    │
+    └─ 5c. Device detection & grouping (_apply_grouping_v2)
+         For each AREA (or whole CABINET):
+          │
+          ├─ build_device_candidates
+          │   5-tier candidate generation + CandidatePool dedup
+          │
+          │   Score hierarchy:
+          │     detect_closed_rects    → 0.95  (closed rectangles)
+          │     detect_spine_devices   → 0.75  (open-rect, spine matching)
+          │     detect_U_shapes        → 0.70  (3 segments, parallel ends)
+          │     detect_L_shapes        → 0.50  (2 segments, 90° end-joined)
+          │     detect_text_devices    → 0.40  (text-only fallback)
+          │
+          │   Dedup: CandidatePool retains higher-scoring candidate
+          │     when overlap > 0.2 (lower score discarded)
+          │
+          ├─ TextAssociator.associate_devices
+          │   Topmost text = name, rest = description
+          │
+          ├─ DBSCANClusterer (eps=30, min_samples=2)
+          │   Feature vector: [cx, cy, w*0.1, h*0.1]
+          │   → DeviceGroup[] (VERTICAL_COLUMN / HORIZONTAL_ROW /
+          │                     GRID / FREEFORM)
+          │
+          └─ TextAssociator.associate_groups
+                Position labels (left/right) for groups
+    
+Step 6 — Semantic annotation (_annotate_groups)
+    GroupSemanticResolver assigns semantic types
+    (TERMINAL_COLUMN / METER_GRID / DEVICE_PANEL etc.)
+    │
+    ▼
     LayoutTree { roots: [...] }
 ```
 
-#### 7.4.3 Key Helper Functions
+#### 7.4.3 Key Helper Functions (V8.2)
 
-| Function | Purpose | Key Logic |
-|----------|---------|-----------|
-| `detect_rectangles(doc)` | Find axis-aligned rects from LINE/POLYLINE | Closed 4-pt polylines or 4-segment LINE chain |
-| `detect_long_lines(doc, min_length)` | Classify long lines as horizontal/vertical | `\|dy\| < 2` → horizontal; `\|dx\| < 2` → vertical |
-| `detect_cabinets(doc, rects, verts, hors)` | Cabinet boundary candidates | Rect area >10k u² + aspect-ratio 1.5-5.0; paired-vertical dx 140-240; rect preferred over paired-vertical; page-border >90% rejected |
-| `_detect_cabinet_interior(cab, rects)` | Header rects + device area inside cabinet | Full-width thin rects = headers; large inner rect = device area; rejects rects >110% cab bbox |
-| `detect_areas_v2(doc, cab, hors, interior)` | Device mounting area creation | Interior rect preferred; divider lines fallback |
-| `_detect_device_sub_groups(doc, area, rects)` | Sub-rectangles inside device area | Min 30u, ≤70% area; top-edge text as label; filter labels >15 chars |
-| `detect_devices(doc, rects, container)` | Find device rectangles within container | Small rects (3-150u) + BlockRef nearest-rect; center-point containment |
-| `_detect_open_rect_devices(doc, container, verts, hors)` | 3-side + spine shared-edge devices | Short horizontals grouped by span; vertical spines as reference; far-x vertical closure check; bbox x uses rounded span x1 |
-| `_merge_devices(a, b)` | Merge two device lists, dedup by overlap | Overlap ratio >0.4 → duplicate |
-| `_find_device_name_by_text(doc, bbox)` | Multi-line text aggregation | All text in bbox, sorted top-to-bottom, joined by " / " |
-| `_bbox_contains(outer, inner)` | Strict containment check | `outer.[x,y,w,h]` fully encloses `inner` |
-| `_bbox_contains_center(outer, inner)` | Center-point containment | Inner's centroid within outer (5u padding) |
+| Function | Module | Purpose |
+|----------|--------|---------|
+| `detect_rectangles(doc)` | `primitives/rectangle.py` | Axis-aligned rects from LINE/POLYLINE |
+| `detect_long_lines(doc, min_length)` | `primitives/line.py` | Classify lines as H/V |
+| `detect_cabinets(doc, rects, verts, hors)` | `detectors/cabinet.py` | Cabinet boundary candidates |
+| `detect_cabinet_interior(cab, rects)` | `detectors/area.py` | Header rects + device area inside cabinet |
+| `detect_areas_v2(doc, cab, hors, interior)` | `detectors/area.py` | Device mounting area creation |
+| `_identify_front_back(cabinets, doc)` | `detector.py` | Text-based front/back matching |
+| `build_device_candidates(doc, bbox)` | `candidate.py` | 5-tier candidate pipeline orchestrator |
+| `detect_closed_rects(doc, bbox)` | `candidate.py` | Closed-rect devices (score 0.95) |
+| `detect_spine_devices(doc, bbox)` | `candidate.py` | Spine-matched open-rect devices (0.75) |
+| `detect_U_shapes(doc, bbox)` | `candidate.py` | U-shape device detection (0.70) |
+| `detect_L_shapes(doc, bbox)` | `candidate.py` | L-shape device detection (0.50) |
+| `detect_text_devices(doc, bbox)` | `candidate.py` | Text-only fallback (0.40) |
+| `CandidatePool` | `candidate.py` | Multi-source candidate dedup |
+| `TextAssociator` | `associator.py` | Text association (name/desc + group labels) |
+| `DBSCANClusterer` | `clustering.py` | DBSCAN spatial clustering (eps=30, min_samples=2) |
+| `_score_column` | `clustering.py` | Column scoring (x-align + size consistency + spacing) |
 
 #### 7.4.4 Storage
 
@@ -597,9 +592,10 @@ GET /api/document/{hash}/layout
 
 renderLayoutTree(layout)  → HTML
   └─ CABINET tree view:
-       Front cabinet → cabinet name
+       Front cabinet → cabinet name (from cab.data.face)
        Back cabinet  → "背面"
-       Each PANEL_AREA (sub-group) → nested with orange label
+       Each PANEL_AREA → nested with orange label
+       GROUP → purple border, semantic label + position
        DEVICE → label with name
 ```
 
@@ -672,13 +668,32 @@ cable_engine/
 │   ├── geometry.py              # LineGeometry, BlockRef, AttributeEntity
 │   ├── document.py              # Document, DocumentType
 │   └── pdf.py                   # Page, PixelImage (deferred)
-├── layout/                      # ← PANEL_LAYOUT LayoutTree
+├── layout/                      # ← PANEL_LAYOUT LayoutTree (V8.2)
 │   ├── __init__.py              # Public API exports
 │   ├── types.py                 # LayoutTree, LayoutNode, LayoutNodeType
-│   ├── detector.py              # 6-step spatial detection pipeline
-│   ├── stage.py                 # LayoutStage (gated post-TopologyStage run)
-│   ├── test_detector.py         # 7 unit tests
-│   └── demo.py                  # CLI demo last run command
+│   ├── model.py                 # LayoutNode, LayoutGroupType (canonical)
+│   ├── detector.py              # V8.2 pipeline + _apply_grouping_v2
+│   ├── stage.py                 # LayoutStage (post-TopologyStage)
+│   ├── candidate.py             # DeviceCandidate + 5-tier generator + CandidatePool
+│   ├── associator.py            # TextAssociator (name/desc + group labels)
+│   ├── clustering.py            # DBSCANClusterer + _score_column
+│   ├── cabinet.py               # PhysicalCabinet wrapper
+│   ├── test_detector.py         # 23 unit tests
+│   ├── demo.py                  # CLI demo
+│   ├── detectors/               # Spatial detection modules
+│   │   ├── __init__.py
+│   │   ├── cabinet.py           # detect_cabinets, paired-vertical, merge
+│   │   ├── area.py              # area detection + interior analysis
+│   │   └── device.py            # legacy (unused, kept for reference)
+│   ├── primitives/              # Primitive detectors
+│   │   ├── __init__.py
+│   │   ├── bbox.py              # BBox utilities
+│   │   ├── line.py              # detect_long_lines / LongLine
+│   │   └── rectangle.py         # DetectedRect / detect_rectangles
+│   └── semantics/               # V8.2 semantic annotation
+│       ├── __init__.py
+│       ├── group_type.py        # GroupSemanticResolver
+│       └── device_type.py       # Device type classification (reserved)
 ├── loaders/
 │   ├── dwg_loader.py            # dwgread -O JSON + ezdxf fallback
 │   └── pdf_loader.py            # pypdfium2 (deferred)
@@ -710,13 +725,15 @@ tools/cable_match_viewer/
 | **Area-based page-border rejection** | Page border rejection uses area ratio (>90%) not dimension-based (70% of max dimension). Prevents filtering of legitimate large cabinets that span most of the drawing. |
 | **Cabinet aspect-ratio filter (1.5-5.0)** | Cabinet faces are tall/narrow (h/w≈3:1); rejects page borders (h/w≈0.7) and wide inner frames. |
 | **Rect-based cabinet preferred over paired-vertical** | Merge picks rect-based when both sources produce overlapping candidates; paired-vertical is only fallback for open-face cabinets. |
-| **Device area rect must be inside cabinet** | Interior analysis rejects rects >110% of cabinet bbox, preventing the page border rect from being used as the device area of a small cabinet. |
-| **Device min dimension 3.0u** | Lowered from 8u to handle narrow back-face devices (ZDK/DK series: 3.5×9). Front-face devices (17×28) unaffected. |
-| **Open-rectangle device detection** | Devices sharing one edge with a long vertical spine (3 drawn sides + spine as 4th) are detected from short horizontals + far-x verticals. Covers back-face layouts where devices are drawn against a shared vertical divider. |
-| **Open-rect bbox x uses x1 (rounded span)** | Bbox origin uses the rounded horizontal-span start (x1) rather than the raw spine coordinate (sx). Fixes text outside bbox when the spine coordinate (−63.78) places the bbox left of the text anchor (−63.85) — the rounded span start (−64) includes both. |
-| **No document-level table detection** | Removed. Focus is on front/back cabinet faces and their device rectangles. Equipment table will be re-added when needed. |
-| **Device sub-group detection** | Sub-rectangles inside the device area are detected as device groups (PANEL_AREA children). The text label near each sub-rect's top edge becomes the group label ("左侧", "右侧"). Groups with labels >15 chars are filtered (avoids copyright text). |
-| **Multi-line device name aggregation** | All text entities inside a device bounding box are aggregated with " / " separator. A device may have multiple lines (e.g. "M1" + "DTZ178" + "张北I线") that together identify it. |
+| **CandidatePool score hierarchy** | closed_rect(0.95) > spine(0.75) > U(0.70) > L(0.50) > text(0.40). Dedup discards lower-score on overlap >0.2. Spine beats U so individual open-rects replace merged U-shapes. |
+| **Spine device detection** | Replaces legacy `_detect_open_rect_devices`. Pairs short horizontals sharing a vertical spine. Score 0.75. Handles 6u-wide back-face devices (2D-12D). |
+| **DBSCAN feature vector with scaled dimensions** | `[cx, cy, w*0.1, h*0.1]` — w/h scaled by 0.1x to prevent size dominance. Separates adjacent device columns with different widths. |
+| **Post-classification stricter than DBSCAN** | DBSCAN clusters broadly (eps=30), post-class filters (w/h diff ≤8/6u). Label texts (e.g. "左侧" w=20) with spine devices (w=6) in same cluster → size mismatch → FREEFORM fallback. |
+| **Text-based front/back matching** | Finds "正面"/"背面" text below cabinet bottom edge (dx ≤ 60% width, dy ≤ 200u). Replaces y-sort from V8.0. Fixes D0206-20 where both halves share the same y. |
+| **No document-level table detection** | Removed. Focus is on front/back cabinet faces and their device rectangles. |
+| **V8.2 GROUP node between AREA and DEVICE** | GROUP nodes carry `group_type` (spatial pattern) and semantic types. Plug into existing CABINET/AREA/DEVICE hierarchy via `parent.children`. |
+| **DBSCAN replaces sweep-based clustering** | Legacy sweep-based clustering (`grouping/`) deleted. DBSCAN(eps=30) eliminates explicit GRID → COLUMN → ROW phase ordering. Post-classification assigns pattern type. |
+| **GroupSemanticResolver scoring** | Each signal contributes weighted score; highest wins. Evidence list traces decision provenance. |
 
 ## 12. Known Limitations
 
@@ -727,12 +744,16 @@ tools/cable_match_viewer/
 - **DWG only**: PDF support deferred (no RasterizeStage / OcrStage yet).
 - **Anonymous block text**: TEXT/ATTRIB inside anonymous blocks remain invisible.
 
-### Panel Layout (PANEL_LAYOUT)
+### Panel Layout (PANEL_LAYOUT) — V8.2
 
-- **Cabinet detection fragile**: The paired-vertical approach (neighbouring vertical lines with dx 140-240) is empirical and may miss non-standard cabinet widths or cabinets drawn with rectangles only.
-- **Sub-group detection depends on sub-rectangles**: If the drawing uses visual layout (no explicit rectangles around device groups), `_detect_device_sub_groups` returns nothing and devices are placed directly under the main cabinet node.
-- **Device name completeness**: Multi-line text aggregation joins ALL text in the device bbox. If unrelated text is spatially coincident, this produces noisy names.
-- **Back-face device naming**: Open-rect devices rely on `_find_device_name_by_text` which requires text strictly inside the bbox. If a text label is slightly outside (due to floating-point misalignment), the device is discarded (fixed for common cases via rounded-span bbox x, but edge cases remain).
-- **No text-based device grouping**: The current algorithm relies entirely on containment geometry (rects inside rects). It does not group devices by text similarity, proximity-based clustering, or label association.
-- **PANEL_POSITION analyzer missing**: Panel position drawings (屏位布置图) are classified but no spatial analyzer exists yet.
-- **No cross-validation**: The layout tree is produced independently per drawing. There is no cross-document validation (e.g. verifying that the same device appears consistently in front/back views).
+- **Cabinet detection fragile**: The paired-vertical approach (dx 140-240) is empirical. May miss short-vertical cabinets (e.g. D0206-20 front: verticals 65u < 100u threshold).
+- **Device name completeness**: TextAssociator picks topmost text as name, rest as description. Unrelated text above a device produces noisy names.
+- **Back-face device naming**: Spine devices require text strictly inside bbox. Floating-point edge cases may still discard valid devices (fixed for common cases via `_texts_in_bbox`).
+- **DBSCAN label text interference**: Group labels (e.g. "左侧" w=20u) in same cluster as spine devices (w=6u) → consistency check fails → FREEFORM fallback. Mitigated by `_score_column` sorted cy descending.
+- **No sensor vs terminal discrimination**: `detect_closed_rects` finds all closed rectangles but does not distinguish sensors (temp/humidity) from terminal devices. Device-level semantic classification needed.
+- **PANEL_POSITION analyzer missing**: Panel position drawings classified but no spatial analyzer yet.
+- **No cross-validation**: Layout tree produced independently per drawing.
+- **GRID post-class requires full fill**: Grid device count must exactly equal `cols × rows`. Partial grids (e.g. 2×3 with 5 devices) are missed.
+- **FREEFORM has no pattern scoring**: DBSCAN noise points become standalone DEVICE nodes; remaining ungrouped devices are not clustered.
+- **Semantic classification prefix-only**: `GroupSemanticResolver` matches device name prefixes (`2D`, `DTZ`, `DK` etc.). No suffix or regex support.
+- **detectors/device.py legacy**: Old `detect_devices`, `_detect_open_rect_devices`, `_merge_devices` remain in `detectors/device.py` but are no longer called. Pending cleanup.
