@@ -22,6 +22,9 @@ from .grouping.clustering import (
     _detect_grids, _detect_columns, _detect_rows,
     _connected_components,
 )
+from .candidate import DeviceCandidate, SymbolCandidate
+from .associator import TextAssociator
+from .clustering import DBSCANClusterer
 
 
 def _line_geom(pts: list[Point], id_: str = '') -> LineGeometry:
@@ -156,9 +159,13 @@ def test_devices_in_cabinet():
             print(f'      {cc.node_type.value} "{cc.name}"')
     assert len(cab.children) == 2, f'expected 2 areas, got {len(cab.children)}'
     area_top = cab.children[1]
-    print(f'  Top area: {area_top.bbox.h:.0f}u, devices: {len(area_top.children)}')
-    assert len(area_top.children) == 2
-    for dev in area_top.children:
+    print(f'  Top area: {area_top.bbox.h:.0f}u, children: {len(area_top.children)}')
+    # V8.1: 2 devices clustered into 1 GROUP node
+    assert len(area_top.children) == 1
+    group = area_top.children[0]
+    assert group.node_type == LayoutNodeType.GROUP
+    assert len(group.children) == 2
+    for dev in group.children:
         assert dev.node_type == LayoutNodeType.DEVICE
         print(f'    Device "{dev.name}" ({dev.bbox.w:.0f}x{dev.bbox.h:.0f})')
     print('  ✓ test_devices_in_cabinet')
@@ -372,6 +379,8 @@ def test_grouping_integration():
     print(f'  Cabinet children: {len(cab.children)}')
     for c in cab.children:
         print(f'    {c.node_type.value} "{c.name}" ({len(c.children)} children)')
+        for cc in c.children or []:
+            print(f'      {cc.node_type.value} "{cc.name}" ({len(cc.children)} children)')
 
     # Find a GROUP somewhere in the tree
     def find_groups(node: LayoutNode) -> list[LayoutNode]:
@@ -399,6 +408,171 @@ def test_grouping_integration():
     sem = col.data.get('group_semantic', {})
     assert sem.get('type') == 'TERMINAL_COLUMN', f'expected TERMINAL_COLUMN, got {sem}'
     print('  ✓ test_grouping_integration')
+
+
+# ---------------------------------------------------------------------------
+# V8.1 Candidate + DBSCAN tests
+# ---------------------------------------------------------------------------
+
+
+def test_closed_rect_candidate():
+    """Closed rectangle → DeviceCandidate(0.95)."""
+    from .candidate import detect_closed_rects
+    doc = Document(document_path=Path('/fake'), content_hash='cr1', document_type=DocumentType.DWG)
+    doc.add_entity(_line_geom([Point(10, 10), Point(50, 10), Point(50, 30), Point(10, 30), Point(10, 10)], 'r1'))
+    container = BBox(0, 0, 200, 300)
+    cands = detect_closed_rects(doc, container)
+    assert len(cands) == 1
+    assert cands[0].score == 0.95
+    assert cands[0].source == 'closed_rect'
+    assert cands[0].bbox.w == 40 and cands[0].bbox.h == 20
+    print('  ✓ test_closed_rect_candidate')
+
+
+def test_L_shape_candidate():
+    """L-shape (2 segments, 90°) → DeviceCandidate(0.5)."""
+    from .candidate import detect_open_shapes
+    doc = Document(document_path=Path('/fake'), content_hash='ls1', document_type=DocumentType.DWG)
+    doc.add_entity(_line_geom([Point(10, 10), Point(50, 10)], 's1'))
+    doc.add_entity(_line_geom([Point(50, 10), Point(50, 40)], 's2'))
+    container = BBox(0, 0, 200, 300)
+    cands = detect_open_shapes(doc, container)
+    assert len(cands) == 1, f'expected 1 L-shape, got {len(cands)}'
+    assert cands[0].score == 0.5
+    assert cands[0].source == 'L_shape'
+    print('  ✓ test_L_shape_candidate')
+
+
+def test_U_shape_candidate():
+    """U-shape (3 segments, parallel ends) → DeviceCandidate(0.7)."""
+    from .candidate import detect_open_shapes
+    doc = Document(document_path=Path('/fake'), content_hash='us1', document_type=DocumentType.DWG)
+    doc.add_entity(_line_geom([Point(10, 10), Point(10, 40)], 's1'))
+    doc.add_entity(_line_geom([Point(10, 10), Point(40, 10)], 's2'))
+    doc.add_entity(_line_geom([Point(40, 10), Point(40, 40)], 's3'))
+    container = BBox(0, 0, 200, 300)
+    cands = detect_open_shapes(doc, container)
+    assert len(cands) == 1, f'expected 1 U-shape, got {len(cands)}'
+    assert cands[0].score == 0.7
+    assert cands[0].source == 'U_shape'
+    print(f'  U-shape bbox: {cands[0].bbox}')
+    print('  ✓ test_U_shape_candidate')
+
+
+def test_circle_symbol_candidate():
+    """Circle with text inside → SymbolCandidate(0.60)."""
+    from .candidate import detect_circle_symbols
+    from ..ir import CircleGeometry
+    doc = Document(document_path=Path('/fake'), content_hash='cir1', document_type=DocumentType.DWG)
+    doc.add_entity(CircleGeometry(
+        id='cir1', source='dwg', page=1, confidence=1.0,
+        handle='cir1', center=Point(50, 50), radius=8,
+    ))
+    doc.add_entity(_text('GZ11', 50, 50, 'tgz'))
+    container = BBox(0, 0, 200, 300)
+    syms = detect_circle_symbols(doc, container)
+    assert len(syms) == 1, f'expected 1 symbol, got {len(syms)}'
+    assert syms[0].score == 0.60
+    assert syms[0].texts[0][0] == 'GZ11'
+    print('  ✓ test_circle_symbol_candidate')
+
+
+def test_candidate_pool_dedup():
+    """Overlapping candidates → high-score wins; Symbol→Device promotion."""
+    from .candidate import CandidatePool
+    pool = CandidatePool()
+    pool.add_device(DeviceCandidate(id='a', bbox=BBox(0, 0, 50, 20), score=0.95, source='closed_rect'))
+    pool.add_device(DeviceCandidate(id='b', bbox=BBox(5, 2, 40, 16), score=0.50, source='L_shape'))
+    pool.add_symbol(SymbolCandidate(id='c', bbox=BBox(100, 100, 20, 20),
+                                     center=Point(110, 110), radius=10, score=0.60))
+    result = pool.dedup()
+    # 'b' overlaps 'a' → dropped; 'c' is standalone → promoted to Device
+    assert len(result) == 2, f'expected 2 after dedup, got {len(result)}'
+    ids = [d.id for d in result]
+    assert 'a' in ids
+    assert 'b' not in ids  # dropped
+    assert 'c' in ids       # promoted from Symbol
+    print('  ✓ test_candidate_pool_dedup')
+
+
+def test_text_associator_name_description():
+    """Text inside candidate bbox → name (topmost) + description (rest)."""
+    from .associator import TextAssociator
+    cand = DeviceCandidate(id='d1', bbox=BBox(100, 100, 50, 40))
+    texts = [
+        (100, 130, 'DTZ178'),    # y=130 → description
+        (120, 140, 'M1'),         # y=140 → name (topmost)
+        (110, 120, '张北I线'),     # y=120 → description
+    ]
+    TextAssociator().associate_devices([cand], texts)
+    assert cand.name == 'M1', f'expected M1, got {cand.name!r}'
+    assert cand.description == ['DTZ178', '张北I线'], f'got {cand.description}'
+    print('  ✓ test_text_associator_name_description')
+
+
+def test_dbscan_column_cluster():
+    """6 x-aligned devices → DBSCAN → 1 VERTICAL_COLUMN group."""
+    from .clustering import DBSCANClusterer
+    devs = [
+        DeviceCandidate(id='d1', bbox=BBox(10, 180, 20, 10)),
+        DeviceCandidate(id='d2', bbox=BBox(10, 150, 20, 10)),
+        DeviceCandidate(id='d3', bbox=BBox(10, 120, 20, 10)),
+        DeviceCandidate(id='d4', bbox=BBox(10, 90, 20, 10)),
+        DeviceCandidate(id='d5', bbox=BBox(10, 60, 20, 10)),
+        DeviceCandidate(id='d6', bbox=BBox(10, 30, 20, 10)),
+    ]
+    cab = BBox(0, 0, 200, 300)
+    groups = DBSCANClusterer(eps=30, min_samples=2).cluster(devs, cab)
+    assert len(groups) == 1, f'expected 1 group, got {len(groups)}'
+    g = groups[0]
+    assert g.group_type == LayoutGroupType.VERTICAL_COLUMN
+    assert len(g.devices) == 6
+    print(f'  Column: score={g.score}')
+    print('  ✓ test_dbscan_column_cluster')
+
+
+def test_dbscan_noise_standalone():
+    """Scattered devices → DBSCAN noise → no groups."""
+    from .clustering import DBSCANClusterer
+    devs = [
+        DeviceCandidate(id='a', bbox=BBox(10, 100, 20, 10)),
+        DeviceCandidate(id='b', bbox=BBox(100, 80, 20, 10)),
+        DeviceCandidate(id='c', bbox=BBox(200, 60, 20, 10)),
+    ]
+    cab = BBox(0, 0, 300, 300)
+    groups = DBSCANClusterer(eps=30, min_samples=2).cluster(devs, cab)
+    assert len(groups) == 0, f'expected 0 groups, got {len(groups)}'
+    print('  ✓ test_dbscan_noise_standalone')
+
+
+def test_full_candidate_pipeline():
+    """End-to-end: doc → build_device_candidates → name + cluster."""
+    from .candidate import build_device_candidates
+    from .associator import TextAssociator
+    from .clustering import DBSCANClusterer
+    doc = Document(document_path=Path('/fake'), content_hash='pipe', document_type=DocumentType.DWG)
+    # Column: 3 closed rect devices
+    for i, y in enumerate([100, 70, 40]):
+        tag = f'{i * 2 + 2}D'
+        doc.add_entity(_line_geom([
+            Point(10, y), Point(30, y), Point(30, y + 18), Point(10, y + 18), Point(10, y),
+        ], f'r{i}'))
+        doc.add_entity(_text(tag, 20, y + 5, f't{i}'))
+    container = BBox(0, 0, 200, 300)
+    cands = build_device_candidates(doc, container)
+    assert len(cands) == 3, f'expected 3 candidates, got {len(cands)}'
+    texts = [(x, y, t) for t, x, y in
+             [('2D', 20, 105), ('4D', 20, 75), ('6D', 20, 45)]]
+    TextAssociator().associate_devices(cands, texts)
+    assert cands[0].name == '2D'
+    cab = BBox(0, 0, 200, 300)
+    groups = DBSCANClusterer(eps=30, min_samples=2).cluster(cands, cab)
+    assert len(groups) == 1
+    g = groups[0]
+    assert g.group_type == LayoutGroupType.VERTICAL_COLUMN
+    assert len(g.devices) == 3
+    print(f'  Pipeline: {g.group_type}, score={g.score}, devices={len(g.devices)}')
+    print('  ✓ test_full_candidate_pipeline')
 
 
 def test_front_back_cabinets():
@@ -477,5 +651,15 @@ if __name__ == '__main__':
     test_front_back_cabinets()
     test_group_label_assignment_right()
     test_eyebrow_row_all_together()
+    # V8.1 tests
+    test_closed_rect_candidate()
+    test_L_shape_candidate()
+    test_U_shape_candidate()
+    test_circle_symbol_candidate()
+    test_candidate_pool_dedup()
+    test_text_associator_name_description()
+    test_dbscan_column_cluster()
+    test_dbscan_noise_standalone()
+    test_full_candidate_pipeline()
     print()
     print('All tests passed.')

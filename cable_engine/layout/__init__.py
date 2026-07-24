@@ -3,16 +3,25 @@
 Layers:
   types.py           — LayoutTree / LayoutNode / LayoutNodeType (legacy compat)
   model.py           — LayoutNode / LayoutNodeType / LayoutGroupType (canonical)
-  grouping/          — DeviceSpatialGraph, detect_layout_groups
+  grouping/          — DeviceSpatialGraph, detect_layout_groups (legacy sweep)
   semantics/         — DeviceSemanticResolver, GroupSemanticResolver
+  candidate.py       — DeviceCandidate, CandidatePool (V8.1)
+  clustering.py      — DBSCANClusterer (V8.1)
+  associator.py      — TextAssociator (V8.1)
   detector.py        — build_layout_tree(doc) → LayoutTree from Document IR
   stage.py           — LayoutStage plugging into the pipeline
 
-V8.2 adds LayoutGroup:
-  GROUP nodes sit between PANEL_AREA / CABINET and DEVICE nodes,
-  representing spatial clusters (e.g. a vertical column of terminals).
-  They carry a group_type (VERTICAL_COLUMN / HORIZONTAL_ROW / GRID / FREEFORM)
-  and a semantic type (TERMINAL_COLUMN / DEVICE_PANEL / etc.).
+V8.1 adds CandidatePool + DBSCAN clustering:
+  ClosedRectDetector  ─→ DeviceCandidate(0.95)
+  OpenShapeDetector   ─→ DeviceCandidate(L=0.5, U=0.7)
+  CircleDetector      ─→ SymbolCandidate → DeviceCandidate(0.60)
+  TextDetector        ─→ DeviceCandidate(0.40)
+          ↓
+    CandidatePool.dedup()
+          ↓
+    DBSCANClusterer(eps=30, min_samples=2)
+          ↓
+    DeviceGroup (COLUMN / ROW / GRID / FREEFORM)
 
 Quick start:
     from cable_engine.layout import build_layout_tree, LayoutTree, LayoutNodeType
@@ -25,6 +34,9 @@ from .types import LayoutNode, LayoutNodeType, LayoutTree
 from .model import LayoutGroupType
 from .detector import build_layout_tree
 from .stage import LayoutStage
+from .candidate import DeviceCandidate, SymbolCandidate, CandidatePool
+from .clustering import DBSCANClusterer, DeviceGroup
+from .associator import TextAssociator
 
 __all__ = [
     'LayoutNode', 'LayoutNodeType', 'LayoutTree',

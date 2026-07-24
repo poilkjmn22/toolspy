@@ -37,7 +37,14 @@ from .detectors.area import (
 from .model import LayoutNode, LayoutNodeType, LayoutTree
 from .grouping import detect_layout_groups
 from .semantics.group_type import annotate_groups as _annotate_groups
+from .candidate import DeviceCandidate
+from .clustering import DeviceGroup
 from ..ir import Document
+
+from .candidate import build_device_candidates
+from .clustering import DBSCANClusterer
+from .associator import TextAssociator
+from ..ir import TextEntity, AttributeEntity
 
 # ---------------------------------------------------------------------------
 # Build pipeline
@@ -51,10 +58,9 @@ def _collect_leaf_devices(node: LayoutNode) -> list[LayoutNode]:
 
 
 def _collect_text_positions(doc: Document) -> list[tuple[float, float, str]]:
-    """Collect (x, y, text) tuples for group label assignment."""
+    """Collect (x, y, text) tuples for text association."""
     out: list[tuple[float, float, str]] = []
     for e in doc.entities:
-        from ..ir import TextEntity, AttributeEntity
         if not isinstance(e, (TextEntity, AttributeEntity)):
             continue
         t = (e.text or '').strip()
@@ -99,6 +105,97 @@ def _apply_grouping(
     parent.children = remaining
 
 
+def _build_device_node(cand: DeviceCandidate) -> Optional[LayoutNode]:
+    """Build a DEVICE LayoutNode from a DeviceCandidate."""
+    name = cand.name or (cand.texts[0][0] if cand.texts else '')
+    if not name:
+        return None
+    desc_text = ' / '.join(cand.description) if cand.description else ''
+    full_name = f'{name} / {desc_text}' if desc_text else name
+    return LayoutNode(
+        id=cand.id,
+        node_type=LayoutNodeType.DEVICE,
+        bbox=cand.bbox,
+        name=full_name,
+        data={'source': cand.source},
+    )
+
+
+def _build_group_node(group: DeviceGroup, label: int) -> LayoutNode:
+    """Build a GROUP LayoutNode from a DeviceGroup."""
+    g_node = LayoutNode(
+        id=f'dbscan_{label}',
+        node_type=LayoutNodeType.GROUP,
+        group_type=group.group_type,
+        bbox=group.bbox,
+        name=group.name,
+        data={
+            'score': round(group.score, 2),
+            'evidence': group.features.get('evidence', []),
+            **group.features,
+        },
+    )
+    for d in group.devices:
+        dev_node = _build_device_node(d)
+        if dev_node:
+            g_node.add_child(dev_node)
+    return g_node
+
+
+def _apply_grouping_v2(
+    parent: LayoutNode,
+    cab_bbox: BBox,
+    doc: Document,
+) -> None:
+    """V8.1 pipeline: CandidatePool → TextAssociator → DBSCAN → LayoutNodes."""
+    text_positions = _collect_text_positions(doc)
+    container = parent.bbox
+
+    candidates = build_device_candidates(doc, container)
+    if len(candidates) < 2:
+        return
+
+    # If parent has sub-containers (PANEL_AREA), exclude candidates inside them.
+    exclude_bboxes = [
+        c.bbox for c in parent.children
+        if c.node_type == LayoutNodeType.PANEL_AREA
+    ]
+    if exclude_bboxes:
+        candidates = [
+            c for c in candidates
+            if not any(bbox_contains_center(eb, c.bbox) for eb in exclude_bboxes)
+        ]
+        if len(candidates) < 2:
+            return
+
+    TextAssociator().associate_devices(candidates, text_positions)
+
+    clusterer = DBSCANClusterer(eps=30, min_samples=2)
+    groups = clusterer.cluster(candidates, cab_bbox)
+
+    TextAssociator().associate_groups(groups, text_positions, cab_bbox)
+
+    grouped_ids = {d.id for g in groups for d in g.devices}
+    device_children: list[LayoutNode] = []
+
+    for label, g in enumerate(groups):
+        group_node = _build_group_node(g, label)
+        device_children.append(group_node)
+
+    for c in candidates:
+        if c.id not in grouped_ids:
+            dev_node = _build_device_node(c)
+            if dev_node:
+                device_children.append(dev_node)
+
+    # Preserve non-DEVICE children (areas, sub-groups, etc.)
+    non_device = [c for c in parent.children
+                  if c.node_type != LayoutNodeType.DEVICE]
+    for c in device_children:
+        c.parent = parent
+    parent.children = non_device + device_children
+
+
 def _identify_front_back(cabinets: list[LayoutNode]) -> None:
     if len(cabinets) < 2:
         return
@@ -122,8 +219,6 @@ def build_layout_tree(doc: Document) -> LayoutTree:
     cabinets = detect_cabinets(doc, rects, verts, hors)
     if not cabinets:
         return tree
-
-    text_positions = _collect_text_positions(doc)
 
     for cab in cabinets:
         interior = detect_cabinet_interior(cab, rects)
@@ -156,8 +251,8 @@ def build_layout_tree(doc: Document) -> LayoutTree:
 
                 cab.add_child(area)
 
-                # Apply spatial grouping within each area.
-                _apply_grouping(area, cab.bbox, text_positions)
+                # Apply V8.1 spatial grouping within each area.
+                _apply_grouping_v2(area, cab.bbox, doc)
 
             # Detect orphan devices inside the cabinet but outside all areas.
             cab_rect_devs = detect_devices(doc, rects, cab)
@@ -184,8 +279,8 @@ def build_layout_tree(doc: Document) -> LayoutTree:
             for d in orphans:
                 cab.add_child(d)
 
-            # Apply grouping on orphans too.
-            _apply_grouping(cab, cab.bbox, text_positions)
+            # Apply V8.1 grouping on orphans too.
+            _apply_grouping_v2(cab, cab.bbox, doc)
         else:
             devices = detect_devices(doc, rects, cab)
             open_devs = _detect_open_rect_devices(doc, cab, all_verts, all_hors)
@@ -196,8 +291,8 @@ def build_layout_tree(doc: Document) -> LayoutTree:
                 if d.name:
                     cab.add_child(d)
 
-            # Apply spatial grouping at cabinet level.
-            _apply_grouping(cab, cab.bbox, text_positions)
+            # Apply V8.1 spatial grouping at cabinet level.
+            _apply_grouping_v2(cab, cab.bbox, doc)
 
         tree.add_root(cab)
 
