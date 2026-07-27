@@ -10,7 +10,7 @@ DWG file → DWGLoader (dwgread -O JSON) → Document IR → TopologyStage → c
                                                              LayoutStage → panel_layout (SQLite)
 ```
 
-A single `TopologyStage` orchestrates classification, cabinet analysis, and analyzer dispatch. V8 introduces a **GeometryGraph** — a pure graph layer — to replace the V7 procedural `_cabinet_path_trace()` algorithm. V8.2 introduces a **CandidatePool + DBSCAN** device detection pipeline in LayoutStage. V9 adds three layers on top: **Structure Analyzers** (replacing inline score functions), **TableParser** (injecting device business metadata), and **SpatialGraph** (spatial relations between layout nodes).
+A single `TopologyStage` orchestrates classification, cabinet analysis, and analyzer dispatch. V8 introduces a **GeometryGraph** — a pure graph layer — to replace the V7 procedural `_cabinet_path_trace()` algorithm. V8.2 introduces a **CandidatePool + DBSCAN** device detection pipeline in LayoutStage. V9 adds four layers on top: **Structure Analyzers** (replacing inline score functions), **TableParser** (injecting device business metadata), **Region Layer** (functional areas between CABINET and GROUP), and **SpatialGraph** (spatial relations between layout nodes).
 
 ## 2. Document Classification
 
@@ -733,6 +733,38 @@ graph.query_near((cx, cy), radius) → list[SpatialNode]  # Proximity
 graph.neighbors(node_id) → list[(target_id, edge)]   # Adjacency
 graph.relations_of(node_id, relation) → list[(target_id, edge)]  # Filtered
 ```
+
+### 7.7 V9 Region Layer — Functional Areas
+
+Introduces a **REGION** node layer between CABINET and GROUP/PANEL_AREA, representing functional areas within a cabinet (meters area, terminal strip area, device area, etc.). REGION is a semantic concept between physical cabinet and spatial pattern.
+
+#### 7.7.1 Detection Strategies
+
+**Strategy 1 — Text keywords**: Find region keyword texts (仪表区/端子排区/继电器区/控制区/电源区/通讯区/设备区/预留区/区域) inside the cabinet. Each match creates a REGION node spanning from the text downward over 60% of cabinet height.
+
+**Strategy 2 — Group aggregation**: When ≥3 GROUPs exist inside a cabinet with no text regions, split by gap thresholds (40u). Consecutive groups with gaps ≤40u merge into the same region.
+
+```
+CABINET "1号继电器柜"
+  ├── REGION "仪表区" (text-detected)
+  │   ├── GROUP [VERTICAL_COLUMN] "METER_GRID"
+  │   │   ├── DEVICE "M1"
+  │   │   ├── DEVICE "M2"
+  │   │   └── DEVICE "M3"
+  │   └── DEVICE "DTZ178" (standalone)
+  ├── REGION "端子排区" (text-detected)
+  │   └── GROUP [VERTICAL_COLUMN] "TERMINAL_COLUMN"
+  │       ├── DEVICE "1D"
+  │       └── DEVICE "2D"
+  └── REGION (aggregated, 3 groups)
+      ├── GROUP "G1"
+      ├── GROUP "G2"
+      └── GROUP "G3"
+```
+
+#### 7.7.2 Integration
+
+`detect_regions(cab, doc)` is called per-cabinet in `build_layout_tree` after `_apply_grouping_v2` and before `_annotate_groups`. REGION nodes are automatically serialized by the generic `_node_to_dict` in LayoutStage.
 
 ## 8. Cabinet Semantic Layer
 

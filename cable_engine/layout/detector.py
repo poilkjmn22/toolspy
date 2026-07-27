@@ -34,6 +34,7 @@ from .candidate import DeviceCandidate, build_device_candidates
 from .clustering import DeviceGroup, DBSCANClusterer
 from .associator import TextAssociator
 from .table import TableArea, detect_table_regions, parse_table_at, match_to_devices
+from .region import detect_regions
 from ..ir import Document, TextEntity, AttributeEntity
 from ..ir.entities import BBox
 
@@ -265,6 +266,9 @@ def build_layout_tree(doc: Document) -> LayoutTree:
             _apply_grouping_v2(cab, cab.bbox, doc, table)
         else:
             _apply_grouping_v2(cab, cab.bbox, doc, table)
+
+        # V9 Region layer: detect functional regions inside cabinet.
+        detect_regions(cab, doc)
 
         tree.add_root(cab)
 
