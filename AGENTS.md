@@ -44,6 +44,18 @@ Key change from V5/V6: V7.0 replaces all V6 fallback methods (icon y-bucket, geo
     - `types.py` — Legacy DocumentGraph (kept for reference)
     - `spatial.py` — Legacy spatial index (kept for reference)
   - `storage/` — single `cable.db` (CableStore + ensure_schema)
+  - `layout/structure/` — V9 spatial-structure analyzers
+    - `column.py` — `ColumnAnalyzer` (x-aligned → VERTICAL_COLUMN)
+    - `row.py` — `RowAnalyzer` (y-aligned → HORIZONTAL_ROW)
+    - `grid.py` — `GridAnalyzer` (cols×rows → GRID)
+  - `layout/table/` — V9 equipment table parser (PANEL_LAYOUT)
+    - `model.py` — `TableArea`/`TableRow`/`TableCell` data classes
+    - `detector.py` — `detect_table_regions` (rectangle-based search)
+    - `parser.py` — `parse_table_at` (text clustering, header detection, column typing)
+    - `matcher.py` — `match_to_devices` (name column → DeviceCandidate.features['table_info'])
+  - `layout/spatial/` — V9 SpatialGraph (spatial relations between layout nodes)
+    - `model.py` — `SpatialNode`/`SpatialEdge`/`SpatialGraph` + `SpatialRelation` enum
+    - `bridge.py` — `lift(tree)` builds SpatialGraph from LayoutTree
 - `tools/cable_match_viewer/` — V5 minimal viewer
   - `server.py` — aiohttp app (one file, ~250 lines including HTML)
   - `store.py` — read-only CableViewer facade (does on-demand graph traversal)

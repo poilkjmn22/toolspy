@@ -1,12 +1,15 @@
-"""cable_engine.layout.detector — V8.2 LayoutTree orchestrator.
+"""cable_engine.layout.detector — V9 LayoutTree orchestrator.
 
 Pipeline:
   entities  →  detect_rectangles / detect_long_lines
             →  detect_cabinets  →  detect_areas_v2
             →  candidate.build_device_candidates  →  DBSCANClusterer
-            →  TextAssociator  →  GROUP + DEVICE nodes
+            →  structure.* analyzers  →  GROUP + DEVICE nodes
             →  annotate_groups  →  semantic types
             →  _identify_front_back  →  face labels
+
+DBSCAN answers "which devices are near each other".
+Structure analyzers answer "what spatial pattern are they in".
 """
 
 from __future__ import annotations
@@ -30,7 +33,9 @@ from .semantics.group_type import annotate_groups as _annotate_groups
 from .candidate import DeviceCandidate, build_device_candidates
 from .clustering import DeviceGroup, DBSCANClusterer
 from .associator import TextAssociator
+from .table import TableArea, detect_table_regions, parse_table_at, match_to_devices
 from ..ir import Document, TextEntity, AttributeEntity
+from ..ir.entities import BBox
 
 # ---------------------------------------------------------------------------
 # Build pipeline
@@ -95,6 +100,7 @@ def _apply_grouping_v2(
     parent: LayoutNode,
     cab_bbox: BBox,
     doc: Document,
+    table: Optional[TableArea] = None,
 ) -> None:
     """V8.1 pipeline: CandidatePool → TextAssociator → DBSCAN → LayoutNodes."""
     text_positions = _collect_text_positions(doc)
@@ -118,6 +124,10 @@ def _apply_grouping_v2(
             return
 
     TextAssociator().associate_devices(candidates, text_positions)
+
+    # Inject equipment table metadata into matching candidates.
+    if table is not None:
+        match_to_devices(table, candidates)
 
     clusterer = DBSCANClusterer(eps=30, min_samples=2)
     groups = clusterer.cluster(candidates, cab_bbox)
@@ -143,6 +153,24 @@ def _apply_grouping_v2(
     for c in device_children:
         c.parent = parent
     parent.children = non_device + device_children
+
+
+def _detect_equipment_table(
+    doc: Document, cab: LayoutNode,
+) -> Optional[TableArea]:
+    """Detect and parse an equipment table inside or near *cab*.
+
+    Returns the first valid table found; ``None`` if none detected.
+    """
+    search_bbox = BBox(
+        cab.bbox.x, cab.bbox.y,
+        cab.bbox.w + 200.0, cab.bbox.h,
+    )
+    for tbbox in detect_table_regions(doc, search_bbox):
+        table = parse_table_at(doc, tbbox)
+        if table is not None and table.name_column_index >= 0:
+            return table
+    return None
 
 
 def _identify_front_back(cabinets: list[LayoutNode],
@@ -226,14 +254,17 @@ def build_layout_tree(doc: Document) -> LayoutTree:
         interior = detect_cabinet_interior(cab, rects)
         area_nodes = detect_areas_v2(doc, cab, hors, interior)
 
+        # Attempt to detect equipment table for this cabinet.
+        table = _detect_equipment_table(doc, cab)
+
         if area_nodes:
             for area in area_nodes:
                 cab.add_child(area)
-                _apply_grouping_v2(area, cab.bbox, doc)
+                _apply_grouping_v2(area, cab.bbox, doc, table)
             # Orphans: run V8.1 at cabinet level (excludes area children).
-            _apply_grouping_v2(cab, cab.bbox, doc)
+            _apply_grouping_v2(cab, cab.bbox, doc, table)
         else:
-            _apply_grouping_v2(cab, cab.bbox, doc)
+            _apply_grouping_v2(cab, cab.bbox, doc, table)
 
         tree.add_root(cab)
 

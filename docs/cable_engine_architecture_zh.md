@@ -1,4 +1,4 @@
-# cable_engine 架构文档 (V8.2)
+# cable_engine 架构文档 (V9)
 
 ## 1. 系统概述
 
@@ -10,7 +10,7 @@ DWG 文件 → DWGLoader (dwgread -O JSON) → Document IR → TopologyStage →
                                                    LayoutStage → panel_layout (SQLite)
 ```
 
-单一 `TopologyStage` 负责文档分类、柜体分析和分析器分发。V8 引入了 **GeometryGraph**（纯几何图结构）来替代 V7 过程式的 `_cabinet_path_trace()` 算法。V8.2 在 LayoutStage 中引入了基于 **CandidatePool** + **DBSCAN** 的设备检测管线，替代了 V8.0 的多阶段配置式检测。
+单一 `TopologyStage` 负责文档分类、柜体分析和分析器分发。V8 引入了 **GeometryGraph**（纯几何图结构）来替代 V7 过程式的 `_cabinet_path_trace()` 算法。V8.2 在 LayoutStage 中引入了基于 **CandidatePool** + **DBSCAN** 的设备检测管线。V9 在此基础上新增三层能力：**Structure Analyzers**（结构分析器，替代内联评分函数）、**TableParser**（表格解析器，注入设备业务元数据）和 **SpatialGraph**（空间关系图，捕获节点间的几何关系）。
 
 ## 2. 文档分类
 
@@ -401,7 +401,7 @@ TerminalStripAnalyzer.analyze(doc)
 
 电缆清册文档的存根分析器。对清册中每条电缆记录生成单行 `cable_topology` 条目，包含 `cable_id`、`source_type='cable_schedule'`，端子/回路字段为空。查看器使用这些记录构建可浏览的电缆索引。
 
-### 7.4 LayoutStage — 屏面布置图布局树 (V8.2)
+### 7.4 LayoutStage — 屏面布置图布局树 (V9)
 
 `LayoutStage`（`cable_engine/layout/stage.py`）在 **TopologyStage 之后**运行，仅对 `PANEL_LAYOUT` 分类的文档进行处理。其构建一个分层的 **LayoutTree**（空间包含树，描述屏面布置图的物理结构），以 JSON 格式持久化到 `panel_layout` 表。
 
@@ -564,8 +564,14 @@ Document IR 实体
 | `detect_text_devices(doc, bbox)` | `candidate.py` | 文本回退设备（得分 0.40） |
 | `CandidatePool` | `candidate.py` | 多源候选去重（按得分 + 重叠率） |
 | `TextAssociator` | `associator.py` | 文本关联（name/description + 分组标签） |
-| `DBSCANClusterer` | `clustering.py` | DBSCAN 空间聚类（eps=30, min_samples=2） |
-| `_score_column` | `clustering.py` | 列评分（x 对齐 + 等宽/等高 + 等间距） |
+| `DBSCANClusterer` | `clustering.py` | DBSCAN 空间聚类（eps=30, min_samples=2，委托 structure/* 做后分类） |
+| `ColumnAnalyzer` | `structure/column.py` | 列评分（x 对齐 + 尺寸一致性 + 等间距） |
+| `RowAnalyzer` | `structure/row.py` | 行评分（y 对齐 + 尺寸一致性 + 等间距） |
+| `GridAnalyzer` | `structure/grid.py` | 网格评分（cols×rows 完整性） |
+| `detect_table_regions` | `table/detector.py` | 基于矩形的设备表区域检测 |
+| `parse_table_at` | `table/parser.py` | 表格行/列/表头解析 |
+| `match_to_devices` | `table/matcher.py` | 表行 → DeviceCandidate 匹配 |
+| `lift` | `spatial/bridge.py` | LayoutTree → SpatialGraph 提升 |
 #### 7.4.4 存储
 
 布局树序列化为 JSON（`LayoutNode` 数据类 → `asdict()` → JSON），存储在 `panel_layout` 表中：
@@ -601,7 +607,7 @@ renderLayoutTree(layout)  → HTML
          GROUP  → 分组颜色（紫色）、语义标签、网格尺寸、位置标签
 ```
 
-### 7.5 V8.2 LayoutGroup — 设备分组
+### 7.5 V9 LayoutGroup — 设备分组
 
 V8.2 在 CABINET/PANEL_AREA 与 DEVICE 之间引入 **GROUP** 节点层。GROUP 节点表示空间排布模式——例如垂直排列的端子列、顶部一行设备或 2×2 电表网格。
 
@@ -680,11 +686,6 @@ _apply_grouping_v2(parent, cab_bbox, doc)
 |------|--------|------|
 | `eps` | 30.0 | 邻域半径（DWG 单位） |
 | `min_samples` | 2 | 形成核心点所需最少样本数 |
-| `W_DIFF_TOL` | 8.0 | 组内宽度一致性容差（后分类） |
-| `H_DIFF_TOL` | 6.0 | 组内高度一致性容差（后分类） |
-| `SPACING_STD_TOL` | 5.0 | 间距标准差容差（后分类） |
-| `GAP_MAX` | 40.0 | 列/行内最大允许间隙（后分类） |
-| `SCORE_THRESHOLD` | 0.40 | 形成分组的最少评分 |
 
 **特征向量设计**：
 
@@ -692,15 +693,16 @@ _apply_grouping_v2(parent, cab_bbox, doc)
 - w/h 缩放因子 0.1 防止尺寸差异主导聚类（CAD 设备尺寸范围 6u–30u）
 - 尺寸信息帮助分离相邻但尺寸不同的设备列
 
-**后分类流程**：
+**后分类流程（委托给 Structure Analyzers）**：
 
-DBSCAN 产生无标签簇 → 每簇按几何特征评分为四种模式之一：
-1. **GRID**：x 簇 ≥2 且 y 簇 ≥2，总设备数 = cols × rows
-2. **VERTICAL_COLUMN**：x 对齐 + 等宽 + 等高 + 等间距（`_score_column`）
-3. **HORIZONTAL_ROW**：y 对齐 + 等高 + 等宽 + 等间距
-4. **FREEFORM**：其余簇（回退）
+DBSCAN 产生无标签簇 → 每簇委托给独立的结构分析器评分：
+1. **`GridAnalyzer`**：cols×rows 完整填充检查（得分 ≥0.40 → GRID）
+2. **`ColumnAnalyzer`**：x 对齐 + 宽度一致性 + 高度一致性 + 等间距（≥0.40 → VERTICAL_COLUMN）
+3. **`RowAnalyzer`**：y 对齐 + 高度一致性 + 宽度一致性 + 等间距（≥0.40 → HORIZONTAL_ROW）
+4. 均不达标 → **FREEFORM**
 
-后分类的一致性检查严格于 DBSCAN 的聚类（如 w/h 差 ≤8/6u），确保 FREEFORM 组仅包含真正相似的设备。
+检查顺序：GRID → COLUMN → ROW → FREEFORM。GRID 优先防止 2×2 网格被误拆为列。
+结构分析器独立于 `clustering.py`，存储在 `structure/` 包中，便于扩展（如 ladder、symmetry）。
 
 #### 7.5.3 语义分类
 
@@ -753,6 +755,135 @@ DBSCAN 产生无标签簇 → 每簇按几何特征评分为四种模式之一�
 | 网格尺寸 | GRID 节点显示 `2×2` |
 | 分组评分 | 数据中的 `score.round(2)` 作为可信度提示 |
 | 正/背面标识 | 使用 `cab.data.face` — `front` = 柜体名称, `back` = "背面" |
+
+### 7.6 V9 TableParser — 设备表解析器
+
+`layout/table/` 包从 PANEL_LAYOUT 图纸右侧的**设备表（材料表）**中提取结构化行数据，并将业务元数据（型号、说明、数量）注入到匹配的 DeviceCandidate 中。
+
+#### 7.6.1 数据模型
+
+```
+TableArea
+├── bbox: BBox                          — 表格所在区域
+├── rows: list[TableRow]                — Header + data 行
+├── header_row: Optional[TableRow]      — 表头行（含中文关键词）
+├── header_columns: list[str]           — 表头文本
+├── name_column_index: int              — 设备名称列索引
+├── model_column_index: int             — 型号列索引
+├── desc_column_index: int              — 说明列索引
+└── qty_column_index: int               — 数量列索引
+
+TableRow
+├── cells: list[TableCell]              — 单元格（按 col_index）
+├── y: float                            — Y 位置（CAD 坐标）
+└── header: bool                        — 是否为表头行
+
+TableCell
+├── text: str                           — 单元格文本
+├── x: float                            — X 位置
+├── col_index: int
+└── row_index: int
+```
+
+#### 7.6.2 解析管线
+
+```
+detect_table_regions(doc, container)
+  │   在容器内查找 ≥60w×80h 的矩形，且包含 ≥4 个文本实体
+  │   → list[BBox]
+  ▼
+parse_table_at(doc, table_bbox)
+  │   收集矩形内的文本
+  │   → Y 聚类（_ROW_TOL=3.0）分组到行
+  │   → 每行按 X 排序
+  │   → 查找含中文关键词（序号/名称/型号/说明/数量）的表头行
+  │   → 映射列角色（name/model/desc/qty/index/position）
+  │   → Optional[TableArea]
+  ▼
+match_to_devices(table, candidates)
+  │   对 TableRow.name_column 中的每个设备名称文本：
+  │     查找 name 匹配的 DeviceCandidate
+  │     注入 candidate.features['table_info'] = {model, description, qty}
+  │   → match_count
+```
+
+#### 7.6.3 集成
+
+在 `build_layout_tree` 的逐柜循环中调用 `_detect_equipment_table(doc, cab)`：
+- 在柜体右侧 200u 范围内搜索表格矩形
+- 找到首个有效表格（`name_column_index ≥ 0`）后传入 `_apply_grouping_v2`
+- 在 `TextAssociator.associate_devices` **之后**、DBSCAN **之前**执行 `match_to_devices`
+- 使 GroupSemanticResolver 可以访问候选设备的 `features['table_info']`
+
+### 7.7 V9 SpatialGraph — 空间关系图
+
+`layout/spatial/` 包建立了一个与 LayoutTree 平行的**扁平空间关系图**，捕获节点间的几何关系。与 `electrical/` 中的 GeometryGraph 保持严格分离。
+
+#### 7.7.1 数据模型
+
+```
+SpatialGraph
+├── nodes: dict[str, SpatialNode]       — 节点（包装 LayoutNode）
+└── edges: list[SpatialEdge]            — 空间关系边
+
+SpatialNode
+├── node_id: str                        — 对应 LayoutNode.id
+├── node_type: str                      — LayoutNodeType 值
+├── bbox: BBox
+├── name: str
+└── data: dict
+
+SpatialEdge
+├── source_id / target_id               — 节点 ID
+├── relation: SpatialRelation            — 关系类型
+├── distance: float                     — 间距（单位）
+└── confidence: float                   — 置信度
+```
+
+**关系类型**（`SpatialRelation`）：
+
+| 关系 | 含义 | 判定条件 |
+|------|------|----------|
+| `CONTAINS` | 包含 | LayoutTree 父→子边 |
+| `LEFT_OF` | 左侧 | 垂直重叠 ≥30%，A 在 B 左侧 |
+| `RIGHT_OF` | 右侧 | 垂直重叠 ≥30%，A 在 B 右侧 |
+| `ABOVE` | 上方 | 水平重叠 ≥30%，A 在 B 上方 |
+| `BELOW` | 下方 | 水平重叠 ≥30%，A 在 B 下方 |
+| `ALIGNED_VERT` | 垂直对齐 | |cx差| ≤ 8u，设备在同一列 |
+| `ALIGNED_HORZ` | 水平对齐 | |cy差| ≤ 8u，设备在同一行 |
+| `NEAR` | 邻近 | 质心距离 ≤ 40u，且无其他关系 |
+
+#### 7.7.2 桥接（`lift(tree)`）
+
+```
+lift(LayoutTree) → SpatialGraph
+  │
+  ├─ 1. 展平 LayoutTree（BFS）
+  │     每个 LayoutNode → SpatialNode
+  │
+  ├─ 2. CONTAINS 边
+  │     每个父节点 → 子节点
+  │
+  ├─ 3. 兄弟节点空间关系
+  │     同父节点下的兄弟对：
+  │       - 水平重叠 ≥30% → ABOVE / BELOW
+  │       - 垂直重叠 ≥30% → LEFT_OF / RIGHT_OF
+  │
+  └─ 4. 机柜内设备关系
+       同一 CABINET 下的所有 DEVICE 对：
+         - |cx差| ≤ 8  → ALIGNED_VERT
+         - |cy差| ≤ 8  → ALIGNED_HORZ
+         - 质心距离 ≤ 40 → NEAR
+```
+
+#### 7.7.3 查询接口
+
+```python
+graph.query_bbox(bbox: BBox) → list[SpatialNode]    # 空间相交节点
+graph.query_near((cx, cy), radius) → list[SpatialNode]  # 邻近节点
+graph.neighbors(node_id) → list[(target_id, edge)]   # 邻接点
+graph.relations_of(node_id, relation) → list[(target_id, edge)]  # 指定关系
+```
 
 ## 8. 柜体语义层
 
@@ -823,17 +954,17 @@ cable_engine/
 │   ├── geometry.py              # LineGeometry, BlockRef, AttributeEntity
 │   ├── document.py              # Document, DocumentType
 │   └── pdf.py                   # Page, PixelImage（延期）
-├── layout/                      # ← 屏面布置图 LayoutTree (V8.2)
+├── layout/                      # ← 屏面布置图 LayoutTree (V9)
 │   ├── __init__.py              # 公开 API 导出（含 LayoutGroupType）
 │   ├── types.py                 # LayoutTree, LayoutNode, LayoutNodeType（遗留兼容）
 │   ├── model.py                 # LayoutNode, LayoutNodeType, LayoutGroupType（规范）
-│   ├── detector.py              # V8.2 检测管线 + _apply_grouping_v2
+│   ├── detector.py              # V9 检测管线 + _apply_grouping_v2
 │   ├── stage.py                 # LayoutStage（序列化）
 │   ├── candidate.py             # DeviceCandidate + 5 级生成器 + CandidatePool
 │   ├── associator.py            # TextAssociator（name/description + 分组标签）
-│   ├── clustering.py            # DBSCANClusterer + _score_column
+│   ├── clustering.py            # DBSCANClusterer（后分类委托 structure/*）
 │   ├── cabinet.py               # PhysicalCabinet 包装器
-│   ├── test_detector.py         # 23 个单元测试
+│   ├── test_detector.py         # 30 个单元测试
 │   ├── demo.py                  # CLI demo
 │   ├── detectors/               # 空间检测模块
 │   │   ├── __init__.py          # 初始化
@@ -844,6 +975,21 @@ cable_engine/
 │   │   ├── bbox.py              # BBox 工具函数
 │   │   ├── line.py              # detect_long_lines / LongLine
 │   │   └── rectangle.py         # DetectedRect / detect_rectangles
+│   ├── structure/               # ← V9 空间结构分析器
+│   │   ├── __init__.py
+│   │   ├── column.py            # ColumnAnalyzer（VERTICAL_COLUMN 评分）
+│   │   ├── row.py               # RowAnalyzer（HORIZONTAL_ROW 评分）
+│   │   └── grid.py              # GridAnalyzer（GRID 评分）
+│   ├── table/                   # ← V9 设备表解析器
+│   │   ├── __init__.py
+│   │   ├── model.py             # TableArea / TableRow / TableCell
+│   │   ├── detector.py          # detect_table_regions
+│   │   ├── parser.py            # parse_table_at（文本聚类 + 表头检测）
+│   │   └── matcher.py           # match_to_devices（候选注入）
+│   ├── spatial/                 # ← V9 空间关系图
+│   │   ├── __init__.py
+│   │   ├── model.py             # SpatialNode / SpatialEdge / SpatialGraph
+│   │   └── bridge.py            # lift(tree) → SpatialGraph
 │   └── semantics/               # ← V8.2 弱语义标注层
 │       ├── __init__.py          # 初始化
 │       ├── group_type.py        # GroupSemanticResolver + 语义模式
@@ -888,6 +1034,11 @@ tools/cable_match_viewer/
 | **V8.2 GROUP 节点介于 AREA 与 DEVICE 之间** | GROUP 是空间集群节点，携带 `group_type`（排布模式）和语义类型。不改动现有 CABINET/AREA/DEVICE 层级。 |
 | **DBSCAN 替代扫描聚类** | 旧版扫描聚类（`grouping/` 目录）已删除。DBSCAN(eps=30) 无需显式 GRID→COLUMN→ROW 阶段顺序，后分类逻辑分配模式类型。 |
 | **GroupSemanticResolver 评分制** | 每个信号贡献权重分数，最高分胜出。证据列表可追溯决策过程。 |
+| **V9: Structure Analyzers 替代内联评分函数** | `_score_column`、`_score_row`、`_check_grid` 从 `clustering.py` 提取为独立类（ColumnAnalyzer/RowAnalyzer/GridAnalyzer），统一 analyze(cxs,cys,widths,heights,cab_bbox) 接口。后分类顺序 GRID→COLUMN→ROW→FREEFORM。新增分析器可以即插即用。 |
+| **V9: DBSCAN 降级为邻近发现** | DBSCAN 只回答"哪些设备彼此靠近"；结构分析器回答"它们处于什么空间模式"。两者职责分离。 |
+| **V9: TableParser 注入业务元数据** | 设备表（序号/名称/型号/数量）的文本行通过名称列匹配注入 DeviceCandidate.features['table_info']。运行在 associate_devices 之后、DBSCAN 之前，使语义解析器可利用型号/描述信息。 |
+| **V9: SpatialGraph 独立于 GeometryGraph** | GeometryGraph（electrical/）处理原始几何实体（线段、圆、TAG）；SpatialGraph 处理布局节点（CABINET/GROUP/DEVICE）。两个图保持严格分离，不混合。 |
+| **V9: 表格检测参数化** | 最小表格尺寸 60w×80h、最少 4 个文本、搜索柜体右侧 200u 范围。表头通过中文关键词匹配（regex），列角色通过关键词分类。 |
 
 ## 12. 已知限制
 
@@ -898,16 +1049,19 @@ tools/cable_match_viewer/
 - **仅 DWG**：PDF 支持延期（暂无 RasterizeStage / OcrStage）。
 - **匿名块文本**：匿名块内部的 TEXT/ATTRIB 仍不可见。
 
-### 屏面布置图 (PANEL_LAYOUT) — V8.2
+### 屏面布置图 (PANEL_LAYOUT) — V9
 
 - **柜体检测脆弱**：配对垂直线方法（相邻垂直线 dx 140-240）基于经验，可能漏检非标准宽度或短竖线柜体（如 D0206-20 前柜竖线 65u < 100u 阈值）。
 - **设备名称完整性**：TextAssociator 使用最高文本作为 name，其余为 description。如果无关文本恰好在设备上方，会产生杂音名称。
 - **背面设备命名**：脊柱设备依赖文本严格位于 bbox 内。如文本标签因浮点偏差略微超出 bbox，该设备将被丢弃（已通过 `_texts_in_bbox` 修复常见情况，边界情况仍可能发生）。
-- **DBSCAN 标签文本干扰**：分组标签（如"左侧"）与设备在同一簇内时，其较大宽度（~20u vs 6u）导致一致性检查失败 → FREEFORM 回退。`_score_column` 通过 cy 降序排序缓解此问题。
+- **DBSCAN 标签文本干扰**：分组标签（如"左侧"）与设备在同一簇内时，其较大宽度（~20u vs 6u）导致一致性检查失败 → FREEFORM 回退。`_classify_group` 通过 cy 降序排序缓解此问题。
 - **传感器类型区分**：`detect_closed_rects` 发现所有闭合矩形，但未区分传感器（温湿度/烟雾）与端子排设备。需设备级语义分类。
 - **PANEL_POSITION 分析器缺失**：屏位布置图已分类但尚无空间分析器。
 - **无交叉验证**：布局树独立按图纸生成。没有跨文档验证。
-- **GRID 后分类要求完整填充**：网格设备数必须严格等于 `cols × rows`。非全填充网格（如 2×3 但只有 5 个设备）将被漏检。
+- **GRID 后分类要求完整填充**：GridAnalyzer 要求设备数严格等于 `cols × rows`。非全填充网格（如 2×3 但只有 5 个设备）将被漏检。
 - **FREEFORM 回退无模式评分**：DBSCAN 噪声点独立标注，未分组的剩余设备不做聚类。
 - **语义分类仅匹配前缀**：`GroupSemanticResolver` 依赖设备名称前缀（`2D`、`DTZ`、`DK` 等），不支持后缀匹配或正则表达式。
 - **detectors/device.py 遗留代码**：`detectors/device.py` 中的旧式 `detect_devices`、`_detect_open_rect_devices`、`_merge_devices` 不再被调用。待后续清理。
+- **表格检测仅支持矩形边界**：`detect_table_regions` 依赖 `detect_rectangles` 找到的闭合矩形。无矩形边框的表格（如仅由文本网格构成的"隐形表格"）无法检测。
+- **SpatialGraph 仅支持布局节点**：SpatialGraph 当前仅从 LayoutTree 节点推导关系，不涉及原始几何实体（线条、圆等）。需 GeometryGraph 的细粒度空间查询暂不支持。
+- **O(N²) 设备对枚举未优化**：`_add_device_relations` 枚举 CABINET 内所有设备对。对于大型机柜（>45 设备，1000 对以上），有性能风险。当前以 `_MAX_DEVICE_PAIRS=2000` 为上限保护。

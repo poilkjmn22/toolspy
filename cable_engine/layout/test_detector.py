@@ -477,8 +477,82 @@ def test_front_back_cabinets():
     print('  ✓ test_front_back_cabinets')
 
 
+# ---------------------------------------------------------------------------
+# V9 Structure Analyzer tests
+# ---------------------------------------------------------------------------
+
+
+def test_column_analyzer_perfect():
+    """6 x-aligned, equally spaced, same size → score=0.90."""
+    from .structure import ColumnAnalyzer
+    cxs = [10.0] * 6
+    cys = [180.0, 150.0, 120.0, 90.0, 60.0, 30.0]
+    widths = [20.0] * 6
+    heights = [10.0] * 6
+    cab = BBox(0, 0, 200, 300)
+    score, evidence = ColumnAnalyzer().analyze(cxs, cys, widths, heights, cab)
+    assert score >= 0.4, f'column score too low: {score}'
+    assert 'x_align' in evidence
+    assert 'w_consist' in evidence
+    assert 'h_consist' in evidence
+    assert any(e.startswith('spacing_std') for e in evidence)
+    print(f'  Column perfect: score={score:.2f} evidence={evidence}')
+    print('  ✓ test_column_analyzer_perfect')
+
+
+def test_column_analyzer_wide_x():
+    """Devices spread too wide in x + mixed sizes → score below threshold."""
+    from .structure import ColumnAnalyzer
+    cxs = [10.0, 15.0, 30.0, 10.0, 5.0, 20.0]  # range=25 > X_TOL*3=12
+    cys = [180.0, 150.0, 120.0, 90.0, 60.0, 30.0]
+    widths = [20.0, 15.0, 30.0, 25.0, 10.0, 8.0]  # varied → w_consist fails
+    heights = [10.0, 12.0, 8.0, 15.0, 20.0, 5.0]  # varied → h_consist fails
+    cab = BBox(0, 0, 200, 300)
+    score, evidence = ColumnAnalyzer().analyze(cxs, cys, widths, heights, cab)
+    assert score < 0.4, f'expected low column score, got {score}'
+    print(f'  Column wide-x: score={score:.2f}')
+    print('  ✓ test_column_analyzer_wide_x')
+
+
+def test_row_analyzer_perfect():
+    """3 y-aligned, equally spaced, same size → score=0.90."""
+    from .structure import RowAnalyzer
+    cxs = [10.0, 40.0, 70.0]
+    cys = [100.0] * 3
+    widths = [20.0] * 3
+    heights = [10.0] * 3
+    cab = BBox(0, 0, 200, 300)
+    score, evidence = RowAnalyzer().analyze(cxs, cys, widths, heights, cab)
+    assert score >= 0.4, f'row score too low: {score}'
+    assert 'y_align' in evidence
+    print(f'  Row perfect: score={score:.2f} evidence={evidence}')
+    print('  ✓ test_row_analyzer_perfect')
+
+
+def test_grid_analyzer_2x2():
+    """4 devices in 2x2 pattern → grid detected."""
+    from .structure import GridAnalyzer
+    cxs = [10.0, 10.0, 50.0, 50.0]
+    cys = [100.0, 60.0, 100.0, 60.0]
+    is_grid, dims = GridAnalyzer().analyze(cxs, cys, 4)
+    assert is_grid, 'expected 2x2 grid'
+    assert dims == {'cols': 2, 'rows': 2}
+    print(f'  Grid 2x2: {dims}')
+    print('  ✓ test_grid_analyzer_2x2')
+
+
+def test_grid_analyzer_partial():
+    """5 devices in 2x3 but only 5 → not a grid (needs full fill)."""
+    from .structure import GridAnalyzer
+    cxs = [10.0, 10.0, 10.0, 50.0, 50.0]  # 2 cols × ? but 5 != 2×any
+    cys = [100.0, 60.0, 20.0, 100.0, 60.0]
+    is_grid, dims = GridAnalyzer().analyze(cxs, cys, 5)
+    assert not is_grid, 'partial grid should not match'
+    print('  ✓ test_grid_analyzer_partial')
+
+
 if __name__ == '__main__':
-    print('LayoutTree detector tests:')
+    print('LayoutTree detector + structure analyzer tests:')
     test_empty_doc()
     test_rectangle_from_polyline()
     test_rectangle_from_4seg()
@@ -498,5 +572,11 @@ if __name__ == '__main__':
     test_dbscan_column_cluster()
     test_dbscan_noise_standalone()
     test_full_candidate_pipeline()
+    # V9 structure analyzer tests
+    test_column_analyzer_perfect()
+    test_column_analyzer_wide_x()
+    test_row_analyzer_perfect()
+    test_grid_analyzer_2x2()
+    test_grid_analyzer_partial()
     print()
     print('All tests passed.')

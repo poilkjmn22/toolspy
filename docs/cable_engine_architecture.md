@@ -1,4 +1,4 @@
-# cable_engine Architecture (V8.2)
+# cable_engine Architecture (V9)
 
 ## 1. System Overview
 
@@ -10,7 +10,7 @@ DWG file → DWGLoader (dwgread -O JSON) → Document IR → TopologyStage → c
                                                              LayoutStage → panel_layout (SQLite)
 ```
 
-A single `TopologyStage` orchestrates classification, cabinet analysis, and analyzer dispatch. V8 introduces a **GeometryGraph** — a pure graph layer — to replace the V7 procedural `_cabinet_path_trace()` algorithm. V8.2 introduces a **CandidatePool + DBSCAN** device detection pipeline in LayoutStage, replacing the V8.0 multi-stage configurable detector.
+A single `TopologyStage` orchestrates classification, cabinet analysis, and analyzer dispatch. V8 introduces a **GeometryGraph** — a pure graph layer — to replace the V7 procedural `_cabinet_path_trace()` algorithm. V8.2 introduces a **CandidatePool + DBSCAN** device detection pipeline in LayoutStage. V9 adds three layers on top: **Structure Analyzers** (replacing inline score functions), **TableParser** (injecting device business metadata), and **SpatialGraph** (spatial relations between layout nodes).
 
 ## 2. Document Classification
 
@@ -402,7 +402,7 @@ Each collected text along the vertical column is classified by priority:
 
 A stub analyzer for cable schedule documents (`CABLE_SCHEDULE` type). For each cable entry found in the schedule, it emits a single `cable_topology` record with `cable_id`, `source_type='cable_schedule'`, and empty terminal/loop fields. Used by the viewer for a browsable cable index.
 
-### 7.4 LayoutStage — Panel Layout Tree (屏面布置图) (V8.2)
+### 7.4 LayoutStage — Panel Layout Tree (屏面布置图) (V9)
 
 `LayoutStage` (`cable_engine/layout/stage.py`) runs **after** `TopologyStage` and only for `PANEL_LAYOUT` classified documents. It builds a hierarchical **LayoutTree** — a spatial containment tree capturing the physical structure of a panel face drawing — and persists it as JSON to the `panel_layout` table.
 
@@ -561,8 +561,14 @@ Step 6 — Semantic annotation (_annotate_groups)
 | `detect_text_devices(doc, bbox)` | `candidate.py` | Text-only fallback (0.40) |
 | `CandidatePool` | `candidate.py` | Multi-source candidate dedup |
 | `TextAssociator` | `associator.py` | Text association (name/desc + group labels) |
-| `DBSCANClusterer` | `clustering.py` | DBSCAN spatial clustering (eps=30, min_samples=2) |
-| `_score_column` | `clustering.py` | Column scoring (x-align + size consistency + spacing) |
+| `DBSCANClusterer` | `clustering.py` | DBSCAN clustering (eps=30, min_samples=2; post-class delegates to structure/*) |
+| `ColumnAnalyzer` | `structure/column.py` | Column scoring (x-align + size consistency + spacing) |
+| `RowAnalyzer` | `structure/row.py` | Row scoring (y-align + size consistency + spacing) |
+| `GridAnalyzer` | `structure/grid.py` | Grid scoring (cols×rows fill) |
+| `detect_table_regions` | `table/detector.py` | Rectangle-based equipment table detection |
+| `parse_table_at` | `table/parser.py` | Table row/column/header parsing |
+| `match_to_devices` | `table/matcher.py` | TableRow → DeviceCandidate matching |
+| `lift` | `spatial/bridge.py` | LayoutTree → SpatialGraph lift |
 
 #### 7.4.4 Storage
 
@@ -596,7 +602,136 @@ renderLayoutTree(layout)  → HTML
        Back cabinet  → "背面"
        Each PANEL_AREA → nested with orange label
        GROUP → purple border, semantic label + position
-       DEVICE → label with name
+        DEVICE → label with name
+```
+
+### 7.5 V9 TableParser — Equipment Table Parser
+
+The `layout/table/` package extracts structured row data from **equipment tables (设备表 / 材料表)** on the right side of PANEL_LAYOUT drawings, and injects business metadata (model, description, quantity) into matching DeviceCandidates.
+
+#### 7.5.1 Data Model
+
+```
+TableArea
+├── bbox: BBox                          — Table region
+├── rows: list[TableRow]                — Header + data rows
+├── header_row: Optional[TableRow]      — Header row (Chinese keywords)
+├── header_columns: list[str]           — Header cell texts
+├── name_column_index: int              — Device name column
+├── model_column_index: int             — Model number column
+├── desc_column_index: int              — Description column
+└── qty_column_index: int               — Quantity column
+
+TableRow
+├── cells: list[TableCell]              — Cells by col_index
+├── y: float                            — CAD Y coordinate
+└── header: bool
+
+TableCell
+├── text: str
+├── x: float
+├── col_index: int
+└── row_index: int
+```
+
+#### 7.5.2 Pipeline
+
+```
+detect_table_regions(doc, container)
+  │   Searches for rects ≥60w×80h with ≥4 texts inside container
+  │   → list[BBox]
+  ▼
+parse_table_at(doc, table_bbox)
+  │   Collects texts inside rect
+  │   → Y-cluster (_ROW_TOL=3.0) into rows
+  │   → Sort each row by X
+  │   → Detect header row by Chinese keywords (序号/名称/型号/说明/数量)
+  │   → Map column roles (name/model/desc/qty/index/position)
+  │   → Optional[TableArea]
+  ▼
+match_to_devices(table, candidates)
+  │   For each name-column text in data rows:
+  │     Find candidate with matching name
+  │     Inject candidate.features['table_info'] = {model, description, qty}
+  │   → match_count
+```
+
+#### 7.5.3 Integration
+
+`_detect_equipment_table(doc, cab)` called per-cabinet in `build_layout_tree`:
+- Searches 200u to the right of the cabinet bbox for table rects
+- First valid table (`name_column_index ≥ 0`) is passed to `_apply_grouping_v2`
+- `match_to_devices` runs **after** `associate_devices`, **before** DBSCAN
+- Makes `features['table_info']` available to GroupSemanticResolver and downstream stages
+
+### 7.6 V9 SpatialGraph — Spatial Relations Graph
+
+The `layout/spatial/` package builds a flat **spatial relations graph** parallel to the LayoutTree hierarchy, capturing geometric relationships between layout nodes. Strictly separate from GeometryGraph (`electrical/`).
+
+#### 7.6.1 Data Model
+
+```
+SpatialGraph
+├── nodes: dict[str, SpatialNode]       — Wrapping LayoutNode
+└── edges: list[SpatialEdge]            — Spatial relations
+
+SpatialNode
+├── node_id: str                        → LayoutNode.id
+├── node_type: str                      → LayoutNodeType value
+├── bbox: BBox
+├── name: str
+└── data: dict
+
+SpatialEdge
+├── source_id / target_id
+├── relation: SpatialRelation
+├── distance: float
+└── confidence: float
+```
+
+**Relation types** (`SpatialRelation`):
+
+| Relation | Meaning | Criteria |
+|----------|---------|----------|
+| `CONTAINS` | Containment | LayoutTree parent→child |
+| `LEFT_OF` | Left | vertical overlap ≥30%, A left of B |
+| `RIGHT_OF` | Right | vertical overlap ≥30%, A right of B |
+| `ABOVE` | Above | horizontal overlap ≥30%, A above B |
+| `BELOW` | Below | horizontal overlap ≥30%, A below B |
+| `ALIGNED_VERT` | Vertical alignment | cx diff ≤ 8u, same column |
+| `ALIGNED_HORZ` | Horizontal alignment | cy diff ≤ 8u, same row |
+| `NEAR` | Proximity | centroid distance ≤ 40u, no other relation |
+
+#### 7.6.2 Bridge (`lift(tree)`)
+
+```
+lift(LayoutTree) → SpatialGraph
+  │
+  ├─ 1. Flatten tree (BFS)
+  │     Each LayoutNode → SpatialNode
+  │
+  ├─ 2. CONTAINS edges
+  │     Every parent → child
+  │
+  ├─ 3. Sibling spatial relations
+  │     Sibling pairs under same parent:
+  │       - Horizontal overlap ≥30% → ABOVE / BELOW
+  │       - Vertical overlap ≥30% → LEFT_OF / RIGHT_OF
+  │
+  └─ 4. Cabinet-internal device relations
+       All DEVICE pairs under same CABINET:
+         - |cx diff| ≤ 8 → ALIGNED_VERT
+         - |cy diff| ≤ 8 → ALIGNED_HORZ
+         - centroid dist ≤ 40 → NEAR
+```
+
+#### 7.6.3 Query API
+
+```python
+graph.query_bbox(bbox: BBox) → list[SpatialNode]    # Intersecting nodes
+graph.query_near((cx, cy), radius) → list[SpatialNode]  # Proximity
+graph.neighbors(node_id) → list[(target_id, edge)]   # Adjacency
+graph.relations_of(node_id, relation) → list[(target_id, edge)]  # Filtered
 ```
 
 ## 8. Cabinet Semantic Layer
@@ -668,17 +803,17 @@ cable_engine/
 │   ├── geometry.py              # LineGeometry, BlockRef, AttributeEntity
 │   ├── document.py              # Document, DocumentType
 │   └── pdf.py                   # Page, PixelImage (deferred)
-├── layout/                      # ← PANEL_LAYOUT LayoutTree (V8.2)
+├── layout/                      # ← PANEL_LAYOUT LayoutTree (V9)
 │   ├── __init__.py              # Public API exports
 │   ├── types.py                 # LayoutTree, LayoutNode, LayoutNodeType
 │   ├── model.py                 # LayoutNode, LayoutGroupType (canonical)
-│   ├── detector.py              # V8.2 pipeline + _apply_grouping_v2
+│   ├── detector.py              # V9 pipeline + _apply_grouping_v2
 │   ├── stage.py                 # LayoutStage (post-TopologyStage)
 │   ├── candidate.py             # DeviceCandidate + 5-tier generator + CandidatePool
 │   ├── associator.py            # TextAssociator (name/desc + group labels)
-│   ├── clustering.py            # DBSCANClusterer + _score_column
+│   ├── clustering.py            # DBSCANClusterer (post-class delegates to structure/*)
 │   ├── cabinet.py               # PhysicalCabinet wrapper
-│   ├── test_detector.py         # 23 unit tests
+│   ├── test_detector.py         # 30 unit tests
 │   ├── demo.py                  # CLI demo
 │   ├── detectors/               # Spatial detection modules
 │   │   ├── __init__.py
@@ -690,6 +825,21 @@ cable_engine/
 │   │   ├── bbox.py              # BBox utilities
 │   │   ├── line.py              # detect_long_lines / LongLine
 │   │   └── rectangle.py         # DetectedRect / detect_rectangles
+│   ├── structure/               # ← V9 Spatial-structure analyzers
+│   │   ├── __init__.py
+│   │   ├── column.py            # ColumnAnalyzer (VERTICAL_COLUMN scoring)
+│   │   ├── row.py               # RowAnalyzer (HORIZONTAL_ROW scoring)
+│   │   └── grid.py              # GridAnalyzer (GRID scoring)
+│   ├── table/                   # ← V9 Equipment table parser
+│   │   ├── __init__.py
+│   │   ├── model.py             # TableArea / TableRow / TableCell
+│   │   ├── detector.py          # detect_table_regions
+│   │   ├── parser.py            # parse_table_at (text clustering + header detection)
+│   │   └── matcher.py           # match_to_devices (candidate injection)
+│   ├── spatial/                 # ← V9 Spatial graph
+│   │   ├── __init__.py
+│   │   ├── model.py             # SpatialNode / SpatialEdge / SpatialGraph
+│   │   └── bridge.py            # lift(tree) → SpatialGraph
 │   └── semantics/               # V8.2 semantic annotation
 │       ├── __init__.py
 │       ├── group_type.py        # GroupSemanticResolver
@@ -734,6 +884,11 @@ tools/cable_match_viewer/
 | **V8.2 GROUP node between AREA and DEVICE** | GROUP nodes carry `group_type` (spatial pattern) and semantic types. Plug into existing CABINET/AREA/DEVICE hierarchy via `parent.children`. |
 | **DBSCAN replaces sweep-based clustering** | Legacy sweep-based clustering (`grouping/`) deleted. DBSCAN(eps=30) eliminates explicit GRID → COLUMN → ROW phase ordering. Post-classification assigns pattern type. |
 | **GroupSemanticResolver scoring** | Each signal contributes weighted score; highest wins. Evidence list traces decision provenance. |
+| **V9: Structure Analyzers replace inline score functions** | `_score_column`, `_score_row`, `_check_grid` extracted from `clustering.py` into independent classes (ColumnAnalyzer/RowAnalyzer/GridAnalyzer) with a uniform `analyze()` interface. Post-class order: GRID→COLUMN→ROW→FREEFORM. New analyzers plug in without touching clustering.py. |
+| **V9: DBSCAN downgraded to proximity finder** | DBSCAN answers "which devices are near each other"; structure analyzers answer "what spatial pattern". Responsibilities separated. |
+| **V9: TableParser injects business metadata** | Equipment table rows matched by name column → DeviceCandidate.features['table_info']. Runs after associate_devices, before DBSCAN so semantic resolvers can leverage model/description info. |
+| **V9: SpatialGraph independent from GeometryGraph** | GeometryGraph (electrical/) operates on raw geometry entities (lines, circles, TAGs). SpatialGraph operates on layout nodes (CABINET/GROUP/DEVICE). The two graphs are strictly separate. |
+| **V9: Table detection parametric** | Min table size 60w×80h, min 4 texts, search 200u right of cabinet. Header detected by Chinese keyword regex, column roles by keyword classification. |
 
 ## 12. Known Limitations
 
@@ -744,16 +899,19 @@ tools/cable_match_viewer/
 - **DWG only**: PDF support deferred (no RasterizeStage / OcrStage yet).
 - **Anonymous block text**: TEXT/ATTRIB inside anonymous blocks remain invisible.
 
-### Panel Layout (PANEL_LAYOUT) — V8.2
+### Panel Layout (PANEL_LAYOUT) — V9
 
 - **Cabinet detection fragile**: The paired-vertical approach (dx 140-240) is empirical. May miss short-vertical cabinets (e.g. D0206-20 front: verticals 65u < 100u threshold).
 - **Device name completeness**: TextAssociator picks topmost text as name, rest as description. Unrelated text above a device produces noisy names.
 - **Back-face device naming**: Spine devices require text strictly inside bbox. Floating-point edge cases may still discard valid devices (fixed for common cases via `_texts_in_bbox`).
-- **DBSCAN label text interference**: Group labels (e.g. "左侧" w=20u) in same cluster as spine devices (w=6u) → consistency check fails → FREEFORM fallback. Mitigated by `_score_column` sorted cy descending.
+- **DBSCAN label text interference**: Group labels (e.g. "左侧" w=20u) in same cluster as spine devices (w=6u) → consistency check fails → FREEFORM fallback. Mitigated by `_classify_group` sorted cy descending.
 - **No sensor vs terminal discrimination**: `detect_closed_rects` finds all closed rectangles but does not distinguish sensors (temp/humidity) from terminal devices. Device-level semantic classification needed.
 - **PANEL_POSITION analyzer missing**: Panel position drawings classified but no spatial analyzer yet.
 - **No cross-validation**: Layout tree produced independently per drawing.
-- **GRID post-class requires full fill**: Grid device count must exactly equal `cols × rows`. Partial grids (e.g. 2×3 with 5 devices) are missed.
+- **GRID post-class requires full fill**: GridAnalyzer requires device count to exactly equal `cols × rows`. Partial grids (e.g. 2×3 with 5 devices) are missed.
 - **FREEFORM has no pattern scoring**: DBSCAN noise points become standalone DEVICE nodes; remaining ungrouped devices are not clustered.
 - **Semantic classification prefix-only**: `GroupSemanticResolver` matches device name prefixes (`2D`, `DTZ`, `DK` etc.). No suffix or regex support.
 - **detectors/device.py legacy**: Old `detect_devices`, `_detect_open_rect_devices`, `_merge_devices` remain in `detectors/device.py` but are no longer called. Pending cleanup.
+- **Table detection requires rect border**: `detect_table_regions` depends on `detect_rectangles` to find closed-rect table borders. Tables without rectangular boundaries (e.g. text-only "invisible tables") are not detected.
+- **SpatialGraph layout-node-only**: SpatialGraph currently derives relations only from LayoutTree nodes, not raw geometry entities (lines, circles). Fine-grained geometric queries requiring GeometryGraph are not supported.
+- **O(N²) device pair enumeration not optimized**: `_add_device_relations` enumerates all device pairs within a cabinet. Large cabinets (>45 devices, >1000 pairs) risk performance. Guarded by `_MAX_DEVICE_PAIRS=2000`.

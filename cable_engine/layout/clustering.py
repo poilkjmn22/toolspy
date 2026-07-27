@@ -1,17 +1,16 @@
-"""cable_engine.layout.clustering — DBSCAN-based device clustering.
+"""cable_engine.layout.clustering — DBSCAN-based device proximity clustering.
 
-DeviceClusterer (abstract)
-  └─ DBSCANClusterer
+DBSCAN (eps=30, min_samples=2) groups nearby devices into candidate clusters.
+Post-classification delegates to :mod:`structure` analyzers for pattern
+recognition (VERTICAL_COLUMN / HORIZONTAL_ROW / GRID / FREEFORM).
 
-Feature vector: (cx, cy, w * 0.1, h * 0.1)
-Post-processing classifies group type (COLUMN / ROW / GRID / FREEFORM).
-label = -1 → noise (standalone device).
+Key principle (V9):
+  DBSCAN only answers "which devices are near each other".
+  Structure analyzers answer "what spatial pattern are they in".
 """
 
 from __future__ import annotations
 
-import math
-import statistics
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional
@@ -22,13 +21,11 @@ from sklearn.cluster import DBSCAN
 from ..ir.entities import BBox
 from .candidate import DeviceCandidate
 from .model import LayoutGroupType
+from .structure import ColumnAnalyzer, GridAnalyzer, RowAnalyzer
 
 
 _X_TOL = 4.0
 _Y_TOL = 4.0
-_W_DIFF_TOL = 8.0
-_H_DIFF_TOL = 6.0
-_SPACING_STD_TOL = 5.0
 
 
 @dataclass
@@ -49,6 +46,12 @@ class DeviceClusterer(ABC):
 
 
 class DBSCANClusterer(DeviceClusterer):
+    """DBSCAN-based proximity clusterer.
+
+    This is intentionally simple — it finds "what is near what".
+    Pattern classification is delegated to structure analyzers.
+    """
+
     def __init__(self, eps: float = 30.0, min_samples: int = 2):
         self._eps = eps
         self._min_samples = min_samples
@@ -80,12 +83,16 @@ class DBSCANClusterer(DeviceClusterer):
 
 
 # ---------------------------------------------------------------------------
-# Post-processing
+# Post-classification — delegates to structure analyzers
 # ---------------------------------------------------------------------------
 
 
 def _classify_group(devices: list[DeviceCandidate],
                     cab_bbox: BBox) -> Optional[DeviceGroup]:
+    """Classify a DBSCAN cluster into a DeviceGroup with pattern type.
+
+    Tries structure analyzers in order: GRID → COLUMN → ROW → FREEFORM.
+    """
     if len(devices) < 2:
         return None
 
@@ -98,8 +105,23 @@ def _classify_group(devices: list[DeviceCandidate],
     x_range = max(cxs) - min(cxs)
     y_range = max(cys) - min(cys)
 
+    # GRID — requires clean cols×rows, checked first
+    is_grid, grid_dims = GridAnalyzer().analyze(cxs, cys, len(devices))
+    if is_grid:
+        return DeviceGroup(
+            bbox=bbox,
+            group_type=LayoutGroupType.GRID,
+            devices=sorted(devices, key=lambda d: -d.cy),
+            score=0.8,
+            features={
+                'grid_dims': grid_dims,
+                'evidence': [f'grid_{grid_dims["cols"]}x{grid_dims["rows"]}'],
+            },
+        )
+
+    # VERTICAL_COLUMN — x-aligned
     if x_range <= _X_TOL * 3:
-        score, evidence = _score_column(cxs, cys, widths, heights, cab_bbox)
+        score, evidence = ColumnAnalyzer().analyze(cxs, cys, widths, heights, cab_bbox)
         if score >= 0.4:
             return DeviceGroup(
                 bbox=bbox,
@@ -109,9 +131,9 @@ def _classify_group(devices: list[DeviceCandidate],
                 features={'evidence': evidence},
             )
 
+    # HORIZONTAL_ROW — y-aligned
     if y_range <= _Y_TOL * 2:
-        # Row: y-aligned
-        score, evidence = _score_row(cxs, cys, widths, heights, cab_bbox)
+        score, evidence = RowAnalyzer().analyze(cxs, cys, widths, heights, cab_bbox)
         if score >= 0.4:
             return DeviceGroup(
                 bbox=bbox,
@@ -121,16 +143,7 @@ def _classify_group(devices: list[DeviceCandidate],
                 features={'evidence': evidence},
             )
 
-    is_grid, grid_dims = _check_grid(cxs, cys, devices)
-    if is_grid:
-        return DeviceGroup(
-            bbox=bbox,
-            group_type=LayoutGroupType.GRID,
-            devices=sorted(devices, key=lambda d: -d.cy),
-            score=0.8,
-            features={'grid_dims': grid_dims, 'evidence': [f'grid_{grid_dims["cols"]}x{grid_dims["rows"]}']},
-        )
-
+    # FREEFORM — fallback
     return DeviceGroup(
         bbox=bbox,
         group_type=LayoutGroupType.FREEFORM,
@@ -138,85 +151,6 @@ def _classify_group(devices: list[DeviceCandidate],
         score=0.0,
         features={'evidence': ['connected']},
     )
-
-
-def _score_column(cxs, cys, widths, heights, cab_bbox) -> tuple[float, list[str]]:
-    score, evidence = 0.0, []
-    if max(cxs) - min(cxs) <= _X_TOL:
-        score += 0.3
-        evidence.append('x_align')
-    if max(widths) - min(widths) <= _W_DIFF_TOL:
-        score += 0.15
-        evidence.append('w_consist')
-    if max(heights) - min(heights) <= _H_DIFF_TOL:
-        score += 0.15
-        evidence.append('h_consist')
-
-    sorted_by_y = sorted(zip(cys, cxs, widths, heights), key=lambda x: -x[0])
-    gaps = [sorted_by_y[i][0] - sorted_by_y[i + 1][0]
-            for i in range(len(sorted_by_y) - 1)]
-    if gaps and all(g > 2.0 for g in gaps):
-        if len(gaps) >= 2:
-            s = statistics.stdev(gaps) if len(gaps) >= 2 else 0.0
-            if s <= _SPACING_STD_TOL:
-                score += 0.2
-                evidence.append(f'spacing_std:{s:.1f}')
-        score += 0.1
-        evidence.append(f'count:{len(cxs)}')
-
-    avg_cx = statistics.mean(cxs)
-    cw = cab_bbox.w if cab_bbox.w > 0 else 1
-    if cab_bbox.x > 0 and (avg_cx - cab_bbox.x) / cw < 0.15:
-        score += 0.1
-        evidence.append('left_edge')
-    elif (cab_bbox.x + cw - avg_cx) / cw < 0.15:
-        score += 0.1
-        evidence.append('right_edge')
-
-    return score, evidence
-
-
-def _score_row(cxs, cys, widths, heights, cab_bbox) -> tuple[float, list[str]]:
-    score, evidence = 0.0, []
-    if max(cys) - min(cys) <= _Y_TOL:
-        score += 0.3
-        evidence.append('y_align')
-    if max(heights) - min(heights) <= _H_DIFF_TOL:
-        score += 0.15
-        evidence.append('h_consist')
-    if max(widths) - min(widths) <= _W_DIFF_TOL:
-        score += 0.15
-        evidence.append('w_consist')
-
-    gaps = [cxs[i + 1] - cxs[i] for i in range(len(cxs) - 1)]
-    if gaps and all(g > 2.0 for g in gaps):
-        if len(gaps) >= 2:
-            s = statistics.stdev(gaps) if len(gaps) >= 2 else 0.0
-            if s <= _SPACING_STD_TOL:
-                score += 0.2
-                evidence.append(f'spacing_std:{s:.1f}')
-        score += 0.1
-        evidence.append(f'count:{len(cxs)}')
-
-    ch = cab_bbox.h if cab_bbox.h > 0 else 1
-    if (cab_bbox.y + ch - statistics.mean(cys)) / ch < 0.1:
-        score += 0.1
-        evidence.append('top_edge')
-
-    return score, evidence
-
-
-def _check_grid(cxs, cys, devices) -> tuple[bool, dict]:
-    if len(devices) < 4:
-        return False, {}
-    ux = sorted(set(round(c, 1) for c in cxs))
-    uy = sorted(set(round(c, 1) for c in cys), reverse=True)
-    nx, ny = len(ux), len(uy)
-    if nx < 2 or ny < 2:
-        return False, {}
-    if nx * ny != len(devices):
-        return False, {}
-    return True, {'cols': nx, 'rows': ny}
 
 
 def _union_bbox(devices: list[DeviceCandidate]) -> BBox:
