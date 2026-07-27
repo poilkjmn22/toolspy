@@ -53,8 +53,6 @@ Key change from V5/V6: V7.0 replaces all V6 fallback methods (icon y-bucket, geo
     - `detector.py` — `detect_table_regions` (rectangle-based search)
     - `parser.py` — `parse_table_at` (text clustering, header detection, column typing)
     - `matcher.py` — `match_to_devices` (name column → DeviceCandidate.features['table_info'])
-  - `layout/region/` — V9 Region Layer (CABINET→REGION→GROUP)
-    - `detector.py` — `detect_regions()` (text keywords + group aggregation)
   - `layout/spatial/` — V9 SpatialGraph (spatial relations between layout nodes)
     - `model.py` — `SpatialNode`/`SpatialEdge`/`SpatialGraph` + `SpatialRelation` enum
     - `bridge.py` — `lift(tree)` builds SpatialGraph from LayoutTree

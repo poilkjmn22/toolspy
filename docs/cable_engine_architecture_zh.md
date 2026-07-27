@@ -10,7 +10,7 @@ DWG 文件 → DWGLoader (dwgread -O JSON) → Document IR → TopologyStage →
                                                    LayoutStage → panel_layout (SQLite)
 ```
 
-单一 `TopologyStage` 负责文档分类、柜体分析和分析器分发。V8 引入了 **GeometryGraph**（纯几何图结构）来替代 V7 过程式的 `_cabinet_path_trace()` 算法。V8.2 在 LayoutStage 中引入了基于 **CandidatePool** + **DBSCAN** 的设备检测管线。V9 在此基础上新增四层能力：**Structure Analyzers**（结构分析器，替代内联评分函数）、**TableParser**（表格解析器，注入设备业务元数据）、**Region Layer**（区域层，CABINET 与 GROUP 之间的功能区域）和 **SpatialGraph**（空间关系图，捕获节点间的几何关系）。
+单一 `TopologyStage` 负责文档分类、柜体分析和分析器分发。V8 引入了 **GeometryGraph**（纯几何图结构）来替代 V7 过程式的 `_cabinet_path_trace()` 算法。V8.2 在 LayoutStage 中引入了基于 **CandidatePool** + **DBSCAN** 的设备检测管线。V9 在此基础上新增三层能力：**Structure Analyzers**（结构分析器，替代内联评分函数）、**TableParser**（表格解析器，注入设备业务元数据）和 **SpatialGraph**（空间关系图，捕获节点间的几何关系）。
 
 ## 2. 文档分类
 
@@ -884,38 +884,6 @@ graph.query_near((cx, cy), radius) → list[SpatialNode]  # 邻近节点
 graph.neighbors(node_id) → list[(target_id, edge)]   # 邻接点
 graph.relations_of(node_id, relation) → list[(target_id, edge)]  # 指定关系
 ```
-
-### 7.8 V9 Region Layer — 功能区域层
-
-在 CABINET 与 GROUP/PANEL_AREA 之间引入 **REGION** 节点层，表示柜内的功能区域（如仪表区、端子排区、设备区）。REGION 是语义概念，介于物理柜体（CABINET）与空间模式（GROUP）之间。
-
-#### 7.8.1 检测策略
-
-**策略 1 — 文本关键词**：查找柜体内的区域关键词文本（仪表区、端子排区、继电器区、控制区、电源区、通讯区、设备区、预留区、区域）。每个关键词创建一个 REGION 节点，区域范围从文本位置向下延伸至柜体高度的 60%。
-
-**策略 2 — 分组聚合**：当机柜内有 ≥3 个 GROUP 节点且无文本区域时，通过 GROUP 间的间距间隙（阈值 40u）进行分割。间隙 ≤40u 的连续 GROUP 合并为同一区域。
-
-```
-CABINET "1号继电器柜"
-  ├── REGION "仪表区" (text-detected)
-  │   ├── GROUP [VERTICAL_COLUMN] "METER_GRID"
-  │   │   ├── DEVICE "M1"
-  │   │   ├── DEVICE "M2"
-  │   │   └── DEVICE "M3"
-  │   └── DEVICE "DTZ178" (standalone)
-  ├── REGION "端子排区" (text-detected)
-  │   └── GROUP [VERTICAL_COLUMN] "TERMINAL_COLUMN"
-  │       ├── DEVICE "1D"
-  │       └── DEVICE "2D"
-  └── REGION (aggregated, 3 groups)
-      ├── GROUP "G1"
-      ├── GROUP "G2"
-      └── GROUP "G3"
-```
-
-#### 7.8.2 集成
-
-在 `build_layout_tree` 的逐柜循环中，`_apply_grouping_v2` 之后、`_annotate_groups` 之前调用 `detect_regions(cab, doc)`。REGION 节点自动纳入 LayoutTree 序列化（`_node_to_dict` 通用处理）。
 
 ## 8. 柜体语义层
 

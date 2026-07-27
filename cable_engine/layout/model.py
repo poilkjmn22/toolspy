@@ -16,7 +16,6 @@ from ..ir.entities import BBox
 class LayoutNodeType(Enum):
     SHEET = 'SHEET'
     CABINET = 'CABINET'
-    REGION = 'REGION'
     PANEL_AREA = 'PANEL_AREA'
     DEVICE = 'DEVICE'
     GROUP = 'GROUP'
