@@ -165,6 +165,35 @@ def test_region_merged_bbox():
     print('  ✓ test_region_merged_bbox')
 
 
+def test_region_does_not_extract_area_children():
+    """Children inside PANEL_AREAs stay intact — the AREA itself may be moved."""
+    doc = _make_doc()
+    _text_in_doc(doc, '仪表区', 100, -60)
+
+    cab = _cabinet('Cab', 0, -200, 200, 200, 'cab')
+    area = LayoutNode(
+        id='area_0', node_type=LayoutNodeType.PANEL_AREA,
+        bbox=BBox(0, -150, 200, 100), name='',
+    )
+    cab.add_child(area)
+    g1 = _group('G1', 10, -100, 40, 30, area, 'g1')
+    _device('2D', 15, -95, 10, 8, g1, 'd2d')
+    _device('4D', 15, -115, 10, 8, g1, 'd4d')
+
+    regions = detect_regions(cab, doc)
+    assert len(regions) >= 1
+
+    region = regions[0]
+    area_parent = area.parent
+    assert area_parent is not None
+    assert area_parent.node_type in (LayoutNodeType.CABINET, LayoutNodeType.REGION)
+
+    # Children inside area must still be under area
+    area_child_ids = {c.id for c in area.children}
+    assert 'g1' in area_child_ids, 'group extracted from area!'
+    print('  ✓ test_region_does_not_extract_area_children')
+
+
 def test_region_in_build_layout_tree_integration():
     """Region detection runs inside build_layout_tree without error."""
     from ..detector import build_layout_tree

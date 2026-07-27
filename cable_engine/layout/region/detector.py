@@ -190,39 +190,37 @@ def _detect_by_aggregation(cab: LayoutNode) -> list[LayoutNode]:
 
 def _assign_children_to_regions(cab: LayoutNode,
                                  regions: list[LayoutNode]) -> None:
-    """Move cab children that overlap a region under that region node.
+    """Move cab children that sit inside a region under that region node.
 
-    Assigned children are removed from *cab* and re-parented under the
-    corresponding REGION.  PANEL_AREA nodes are never moved — only their
-    GROUP/DEVICE children may be assigned to a region.
+    Rules:
+      - GROUP / DEVICE nodes that are direct cab children and sit inside
+        a region → moved into the region.
+      - PANEL_AREA nodes whose entire bbox sits inside a region → the
+        whole AREA (with its existing children intact) is moved.
+      - Children INSIDE a PANEL_AREA are never extracted — the AREA
+        itself may be moved as a whole.
     """
     if not regions:
         return
 
     assigned: set[str] = set()
 
-    # Pass 1: assign GROUP / DEVICE children that sit inside a region
     for region in regions:
         for child in list(cab.children):
             if child.id in assigned:
                 continue
-            if child.node_type in (LayoutNodeType.REGION, LayoutNodeType.PANEL_AREA):
+            if child.node_type == LayoutNodeType.REGION:
                 continue
-            if _bbox_inside(child.bbox, region.bbox):
-                region.add_child(child)
-                assigned.add(child.id)
 
-    # Pass 2: assign GROUP / DEVICE inside PANEL_AREAs
-    for area in list(cab.children):
-        if area.node_type != LayoutNodeType.PANEL_AREA:
-            continue
-        for region in regions:
-            for child in list(area.children):
-                if child.id in assigned or child.node_type == LayoutNodeType.REGION:
-                    continue
+            if child.node_type == LayoutNodeType.PANEL_AREA:
+                # Move the whole AREA (with children intact)
                 if _bbox_inside(child.bbox, region.bbox):
                     region.add_child(child)
-                    area.children = [c for c in area.children if c.id != child.id]
+                    assigned.add(child.id)
+            else:
+                # Move standalone GROUP / DEVICE
+                if _bbox_inside(child.bbox, region.bbox):
+                    region.add_child(child)
                     assigned.add(child.id)
 
     # Remove assigned children from cab
