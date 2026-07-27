@@ -10,7 +10,7 @@ DWG file → DWGLoader (dwgread -O JSON) → Document IR → TopologyStage → c
                                                              LayoutStage → panel_layout (SQLite)
 ```
 
-A single `TopologyStage` orchestrates classification, cabinet analysis, and analyzer dispatch. V8 introduces a **GeometryGraph** — a pure graph layer — to replace the V7 procedural `_cabinet_path_trace()` algorithm. V8.2 introduces a **CandidatePool + DBSCAN** device detection pipeline in LayoutStage. V9 adds three layers on top: **Structure Analyzers** (replacing inline score functions), **TableParser** (injecting device business metadata), and **SpatialGraph** (spatial relations between layout nodes).
+A single `TopologyStage` orchestrates classification, cabinet analysis, and analyzer dispatch. V8 introduces a **GeometryGraph** — a pure graph layer — to replace the V7 procedural `_cabinet_path_trace()` algorithm. V8.2 introduces a **CandidatePool + DBSCAN** device detection pipeline in LayoutStage. V9 adds four layers on top: **Structure Analyzers** (replacing inline score functions), **TableParser** (injecting device business metadata), **SpatialGraph** (spatial relations between layout nodes), and **SemanticScore** (multi-evidence fusion for group semantic types).
 
 ## 2. Document Classification
 
@@ -536,8 +536,13 @@ Step 5 — Per-cabinet interior + device pipeline
                 Position labels (left/right) for groups
     
 Step 6 — Semantic annotation (_annotate_groups)
-    GroupSemanticResolver assigns semantic types
-    (TERMINAL_COLUMN / METER_GRID / DEVICE_PANEL etc.)
+    SemanticScoreEngine fuses 5 evidence sources:
+      LayoutShapeEvidence  ← group_type enum
+      NamePatternEvidence  ← device name prefixes
+      DeviceAttrEvidence   ← child node data['attributes']
+      TableInfoEvidence    ← table_info metadata (P1)
+      SpatialEvidence      ← SpatialGraph (stub)
+    → GroupSemantic {type, confidence, evidence}
     │
     ▼
     LayoutTree { roots: [...] }
@@ -734,6 +739,54 @@ graph.neighbors(node_id) → list[(target_id, edge)]   # Adjacency
 graph.relations_of(node_id, relation) → list[(target_id, edge)]  # Filtered
 ```
 
+### 7.8 P4 SemanticScore — Multi-Evidence Fusion Engine
+
+The `semantics/` package provides a **pluggable evidence fusion engine** that replaces the prefix-only `GroupSemanticResolver` with a configurable multi-source scorer.
+
+#### 7.8.1 Architecture
+
+```
+SemanticScoreEngine.fuse(group_node)
+  ├─ LayoutShapeEvidence   — LayoutGroupType (0.20/0.10/0.20)
+  ├─ NamePatternEvidence   — Device name prefix match (weight × ratio)
+  ├─ DeviceAttrEvidence    — Child data['attributes']['category'] (≥50% ratio)
+  ├─ TableInfoEvidence     — table_info description keywords + model prefix
+  └─ SpatialEvidence       — SpatialGraph (stub, ready for future extension)
+      │
+      ▼  weighted sum → pick max
+   GroupSemantic {type, confidence, evidence_trail}
+```
+
+Each `EvidenceSource` returns `{semantic_type: score_contribution}`. The engine fuses by weighted sum, selects the best type, and records an evidence trail with all source contributions for debugging.
+
+#### 7.8.2 Evidence Sources
+
+| Source | Signal | Contribution |
+|--------|--------|-------------|
+| `LayoutShapeEvidence` | VERTICAL_COLUMN → TERMINAL_COLUMN 0.20; GRID → METER_GRID 0.20; HORIZONTAL_ROW → DEVICE_PANEL 0.10 | Fixed additive |
+| `NamePatternEvidence` | Device name prefix match (e.g. `2D`/`4D`/`6D` → TERMINAL_COLUMN 0.40) | `weight × (matched/total)` |
+| `DeviceAttrEvidence` | Child node `data['attributes']['category']` when ≥50% share a category | 0.20 per matching category |
+| `TableInfoEvidence` | table_info description keywords (电能表/继电器/端子) + model prefix (DTZ/DK) | 0.25 description + 0.15 model |
+| `SpatialEvidence` | SpatialGraph adjacency (not yet wired — returns `{}`) | — |
+
+#### 7.8.3 Integration
+
+`GroupSemanticResolver` is now a thin wrapper around `SemanticScoreEngine`. The `annotate_groups(tree)` function still works unchanged — backward compatible. Custom sources can be injected:
+
+```python
+from cable_engine.layout.semantics import SemanticScoreEngine, NamePatternEvidence
+
+engine = SemanticScoreEngine(sources=[NamePatternEvidence()])
+engine.fuse_tree(group_node)
+```
+
+#### 7.8.4 Key Files
+
+- `semantics/evidence.py` — `EvidenceSource` base class + 5 concrete implementations
+- `semantics/fusion.py` — `SemanticScoreEngine` + `GroupSemantic` dataclass
+- `semantics/group_type.py` — `GroupSemanticResolver` (now a thin wrapper)
+- `semantics/test_semantic_score.py` — 28 tests for evidence sources + fusion
+
 ## 8. Cabinet Semantic Layer
 
 ### Pipeline
@@ -840,10 +893,13 @@ cable_engine/
 │   │   ├── __init__.py
 │   │   ├── model.py             # SpatialNode / SpatialEdge / SpatialGraph
 │   │   └── bridge.py            # lift(tree) → SpatialGraph
-│   └── semantics/               # V8.2 semantic annotation
-│       ├── __init__.py
-│       ├── group_type.py        # GroupSemanticResolver
-│       └── device_type.py       # Device type classification (reserved)
+│   └── semantics/               # V9 semantic annotation (P4)
+│       ├── __init__.py          # Public exports
+│       ├── group_type.py        # GroupSemanticResolver (thin wrapper)
+│       ├── device_type.py       # Device type classification
+│       ├── evidence.py          # EvidenceSource base + 5 concrete sources
+│       ├── fusion.py            # SemanticScoreEngine fusion engine
+│       └── test_semantic_score.py  # 28 tests
 ├── loaders/
 │   ├── dwg_loader.py            # dwgread -O JSON + ezdxf fallback
 │   └── pdf_loader.py            # pypdfium2 (deferred)
@@ -889,6 +945,10 @@ tools/cable_match_viewer/
 | **V9: TableParser injects business metadata** | Equipment table rows matched by name column → DeviceCandidate.features['table_info']. Runs after associate_devices, before DBSCAN so semantic resolvers can leverage model/description info. |
 | **V9: SpatialGraph independent from GeometryGraph** | GeometryGraph (electrical/) operates on raw geometry entities (lines, circles, TAGs). SpatialGraph operates on layout nodes (CABINET/GROUP/DEVICE). The two graphs are strictly separate. |
 | **V9: Table detection parametric** | Min table size 60w×80h, min 4 texts, search 200u right of cabinet. Header detected by Chinese keyword regex, column roles by keyword classification. |
+| **P4: EvidenceSource pluggable interface** | Each evidence source implements `score(node) → {type: contrib}`. New sources can be registered without modifying the engine. |
+| **P4: Fusion by weighted sum, not max-vote** | Weighted sum allows every signal to contribute proportionally. The evidence trail records ALL sources (including inactive ones marked `—`) for debuggability. |
+| **P4: TableInfoEvidence consumes P1 output** | The first cross-stage evidence source: uses `table_info` injected by P1 TableParser's `match_to_devices`. Description keyword match + model prefix match provide 0.25 + 0.15 contributions. |
+| **P4: SpatialEvidence stub ready for P2 hookup** | The SpatialGraph-based evidence source exists but returns `{}` until wired with an actual SpatialGraph instance. No tree changes needed when enabling it. |
 
 ## 12. Known Limitations
 
@@ -910,7 +970,7 @@ tools/cable_match_viewer/
 - **No cross-validation**: Layout tree produced independently per drawing.
 - **GRID post-class requires full fill**: GridAnalyzer requires device count to exactly equal `cols × rows`. Partial grids (e.g. 2×3 with 5 devices) are missed.
 - **FREEFORM has no pattern scoring**: DBSCAN noise points become standalone DEVICE nodes; remaining ungrouped devices are not clustered.
-- **Semantic classification prefix-only**: `GroupSemanticResolver` matches device name prefixes (`2D`, `DTZ`, `DK` etc.). No suffix or regex support.
+- **P4 SemanticScore still prefix-based for names**: `NamePatternEvidence` inherits the same prefix pattern approach as the old `GroupSemanticResolver`. No suffix or regex matching.
 - **detectors/device.py legacy**: Old `detect_devices`, `_detect_open_rect_devices`, `_merge_devices` remain in `detectors/device.py` but are no longer called. Pending cleanup.
 - **Table detection requires rect border**: `detect_table_regions` depends on `detect_rectangles` to find closed-rect table borders. Tables without rectangular boundaries (e.g. text-only "invisible tables") are not detected.
 - **SpatialGraph layout-node-only**: SpatialGraph currently derives relations only from LayoutTree nodes, not raw geometry entities (lines, circles). Fine-grained geometric queries requiring GeometryGraph are not supported.

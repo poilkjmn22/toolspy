@@ -56,6 +56,10 @@ Key change from V5/V6: V7.0 replaces all V6 fallback methods (icon y-bucket, geo
   - `layout/spatial/` — V9 SpatialGraph (spatial relations between layout nodes)
     - `model.py` — `SpatialNode`/`SpatialEdge`/`SpatialGraph` + `SpatialRelation` enum
     - `bridge.py` — `lift(tree)` builds SpatialGraph from LayoutTree
+  - `layout/semantics/` — V9 Semantic annotation (P4)
+    - `evidence.py` — `EvidenceSource` base + 5 concrete sources
+    - `fusion.py` — `SemanticScoreEngine` fusion engine
+    - `group_type.py` — `GroupSemanticResolver` (thin wrapper)
 - `tools/cable_match_viewer/` — V5 minimal viewer
   - `server.py` — aiohttp app (one file, ~250 lines including HTML)
   - `store.py` — read-only CableViewer facade (does on-demand graph traversal)

@@ -38,6 +38,15 @@ from .candidate import DeviceCandidate, SymbolCandidate, CandidatePool
 from .clustering import DBSCANClusterer, DeviceGroup
 from .associator import TextAssociator
 from .structure import ColumnAnalyzer, RowAnalyzer, GridAnalyzer
+from .semantics import (
+    SemanticScoreEngine,
+    GroupSemanticResolver,
+    EvidenceSource,
+    LayoutShapeEvidence,
+    NamePatternEvidence,
+    DeviceAttrEvidence,
+    TableInfoEvidence,
+)
 
 __all__ = [
     'LayoutNode', 'LayoutNodeType', 'LayoutTree',
@@ -45,4 +54,8 @@ __all__ = [
     'build_layout_tree', 'LayoutStage',
     'PhysicalCabinet', 'cabinets_from_tree',
     'ColumnAnalyzer', 'RowAnalyzer', 'GridAnalyzer',
+    'SemanticScoreEngine', 'GroupSemanticResolver',
+    'EvidenceSource',
+    'LayoutShapeEvidence', 'NamePatternEvidence',
+    'DeviceAttrEvidence', 'TableInfoEvidence',
 ]

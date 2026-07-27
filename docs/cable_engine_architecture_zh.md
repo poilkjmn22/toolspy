@@ -10,7 +10,7 @@ DWG 文件 → DWGLoader (dwgread -O JSON) → Document IR → TopologyStage →
                                                    LayoutStage → panel_layout (SQLite)
 ```
 
-单一 `TopologyStage` 负责文档分类、柜体分析和分析器分发。V8 引入了 **GeometryGraph**（纯几何图结构）来替代 V7 过程式的 `_cabinet_path_trace()` 算法。V8.2 在 LayoutStage 中引入了基于 **CandidatePool** + **DBSCAN** 的设备检测管线。V9 在此基础上新增三层能力：**Structure Analyzers**（结构分析器，替代内联评分函数）、**TableParser**（表格解析器，注入设备业务元数据）和 **SpatialGraph**（空间关系图，捕获节点间的几何关系）。
+单一 `TopologyStage` 负责文档分类、柜体分析和分析器分发。V8 引入了 **GeometryGraph**（纯几何图结构）来替代 V7 过程式的 `_cabinet_path_trace()` 算法。V8.2 在 LayoutStage 中引入了基于 **CandidatePool** + **DBSCAN** 的设备检测管线。V9 在此基础上新增四层能力：**Structure Analyzers**（结构分析器，替代内联评分函数）、**TableParser**（表格解析器，注入设备业务元数据）、**SpatialGraph**（空间关系图，捕获节点间的几何关系）和 **SemanticScore**（多证据融合引擎，替代前缀匹配）。
 
 ## 2. 文档分类
 
@@ -539,8 +539,13 @@ Document IR 实体
                分组标签（区域内的位置描述）
     
 第6步 — 语义标注 (_annotate_groups)
-    GroupSemanticResolver 为 GROUP 节点分配语义类型
-    (TERMINAL_COLUMN / METER_GRID / DEVICE_PANEL 等)
+    SemanticScoreEngine 融合 5 个证据源:
+      LayoutShapeEvidence  ← group_type 枚举
+      NamePatternEvidence  ← 设备名称前缀匹配
+      DeviceAttrEvidence   ← 子节点 data['attributes']
+      TableInfoEvidence    ← table_info 元数据 (P1)
+      SpatialEvidence      ← SpatialGraph (暂桩)
+    → GroupSemantic {type, confidence, evidence}
     │
     ▼
     LayoutTree { roots: [...] }
@@ -885,6 +890,54 @@ graph.neighbors(node_id) → list[(target_id, edge)]   # 邻接点
 graph.relations_of(node_id, relation) → list[(target_id, edge)]  # 指定关系
 ```
 
+### 7.8 P4 SemanticScore — 多证据融合引擎
+
+`semantics/` 包提供**可插拔的证据融合引擎**，替代仅依赖前缀匹配的 `GroupSemanticResolver`，采用可配置的多源评分器。
+
+#### 7.8.1 架构
+
+```
+SemanticScoreEngine.fuse(group_node)
+  ├─ LayoutShapeEvidence   — LayoutGroupType (0.20/0.10/0.20)
+  ├─ NamePatternEvidence   — 设备名称前缀匹配 (weight × ratio)
+  ├─ DeviceAttrEvidence    — 子节点 data['attributes']['category'] (≥50%)
+  ├─ TableInfoEvidence     — table_info 描述关键词 + 型号前缀
+  └─ SpatialEvidence       — SpatialGraph (暂桩，预留扩展)
+      │
+      ▼  加权求和 → 取最优
+   GroupSemantic {type, confidence, evidence_trail}
+```
+
+每个 `EvidenceSource` 返回 `{semantic_type: score_contribution}`。引擎通过加权求和融合，选择最优类型，并记录包含所有源贡献的证据链（含非活跃源的 `—` 标记）。
+
+#### 7.8.2 证据源
+
+| 源 | 信号 | 贡献 |
+|----|------|------|
+| `LayoutShapeEvidence` | VERTICAL_COLUMN → TERMINAL_COLUMN 0.20; GRID → METER_GRID 0.20; HORIZONTAL_ROW → DEVICE_PANEL 0.10 | 固定加值 |
+| `NamePatternEvidence` | 设备名称前缀匹配（如 `2D`/`4D`/`6D` → TERMINAL_COLUMN 0.40） | `weight × (匹配数/总数)` |
+| `DeviceAttrEvidence` | 子节点 `data['attributes']['category']` 超过 50% 共享同一类别时 | 每类别 0.20 |
+| `TableInfoEvidence` | table_info 描述关键词（电能表/继电器/端子）+ 型号前缀（DTZ/DK） | 描述 0.25 + 型号 0.15 |
+| `SpatialEvidence` | SpatialGraph 邻接（尚未接入——返回 `{}`） | — |
+
+#### 7.8.3 集成
+
+`GroupSemanticResolver` 现在是 `SemanticScoreEngine` 的薄封装。`annotate_groups(tree)` 函数依旧保持向后兼容。可注入自定义证据源：
+
+```python
+from cable_engine.layout.semantics import SemanticScoreEngine, NamePatternEvidence
+
+engine = SemanticScoreEngine(sources=[NamePatternEvidence()])
+engine.fuse_tree(group_node)
+```
+
+#### 7.8.4 关键文件
+
+- `semantics/evidence.py` — `EvidenceSource` 基类 + 5 个具体实现
+- `semantics/fusion.py` — `SemanticScoreEngine` + `GroupSemantic` 数据类
+- `semantics/group_type.py` — `GroupSemanticResolver`（现为薄封装）
+- `semantics/test_semantic_score.py` — 28 个证据源 + 融合测试
+
 ## 8. 柜体语义层
 
 ### 处理阶段
@@ -990,10 +1043,13 @@ cable_engine/
 │   │   ├── __init__.py
 │   │   ├── model.py             # SpatialNode / SpatialEdge / SpatialGraph
 │   │   └── bridge.py            # lift(tree) → SpatialGraph
-│   └── semantics/               # ← V8.2 弱语义标注层
-│       ├── __init__.py          # 初始化
-│       ├── group_type.py        # GroupSemanticResolver + 语义模式
-│       └── device_type.py       # 设备类型分类（预留）
+│   └── semantics/               # V9 弱语义标注层 (P4)
+│       ├── __init__.py          # 公开导出
+│       ├── group_type.py        # GroupSemanticResolver（薄封装）
+│       ├── device_type.py       # 设备类型分类
+│       ├── evidence.py          # EvidenceSource 基类 + 5 个具体证据源
+│       ├── fusion.py            # SemanticScoreEngine 融合引擎
+│       └── test_semantic_score.py  # 28 个测试
 ├── loaders/
 │   ├── dwg_loader.py            # dwgread -O JSON + ezdxf 回退
 │   └── pdf_loader.py            # pypdfium2（延期）
@@ -1060,7 +1116,7 @@ tools/cable_match_viewer/
 - **无交叉验证**：布局树独立按图纸生成。没有跨文档验证。
 - **GRID 后分类要求完整填充**：GridAnalyzer 要求设备数严格等于 `cols × rows`。非全填充网格（如 2×3 但只有 5 个设备）将被漏检。
 - **FREEFORM 回退无模式评分**：DBSCAN 噪声点独立标注，未分组的剩余设备不做聚类。
-- **语义分类仅匹配前缀**：`GroupSemanticResolver` 依赖设备名称前缀（`2D`、`DTZ`、`DK` 等），不支持后缀匹配或正则表达式。
+- **P4 SemanticScore 名称匹配仍为前缀模式**：`NamePatternEvidence` 继承旧版 `GroupSemanticResolver` 的前缀匹配方式，不支持后缀或正则表达式。
 - **detectors/device.py 遗留代码**：`detectors/device.py` 中的旧式 `detect_devices`、`_detect_open_rect_devices`、`_merge_devices` 不再被调用。待后续清理。
 - **表格检测仅支持矩形边界**：`detect_table_regions` 依赖 `detect_rectangles` 找到的闭合矩形。无矩形边框的表格（如仅由文本网格构成的"隐形表格"）无法检测。
 - **SpatialGraph 仅支持布局节点**：SpatialGraph 当前仅从 LayoutTree 节点推导关系，不涉及原始几何实体（线条、圆等）。需 GeometryGraph 的细粒度空间查询暂不支持。

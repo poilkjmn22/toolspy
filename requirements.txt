@@ -56,6 +56,7 @@ ijson==3.5.0
 ImageIO==2.37.3
 imagesize==2.0.0
 imgaug==0.4.0
+iniconfig==2.3.0
 itsdangerous==2.2.0
 Jinja2==3.1.6
 jiter==0.15.0
@@ -102,6 +103,7 @@ pdf2docx==0.5.13
 pdfminer.six==20251107
 pdfplumber==0.11.8
 pillow==10.4.0
+pluggy==1.6.0
 premailer==3.10.0
 prettytable==3.18.0
 propcache==0.5.2
@@ -119,6 +121,7 @@ PyMuPDF==1.27.2.3
 pyparsing==3.3.2
 pypdfium2==5.10.1
 pytesseract==0.3.13
+pytest==9.1.1
 python-bidi==0.6.10
 python-dateutil==2.9.0.post0
 python-docx==1.2.0
