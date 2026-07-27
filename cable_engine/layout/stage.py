@@ -2,7 +2,7 @@
 
 Adds spatial-containment analysis (LayoutTree) to the processing
 pipeline. Runs AFTER TopologyStage so classification is known.
-Only processes documents classified as panel_layout.
+Processes panel_layout (屏面布置图) and panel_position (屏位布置图).
 
 Usage:
     from cable_engine.layout.stage import LayoutStage
@@ -18,19 +18,18 @@ from ..pipeline import Context, Stage
 from ..classifier import BusinessType
 from .cabinet import PhysicalCabinet, cabinets_from_tree
 from .detector import build_layout_tree
+from .position import build_position_tree
 
 if TYPE_CHECKING:
     from ..storage.sqlite import CableStore
 
 
 class LayoutStage(Stage):
-    """Build a LayoutTree for panel_layout documents and persist it.
+    """Build a LayoutTree and persist it.
 
-    Inputs:  ctx.document (Document IR), ctx.classification
-    Outputs: store.panel_layout (if panel_layout)
-
-    Only runs for documents classified as panel_layout (屏面布置图).
-    Other document types are skipped entirely.
+    - panel_layout (屏面布置图) → `build_layout_tree`, stored in panel_layout table.
+    - panel_position (屏位布置图) → `build_position_tree`, stored in panel_position table.
+    - Other types are skipped.
     """
 
     name = 'layout_builder'
@@ -39,10 +38,19 @@ class LayoutStage(Stage):
         self._store = store
 
     def run(self, ctx: Context) -> Context:
-        # Only process panel_layout documents
-        if ctx.classification is None or ctx.classification.primary != BusinessType.PANEL_LAYOUT:
+        if ctx.classification is None:
             return ctx
 
+        bt = ctx.classification.primary
+
+        if bt == BusinessType.PANEL_LAYOUT:
+            return self._run_panel_layout(ctx)
+        elif bt == BusinessType.PANEL_POSITION:
+            return self._run_panel_position(ctx)
+
+        return ctx
+
+    def _run_panel_layout(self, ctx: Context) -> Context:
         doc = ctx.document
         if doc is None:
             ctx.error_msg = 'no document to build layout tree from'
@@ -52,7 +60,6 @@ class LayoutStage(Stage):
             tree = build_layout_tree(doc)
             ctx.layout_tree = tree
 
-            # Build PhysicalCabinet wrappers for cross-world access
             cabinets = cabinets_from_tree(tree, doc.content_hash)
             ctx.physical_cabinets = cabinets
 
@@ -62,7 +69,27 @@ class LayoutStage(Stage):
                     doc.content_hash, tree_json,
                 )
         except Exception as exc:
-            ctx.error_msg = f'LayoutStage failed: {exc}'
+            ctx.error_msg = f'LayoutStage(PANEL_LAYOUT) failed: {exc}'
+
+        return ctx
+
+    def _run_panel_position(self, ctx: Context) -> Context:
+        doc = ctx.document
+        if doc is None:
+            ctx.error_msg = 'no document to build position tree from'
+            return ctx
+
+        try:
+            tree = build_position_tree(doc)
+            ctx.layout_tree = tree
+
+            if tree is not None and tree.roots and self._store is not None:
+                tree_json = json.dumps(_layout_tree_to_dict(tree))
+                self._store.upsert_panel_position(
+                    doc.content_hash, tree_json,
+                )
+        except Exception as exc:
+            ctx.error_msg = f'LayoutStage(PANEL_POSITION) failed: {exc}'
 
         return ctx
 
@@ -70,6 +97,7 @@ class LayoutStage(Stage):
 def _layout_tree_to_dict(tree) -> dict:
     return {
         'roots': [_node_to_dict(r) for r in tree.roots],
+        'meta': tree.meta or {},
     }
 
 

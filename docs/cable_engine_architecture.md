@@ -31,7 +31,7 @@ Seven business types:
 | `CABLE_SCHEDULE` (电缆清册) | 6 | `CableScheduleAnalyzer` |
 | `PROTECTION_DIAGRAM` (保护原理图) | 166 | None (viewer only) |
 | `PANEL_LAYOUT` (屏面布置图) | 48 | `LayoutStage` (layout tree) |
-| `PANEL_POSITION` (屏位布置图) | — | None (viewer only – analyzer TBD) |
+| `PANEL_POSITION` (屏位布置图) | — | `build_position_tree` (room → cells → table → crossref) |
 | `MONITORING_SYSTEM` (状态监测/通风) | 23 | None (viewer only) |
 | `UNKNOWN` (目录/封面) | 260 | None (viewer only) |
 
@@ -787,6 +787,97 @@ engine.fuse_tree(group_node)
 - `semantics/group_type.py` — `GroupSemanticResolver` (now a thin wrapper)
 - `semantics/test_semantic_score.py` — 28 tests for evidence sources + fusion
 
+### 7.9 V9 PANEL_POSITION — Panel Position Tree (屏位布置图)
+
+The `layout/position/` package extracts a **position tree** from PANEL_POSITION drawings — drawings that lay out cabinet/frame F‑number positions (屏位) in a grid and reference a usage table (屏屏用途一览表) mapping each F‑number to the cabinet model assigned there.
+
+#### 7.9.1 Pipeline
+
+```
+build_position_tree(doc)
+  │
+  ├─ 1. detect_room(doc)
+  │      Long horizontals (spanning ≥60% of F‑text X‑range) define room boundary.
+  │      Supports paired segments (left + right with gap) via union X‑range per Y.
+  │      F‑number texts hint the approximate X‑range; multiple clusters → pick largest.
+  │      → Room (bounding box)
+  │
+  ├─ 2. detect_cells(room)
+  │      Find F‑number texts (pattern: r'^\d+[CF]$') inside room bbox.
+  │      Cluster into rows by Y (_ROW_TOL=8.0).
+  │      Sort each row by X, assign label.
+  │      Detect column groups (gap ≥ 1.5× median → new group).
+  │      → list[PositionRow] with row_index, col_index, group_index per cell
+  │
+  ├─ 3. detect_table_regions (reuses layout/table/detector.py)
+  │      Find rects ≥60w×80h with ≥4 texts. Bbox widened (ex‑200, w=350, h=450).
+  │      Filter by header texts containing 屏屏/用途/一览/编号/名称/数量/备注.
+  │
+  ├─ 4. parse_usage_table(doc, table_bbox)
+  │      Label‑centered anchoring: search Y‑neighbourhood around each F‑number label
+  │      for sibling cells. Index‑based role mapping — within each column half, sort
+  │      cells by X → map relative index to header role at same position.
+  │      → TableArea with 屏号/名称/数量/备注 columns
+  │
+  └─ 5. cross_reference(cells, table_rows)
+        Match cells by F‑number text → inject equipment from table row.
+        → LayoutTree(ROOM → POSITION_ROW → POSITION_CELL)
+```
+
+#### 7.9.2 Data Model
+
+```
+PositionCell
+├── label: str                       — Screen number (e.g. "1F", "12C")
+├── bbox: BBox                       — Cell boundary
+├── row_index: int
+├── col_index: int                   — Resets per group
+├── group_index: int                 — Column group within row
+└── equipment: Optional[str]         — From usage table crossref
+
+PositionRow
+├── cells: list[PositionCell]
+├── y: float
+└── row_index: int
+```
+
+#### 7.9.3 Table Parsing Strategy
+
+Two‑column layout (D0201‑05 style):
+```
+[屏号 | 名称 | 数量 | 备注] [屏号 | 名称 | 数量 | 备注]
+```
+Headers detected by keyword; column halves identified by X‑gap. Row cells sorted by X, left half gets index 0‑3, right half 4‑7. Roles assigned by matching relative index in each half.
+
+Single‑column layout (D0201‑07 when left headers inside bbox):
+```
+[屏号 | 名称 | 数量 | 备注 | 屏号 | 名称 | 数量 | 备注]
+```
+Two‑column split detected via natural text gap between column 4 and 5.
+
+#### 7.9.4 Viewer Integration
+
+Served via `/api/document/{hash}/position` in `cable_match_viewer`. Client‑side `renderPositionTree()` renders a grouped tree view:
+
+```
+ROOM (blue label)
+├─ POSITION_ROW
+│  ├─ "第 1 列组" header (gray)
+│  │  ├─ 1F — equipment_name (cell box, 150px, ellipsis)
+│  │  ├─ 2F — ...
+│  └─ "第 2 列组" header
+│     ├─ 12F — ...
+```
+
+Each cell box has `max‑width:150px`, `text‑overflow:ellipsis`, and a `title` attribute showing `排X列Y组Z`.
+
+#### 7.9.5 Edge Cases Handled
+
+- **Paired horizontal segments**: D0227‑03 draws grid horizontals as two segments (left + right with gap) — `detect_room` unions X‑ranges per Y level before checking the 60% span filter.
+- **Variable column layouts**: `_detect_groups()` splits cells by X gap ≥ 1.5× median gap; `col_index` resets per group. Handles both single‑column and split‑column grids.
+- **Label‑centered anchoring**: CAD text within a row may scatter vertically — anchoring on the screen‑number label and searching ±6px captures sibling cells that Y‑bucketing would lose.
+- **Non‑usage tables**: D0227‑03's right‑side table is 设备材料表 (equipment/material list, columns 名称/单位/数量/备注, no 屏号 column) — `cross_reference` returns 0 rows but position cells remain available.
+
 ## 8. Cabinet Semantic Layer
 
 ### Pipeline
@@ -966,7 +1057,7 @@ tools/cable_match_viewer/
 - **Back-face device naming**: Spine devices require text strictly inside bbox. Floating-point edge cases may still discard valid devices (fixed for common cases via `_texts_in_bbox`).
 - **DBSCAN label text interference**: Group labels (e.g. "左侧" w=20u) in same cluster as spine devices (w=6u) → consistency check fails → FREEFORM fallback. Mitigated by `_classify_group` sorted cy descending.
 - **No sensor vs terminal discrimination**: `detect_closed_rects` finds all closed rectangles but does not distinguish sensors (temp/humidity) from terminal devices. Device-level semantic classification needed.
-- **PANEL_POSITION analyzer missing**: Panel position drawings classified but no spatial analyzer yet.
+- **PANEL_POSITION missing drawings**: Some drawings (e.g. D0227-03) use a different table format (设备材料表 without 屏号 column) — the table parser skips them but grid cell data is still available.
 - **No cross-validation**: Layout tree produced independently per drawing.
 - **GRID post-class requires full fill**: GridAnalyzer requires device count to exactly equal `cols × rows`. Partial grids (e.g. 2×3 with 5 devices) are missed.
 - **FREEFORM has no pattern scoring**: DBSCAN noise points become standalone DEVICE nodes; remaining ungrouped devices are not clustered.

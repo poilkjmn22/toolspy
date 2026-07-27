@@ -31,7 +31,7 @@ DWG 文件 → DWGLoader (dwgread -O JSON) → Document IR → TopologyStage →
 | `CABLE_SCHEDULE`（电缆清册） | 6 | `CableScheduleAnalyzer` |
 | `PROTECTION_DIAGRAM`（保护原理图） | 166 | 无（仅查看器） |
 | `PANEL_LAYOUT`（屏面布置图） | 48 | `LayoutStage`（布局树） |
-| `PANEL_POSITION`（屏位布置图） | — | 无（仅查看器 – 分析器待开发） |
+| `PANEL_POSITION`（屏位布置图） | — | `build_position_tree`（房间→屏位格→表格→交叉引用） |
 | `MONITORING_SYSTEM`（状态监测/通风） | 23 | 无（仅查看器） |
 | `UNKNOWN`（目录/封面） | 260 | 无（仅查看器） |
 
@@ -938,6 +938,97 @@ engine.fuse_tree(group_node)
 - `semantics/group_type.py` — `GroupSemanticResolver`（现为薄封装）
 - `semantics/test_semantic_score.py` — 28 个证据源 + 融合测试
 
+### 7.9 V9 PANEL_POSITION — 屏位布置图
+
+`layout/position/` 包从 PANEL_POSITION 图纸中提取**屏位树**——这类图纸以网格形式布置机柜/框架的 F 编号屏位，并引用一个屏屏用途一览表将 F 编号映射到该位置分配的柜体型号。
+
+#### 7.9.1 处理流程
+
+```
+build_position_tree(doc)
+  │
+  ├─ 1. detect_room(doc)
+  │      长水平线（跨度 ≥ F 文本 X 跨度的 60%）定义房间边界。
+  │      支持成对线段（左侧 + 右侧有间隔）——按 Y 级别计算联合 X 跨度。
+  │      F 编号文本提示近似 X 跨度；多个簇时选择最大/最密组。
+  │      → Room（包围框）
+  │
+  ├─ 2. detect_cells(room)
+  │      查找房间包围框内的 F 编号文本（模式：r'^\d+[CF]$'）。
+  │      按 Y 聚类为行（_ROW_TOL=8.0）。
+  │      每行按 X 排序，分配 label。
+  │      检测列组（间隔 ≥ 1.5× 中位数间隔 → 新组）。
+  │      → list[PositionRow]（每格带 row_index, col_index, group_index）
+  │
+  ├─ 3. detect_table_regions（复用 layout/table/detector.py）
+  │      查找 ≥60w×80h 且含 ≥4 个文本的矩形。包围框加宽（ex‑200, w=350, h=450）。
+  │      通过含 屏屏/用途/一览/编号/名称/数量/备注 的表头文本过滤。
+  │
+  ├─ 4. parse_usage_table(doc, table_bbox)
+  │      标签居中锚定法：在每个 F 编号标签周围搜索 Y 邻域内的兄弟单元格。
+  │      基于索引的角色映射——在每半列组内按 X 排序单元格，
+  │      将相对索引映射到相同位置的表头角色。
+  │      → TableArea（含 屏号/名称/数量/备注 列）
+  │
+  └─ 5. cross_reference(cells, table_rows)
+        通过 F 编号文本匹配单元格 → 注入表格行的设备信息。
+        → LayoutTree(ROOM → POSITION_ROW → POSITION_CELL)
+```
+
+#### 7.9.2 数据模型
+
+```
+PositionCell
+├── label: str                       — 屏号（如 "1F", "12C"）
+├── bbox: BBox                       — 单元格包围框
+├── row_index: int
+├── col_index: int                   — 每列组重新计数
+├── group_index: int                 — 行内的列组编号
+└── equipment: Optional[str]         — 从屏屏用途一览表交叉引用获得
+
+PositionRow
+├── cells: list[PositionCell]
+├── y: float
+└── row_index: int
+```
+
+#### 7.9.3 表格解析策略
+
+两列布局（D0201‑05 风格）：
+```
+[屏号 | 名称 | 数量 | 备注] [屏号 | 名称 | 数量 | 备注]
+```
+表头通过关键词检测；列半组通过 X 间隔识别。行单元格按 X 排序，左半组索引 0‑3，右半组索引 4‑7。角色通过各半组内的相对索引位置匹配。
+
+单列布局（左表头在包围框内的 D0201‑07）：
+```
+[屏号 | 名称 | 数量 | 备注 | 屏号 | 名称 | 数量 | 备注]
+```
+通过第 4、5 列之间的自然文本间隔检测两列拆分。
+
+#### 7.9.4 查看器集成
+
+通过 `cable_match_viewer` 中的 `/api/document/{hash}/position` 提供。客户端 `renderPositionTree()` 渲染分组树视图：
+
+```
+ROOM（蓝色标签）
+├─ POSITION_ROW
+│  ├─ "第 1 列组" 标题（灰色）
+│  │  ├─ 1F — equipment_name（单元格盒子，150px，省略号）
+│  │  ├─ 2F — ...
+│  └─ "第 2 列组" 标题
+│     ├─ 12F — ...
+```
+
+每个格盒有 `max‑width:150px`、`text‑overflow:ellipsis` 以及显示 `排X列Y组Z` 的 `title` 属性。
+
+#### 7.9.5 边界情况处理
+
+- **成对水平线段**：D0227‑03 的网格水平线绘制为两段（左侧 + 右侧有间隔）——`detect_room` 在检查 60% 跨度过滤前按 Y 级别联合 X 跨度。
+- **可变列布局**：`_detect_groups()` 通过 X 间隔 ≥ 1.5× 中位数间隔拆分单元格；`col_index` 每列组重新计数。同时处理单列和拆分列网格。
+- **标签居中锚定**：同一行的 CAD 文本可能在 Y 方向分散——以屏号标签为中心搜索 ±6px 可捕捉 Y 分桶会丢失的兄弟单元格。
+- **非用途表格**：D0227‑03 右侧为设备材料表（列：名称/单位/数量/备注，无屏号列）——`cross_reference` 返回 0 行但屏位格数据仍可用。
+
 ## 8. 柜体语义层
 
 ### 处理阶段
@@ -1112,7 +1203,7 @@ tools/cable_match_viewer/
 - **背面设备命名**：脊柱设备依赖文本严格位于 bbox 内。如文本标签因浮点偏差略微超出 bbox，该设备将被丢弃（已通过 `_texts_in_bbox` 修复常见情况，边界情况仍可能发生）。
 - **DBSCAN 标签文本干扰**：分组标签（如"左侧"）与设备在同一簇内时，其较大宽度（~20u vs 6u）导致一致性检查失败 → FREEFORM 回退。`_classify_group` 通过 cy 降序排序缓解此问题。
 - **传感器类型区分**：`detect_closed_rects` 发现所有闭合矩形，但未区分传感器（温湿度/烟雾）与端子排设备。需设备级语义分类。
-- **PANEL_POSITION 分析器缺失**：屏位布置图已分类但尚无空间分析器。
+- **PANEL_POSITION 缺少部分图纸**：部分图纸（如 D0227-03）使用不同的表格格式（无屏号列的设备材料表），表格解析跳过但屏位格数据仍可用。
 - **无交叉验证**：布局树独立按图纸生成。没有跨文档验证。
 - **GRID 后分类要求完整填充**：GridAnalyzer 要求设备数严格等于 `cols × rows`。非全填充网格（如 2×3 但只有 5 个设备）将被漏检。
 - **FREEFORM 回退无模式评分**：DBSCAN 噪声点独立标注，未分组的剩余设备不做聚类。

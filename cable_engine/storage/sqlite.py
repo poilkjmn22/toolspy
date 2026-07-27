@@ -181,6 +181,19 @@ CREATE INDEX IF NOT EXISTS idx_cable_info_wire_type ON cable_info(wire_type);
 	    updated_at      TEXT DEFAULT (datetime('now')),
 	    FOREIGN KEY (document_hash) REFERENCES documents(content_hash)
 	);
+
+	-- ----------------------------------------------------------------------
+	-- V9: Panel position tree (屏位布置图 → 房间-屏位格子-设备)
+	-- One row per panel_position document. The tree_json stores the full
+	-- LayoutTree (ROOM → POSITION_ROW[] → POSITION_CELL[]) as a JSON
+	-- string, plus usage_table metadata in meta.
+	-- ----------------------------------------------------------------------
+	CREATE TABLE IF NOT EXISTS panel_position (
+	    document_hash   TEXT PRIMARY KEY,
+	    tree_json       TEXT NOT NULL,
+	    updated_at      TEXT DEFAULT (datetime('now')),
+	    FOREIGN KEY (document_hash) REFERENCES documents(content_hash)
+	);
 	"""
 
 
@@ -798,6 +811,34 @@ class CableStore:
     def delete_panel_layout_for_document(self, document_hash: str) -> None:
         self._conn.execute(
             'DELETE FROM panel_layout WHERE document_hash = ?',
+            (document_hash,),
+        )
+
+    # ------------------------------------------------------------------
+    # V9: Panel position tree (屏位布置图)
+    # ------------------------------------------------------------------
+    def upsert_panel_position(
+        self, document_hash: str, tree_json: str,
+    ) -> None:
+        self._conn.execute(
+            """INSERT INTO panel_position (document_hash, tree_json, updated_at)
+               VALUES (?, ?, datetime('now'))
+               ON CONFLICT(document_hash) DO UPDATE SET
+                   tree_json = excluded.tree_json,
+                   updated_at = datetime('now')""",
+            (document_hash, tree_json),
+        )
+
+    def get_panel_position(self, document_hash: str) -> Optional[str]:
+        row = self._conn.execute(
+            'SELECT tree_json FROM panel_position WHERE document_hash = ?',
+            (document_hash,),
+        ).fetchone()
+        return row['tree_json'] if row else None
+
+    def delete_panel_position_for_document(self, document_hash: str) -> None:
+        self._conn.execute(
+            'DELETE FROM panel_position WHERE document_hash = ?',
             (document_hash,),
         )
 

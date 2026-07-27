@@ -832,9 +832,10 @@ async function selectDocument(hash) {
   cableList.querySelectorAll('.file-row').forEach(el => {
     el.classList.toggle('selected', el.dataset.docHash === hash);
   });
-  const [topoR, layoutR] = await Promise.all([
+  const [topoR, layoutR, posR] = await Promise.all([
     fetch('/api/document/' + encodeURIComponent(hash) + '/topology'),
     fetch('/api/document/' + encodeURIComponent(hash) + '/layout'),
+    fetch('/api/document/' + encodeURIComponent(hash) + '/position'),
   ]);
   if (!topoR.ok) {
     detail.innerHTML = '<div class="empty-state">未找到此图纸</div>';
@@ -844,8 +845,13 @@ async function selectDocument(hash) {
   if (layoutR.ok) {
     layoutData = await layoutR.json();
   }
+  let posData = null;
+  if (posR.ok) {
+    posData = await posR.json();
+  }
   const data = await topoR.json();
   data.layout = layoutData;
+  data.position = posData;
   renderDocumentDetail(data);
 }
 
@@ -867,6 +873,78 @@ function renderLayoutTree(layout) {
       <div style="font-weight:600;color:#1565c0;">${label}</div>`;
     html += _renderNodes(cab.children || [], 1);
     html += '</div>';
+  }
+
+  html += '</div></div>';
+  return html;
+}
+
+function renderPositionTree(position) {
+  if (!position || !position.roots || !position.roots.length) return '';
+  const rooms = position.roots.filter(n => n.type === 'ROOM');
+  if (!rooms.length) return '';
+
+  let html = '<div class="section"><h3>屏位布置图</h3>';
+  html += '<div style="font-size:12px;">';
+
+  for (const room of rooms) {
+    html += `<div style="margin:4px 0;padding:6px 8px;background:#fff;border:1px solid #e0e0e0;border-radius:4px;">
+      <div style="font-weight:600;color:#1565c0;">房间</div>`;
+    const rows = room.children || [];
+    for (const row of rows) {
+      if (row.type !== 'POSITION_ROW') continue;
+      const cells = row.children || [];
+      const ri = (row.data && row.data.row_index != null) ? parseInt(row.data.row_index) + 1 : '?';
+      html += `<div style="margin:4px 0;padding:2px 4px;border-left:2px solid #4caf50;">
+        <div style="font-size:11px;color:#2e7d32;font-weight:600;">第 ${ri} 排</div>
+        <div style="display:flex;flex-wrap:wrap;gap:2px;">`;
+
+      let lastGroup = -1;
+      for (const cell of cells) {
+        if (cell.type !== 'POSITION_CELL') continue;
+        const gi = cell.data && cell.data.group_index != null ? parseInt(cell.data.group_index) : -1;
+        if (gi !== lastGroup) {
+          if (lastGroup >= 0) {
+            html += '</div></div>';
+          }
+          html += `<div style="margin:2px 0;padding:2px 4px;background:#f9fbe7;border-radius:3px;">
+            <div style="font-size:10px;color:#827717;font-weight:600;">第 ${gi + 1} 列组</div>
+            <div style="display:flex;flex-wrap:wrap;gap:2px;">`;
+          lastGroup = gi;
+        }
+
+        const equip = (cell.data && cell.data.equipment) || '';
+        const qty = (cell.data && cell.data.qty) || '';
+        const label = cell.name || '';
+        const ci = cell.data && cell.data.col_index != null ? parseInt(cell.data.col_index) + 1 : '';
+
+        const maxW = 150;
+        const inner = `<div style="font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:${maxW}px;" title="${escHtml(label)}">${escHtml(label)}</div>` +
+          (equip ? `<div style="color:#666;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:${maxW}px;" title="${escHtml(equip)}">${escHtml(equip)}${qty && qty !== '0' ? ` ×${qty}` : ''}</div>` : '');
+        html += `<div style="padding:2px 4px;border:1px solid #ccc;border-radius:3px;font-size:11px;min-width:40px;max-width:${maxW + 12}px;text-align:center;background:#fff;" title="排${ri}列${ci}组${gi + 1}">${inner}</div>`;
+      }
+      if (lastGroup >= 0) {
+        html += '</div></div>';
+      }
+      html += '</div>';
+    }
+    html += '</div>';
+  }
+
+  // Usage table
+  const meta = position.meta || {};
+  const table = meta.usage_table || null;
+  if (table && table.rows && table.rows.length) {
+    html += '<div style="margin-top:8px;"><div style="font-size:11px;font-weight:600;color:#e65100;">屏屏用途一览表</div>';
+    html += '<table style="width:100%;border-collapse:collapse;font-size:11px;margin-top:4px;">';
+    html += '<tr style="background:#f5f5f5;font-weight:600;"><th style="padding:2px 4px;border:1px solid #ddd;">屏号</th><th style="padding:2px 4px;border:1px solid #ddd;">名称</th><th style="padding:2px 4px;border:1px solid #ddd;">数量</th><th style="padding:2px 4px;border:1px solid #ddd;">备注</th></tr>';
+    for (const tr of table.rows) {
+      html += `<tr><td style="padding:2px 4px;border:1px solid #ddd;">${escHtml(tr.cell_label)}</td>
+        <td style="padding:2px 4px;border:1px solid #ddd;">${escHtml(tr.equipment)}</td>
+        <td style="padding:2px 4px;border:1px solid #ddd;">${tr.qty}</td>
+        <td style="padding:2px 4px;border:1px solid #ddd;">${escHtml(tr.remark)}</td></tr>`;
+    }
+    html += '</table></div>';
   }
 
   html += '</div></div>';
@@ -955,6 +1033,11 @@ function renderDocumentDetail(d) {
   // V8.5: panel layout tree (for 屏面布置图)
   if (d.layout) {
     html += renderLayoutTree(d.layout);
+  }
+
+  // V9: panel position tree (for 屏位布置图)
+  if (d.position) {
+    html += renderPositionTree(d.position);
   }
 
   html += `<div class="section">
@@ -1311,6 +1394,15 @@ async def document_layout_handler(request: web.Request) -> web.Response:
     return web.json_response(data)
 
 
+async def document_position_handler(request: web.Request) -> web.Response:
+    """V9: panel position tree (room → row → cell) for a document."""
+    h = request.match_info['hash']
+    data = _viewer(request).get_document_position(h)
+    if data is None:
+        return web.json_response({'error': f'no position data for {h!r}'}, status=404)
+    return web.json_response(data)
+
+
 async def healthz_handler(request: web.Request) -> web.Response:
     return web.Response(text='OK', content_type='text/plain')
 
@@ -1346,6 +1438,7 @@ def make_app(db_path: Path) -> web.Application:
     app.router.add_get('/api/document/{hash}/topology', document_topology_handler)
     app.router.add_get('/api/search-text', search_text_handler)
     app.router.add_get('/api/document/{hash}/layout', document_layout_handler)
+    app.router.add_get('/api/document/{hash}/position', document_position_handler)
     app.router.add_get('/healthz', healthz_handler)
     return app
 

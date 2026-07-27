@@ -257,6 +257,21 @@ class CableViewer:
             return None
 
     # ------------------------------------------------------------------
+    # V9: Panel position tree (屏位布置图)
+    # ------------------------------------------------------------------
+    def get_document_position(self, content_hash: str) -> Optional[dict]:
+        """Return the panel position tree for a document, if available.
+        Returns a dict with 'roots' (list of ROOM → POSITION_ROW → POSITION_CELL)."""
+        import json
+        raw = self._store.get_panel_position(content_hash)
+        if raw is None:
+            return None
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return None
+
+    # ------------------------------------------------------------------
     # Text search (V6.7+)
     # ------------------------------------------------------------------
     def search_document_text(self, query: str, limit: int = 200) -> list[dict]:

@@ -60,9 +60,15 @@ Key change from V5/V6: V7.0 replaces all V6 fallback methods (icon y-bucket, geo
     - `evidence.py` — `EvidenceSource` base + 5 concrete sources
     - `fusion.py` — `SemanticScoreEngine` fusion engine
     - `group_type.py` — `GroupSemanticResolver` (thin wrapper)
+  - `layout/position/` — V9 PANEL_POSITION parser (屏位布置图)
+    - `model.py` — `PositionCell`/`PositionRow`/`UsageTable`/`UsageTableRow`
+    - `detector.py` — `detect_room` (long-line boundary), `detect_cells` (F-number rects), `cluster_rows` (Y-grouping)
+    - `parser.py` — `parse_usage_table` (右侧屏屏用途一览表)
+    - `crossref.py` — `cross_reference` (F编号 ↔ 表格行)
+    - `builder.py` — `build_position_tree` (full pipeline → LayoutTree with ROOM→POSITION_ROW→POSITION_CELL)
 - `tools/cable_match_viewer/` — V5 minimal viewer
-  - `server.py` — aiohttp app (one file, ~250 lines including HTML)
-  - `store.py` — read-only CableViewer facade (does on-demand graph traversal)
+  - `server.py` — aiohttp app (~1368 lines including HTML + JS + handlers)
+  - `store.py` — read-only CableViewer facade (get_document_position for V9 position tree)
 - `docs/cable_engine_architecture.md` — V7.0 architecture reference
 - `docs/cable_engine_architecture_zh.md` — V7.0 architecture reference (中文)
 
@@ -129,8 +135,8 @@ After meaningful code changes, refresh the index (verify the exact subcommand wi
 - **Short bus segments** — when the horizontal bus line does not span the full distance, the far-side terminal may not be found (lies beyond x_tol).
 
 ### Next Steps
-- **Full repo scan** — run `cable_engine.cli scan` on the full Shengli repo to validate V7.0 results at scale.
-- **Improve bus detection** — handle WS columns other than x=-349.3 (the only column where `_cabinet_path_trace` currently finds bus lines in 30-unit range).
+- **Validate PANEL_POSITION on real data** — run `build_position_tree` on D0201-05.dwg, verify room/cell/table/crossref output.
+- **Improve room detection** — handle variable room structures (e.g., closed polylines instead of long lines).
 - **Handle short bus segments** — when only a short segment is detected, relax x_tol or trace the neighbor cabinet.
 - **PDF support (V5 P1)** — add `RasterizeStage` (PDF → PNG) and `OcrStage` (PNG → TextEntity via Tesseract/PaddleOCR). Reuse the V5 GraphBuilder + viewer.
 - **Knowledge merge (V5 P2)** — `knowledge_nodes` / `knowledge_sources` / `knowledge_edges` tables for cross-document "Cable B3-463 ↔ Terminal X4:3 ↔ Cabinet XX01" queries. Stubbed in the schema but not implemented.

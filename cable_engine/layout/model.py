@@ -22,6 +22,9 @@ class LayoutNodeType(Enum):
     TEXT_BLOCK = 'TEXT_BLOCK'
     TABLE = 'TABLE'
     TITLE_BLOCK = 'TITLE_BLOCK'
+    ROOM = 'ROOM'
+    POSITION_ROW = 'POSITION_ROW'
+    POSITION_CELL = 'POSITION_CELL'
 
 
 class LayoutGroupType(Enum):
@@ -64,6 +67,7 @@ class LayoutNode:
 @dataclass
 class LayoutTree:
     roots: list[LayoutNode] = field(default_factory=list)
+    meta: dict[str, Any] = field(default_factory=dict)
     _by_id: dict[str, LayoutNode] = field(default_factory=dict)
 
     def add_root(self, node: LayoutNode) -> None:
