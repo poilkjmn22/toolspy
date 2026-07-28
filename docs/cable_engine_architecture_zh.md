@@ -3,14 +3,19 @@
 ## 1. 系统概述
 
 ```
-DWG 文件 → DWGLoader (dwgread -O JSON) → Document IR → ClassificationStage → TopologyStage → cable.db (SQLite)
-                                                                                                       ↓
-                                                                                     tools/cable_match_viewer/ (aiohttp)
-                                                                                                       ↓
-                                                                                                LayoutStage → panel_layout (SQLite)
+DWG 文件 → DWGLoader → Document IR → ClassificationStage → TopologyStage → cable.db (SQLite)
+               │                                                                    ↓
+               ├─ ODAFileConverter → DXF → ezdxf  (首选)          tools/cable_match_viewer/ (aiohttp)
+               ├─ dwgread -O JSON                (回退)                            ↓
+               └─ ezdxf direct                   (末选)                   LayoutStage → panel_layout (SQLite)
 ```
 
 `ClassificationStage` 最先运行，将文档分类为业务类型。`TopologyStage` 随后根据分类结果分发到相应的分析器。`LayoutStage` 仅对 `PANEL_LAYOUT`/`PANEL_POSITION` 文档构建布局/屏位树。V8 引入了 **GeometryGraph**（纯几何图结构）来替代 V7 过程式的 `_cabinet_path_trace()` 算法。V8.2 在 LayoutStage 中引入了基于 **CandidatePool** + **DBSCAN** 的设备检测管线。V9 在此基础上新增四层能力：**Structure Analyzers**（结构分析器，替代内联评分函数）、**TableParser**（表格解析器，注入设备业务元数据）、**SpatialGraph**（空间关系图，捕获节点间的几何关系）和 **SemanticScore**（多证据融合引擎，替代前缀匹配）。
+
+**加载器优先级链**（``_load_via_oda → _load_via_dwgread → _load_via_ezdxf``）：
+- **ODAFileConverter**（首选）：通过 ODA 官方应用将 DWG 转换为 DXF，再用 ``ezdxf`` 解析。能正确转换旋转匿名块内的 ATTRIB 坐标为模型空间坐标——对许多回路图文件至关重要（dwgread 会损坏块局部坐标）。
+- **dwgread -O JSON**（回退）：ODA 不可用时使用。能正确处理中文编码（``\\M+5XXXX`` GBK 编码）并提供扩展实体数据（EED）用于端子排分析。
+- **ezdxf direct**（末选）：仅用于原生 DXF 文件，或 ODA 和 dwgread 都失败时。
 
 ## 2. 文档分类
 
@@ -769,7 +774,7 @@ DBSCAN 产生无标签簇 → 每簇委托给独立的结构分析器评分：
 
 ### 7.6 V9 TableParser — 设备表解析器
 
-另见独立的设计文档 [`docs/table_parsing_algorithm.md`](table_parsing_algorithm.md)（英文）——本节仅给出高层次摘要。
+另见独立的设计文档 [`docs/table_parsing_algorithm.md`](table_parsing_algorithm.md)（英文）及其中文版 [`docs/table_parsing_algorithm_zh.md`](table_parsing_algorithm_zh.md)——本节仅给出高层次摘要。
 
 `layout/table/` 包从 PANEL_LAYOUT 图纸右侧的**设备表（材料表）**中提取结构化行数据，并将业务元数据（型号、说明、数量）注入到匹配的 DeviceCandidate 中。
 

@@ -3,14 +3,19 @@
 ## 1. System Overview
 
 ```
-DWG file → DWGLoader (dwgread -O JSON) → Document IR → ClassificationStage → TopologyStage → cable.db (SQLite)
-                                                                                              ↓
-                                                                            tools/cable_match_viewer/ (aiohttp)
-                                                                                              ↓
-                                                                                       LayoutStage → panel_layout (SQLite)
+DWG file → DWGLoader → Document IR → ClassificationStage → TopologyStage → cable.db (SQLite)
+               │                                                                    ↓
+               ├─ ODAFileConverter → DXF → ezdxf  (primary)      tools/cable_match_viewer/ (aiohttp)
+               ├─ dwgread -O JSON                (fallback)                       ↓
+               └─ ezdxf direct                   (last resort)           LayoutStage → panel_layout (SQLite)
 ```
 
 `ClassificationStage` runs first, classifying the document into a business type. `TopologyStage` then dispatches to the appropriate analyzer based on the classification result. `LayoutStage` builds layout/position trees only for `PANEL_LAYOUT`/`PANEL_POSITION` documents. V8 introduces a **GeometryGraph** — a pure graph layer — to replace the V7 procedural `_cabinet_path_trace()` algorithm. V8.2 introduces a **CandidatePool + DBSCAN** device detection pipeline in LayoutStage. V9 adds four layers on top: **Structure Analyzers** (replacing inline score functions), **TableParser** (injecting device business metadata), **SpatialGraph** (spatial relations between layout nodes), and **SemanticScore** (multi-evidence fusion for group semantic types).
+
+**Loader priority chain** (``_load_via_oda → _load_via_dwgread → _load_via_ezdxf``):
+- **ODAFileConverter** (primary): converts DWG to DXF via ODA's app, then parses with ``ezdxf``. Correctly transforms ATTRIB coordinates inside rotated anonymous blocks — essential for many 回路图 files where ``dwgread`` corrupts block-local coordinates.
+- **dwgread -O JSON** (fallback): used when ODA is unavailable. Handles Chinese text encoding correctly (``\\M+5XXXX`` GBK codes) and provides Extended Entity Data (EED) for terminal strip analysis.
+- **ezdxf direct** (last resort): only for native DXF files or when both ODA and dwgread fail.
 
 ## 2. Document Classification
 
