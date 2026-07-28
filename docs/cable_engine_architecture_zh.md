@@ -763,6 +763,8 @@ DBSCAN 产生无标签簇 → 每簇委托给独立的结构分析器评分：
 
 ### 7.6 V9 TableParser — 设备表解析器
 
+另见独立的设计文档 [`docs/table_parsing_algorithm.md`](table_parsing_algorithm.md)（英文）——本节仅给出高层次摘要。
+
 `layout/table/` 包从 PANEL_LAYOUT 图纸右侧的**设备表（材料表）**中提取结构化行数据，并将业务元数据（型号、说明、数量）注入到匹配的 DeviceCandidate 中。
 
 #### 7.6.1 数据模型

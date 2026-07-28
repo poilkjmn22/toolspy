@@ -6,11 +6,12 @@ from uuid import uuid4
 from typing import Optional
 
 from ...ir import Document
+from ...ir.entities import BBox
 from ..model import LayoutNode, LayoutNodeType, LayoutTree
 from .crossref import cross_reference
 from .detector import cluster_rows, detect_cells, detect_room, find_f_texts
 from .model import PositionRow
-from .parser import parse_usage_table
+from .parser import parse_material_table, parse_usage_table
 
 
 def _uid() -> str:
@@ -47,6 +48,12 @@ def build_position_tree(doc: Document) -> Optional[LayoutTree]:
     if table is not None:
         cross_reference(rows, table)
 
+    material = parse_material_table(doc)
+    if material is not None:
+        b = material.get('bbox')
+        if isinstance(b, BBox):
+            material['bbox'] = [b.x, b.y, b.w, b.h]
+
     room_node = LayoutNode(id=_uid(), node_type=LayoutNodeType.ROOM, bbox=room)
 
     for row in rows:
@@ -75,6 +82,8 @@ def build_position_tree(doc: Document) -> Optional[LayoutTree]:
     tree = LayoutTree(roots=[room_node])
     if table is not None:
         tree.meta['usage_table'] = _table_to_dict(table)
+    if material is not None:
+        tree.meta['material_table'] = material
     return tree
 
 

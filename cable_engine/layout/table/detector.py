@@ -1,25 +1,34 @@
-"""Table region detection for PANEL_LAYOUT.
+"""Table region detection — unified strategies for all document types.
 
-Detects rectangular areas that are likely equipment tables based on
-text density and layout geometry.
+Strategies (tried in order of confidence):
+  A — DBSCAN grid clustering on rectangle centroids (high confidence)
+  B — Single large rectangle + text count (medium confidence)
+  C — Title text ending with "表" + offset bbox (low confidence)
+
+For callers that already have a container bbox (e.g. PANEL_LAYOUT cabinet),
+``detect_table_regions(doc, container)`` remains as a convenience wrapper.
 """
 
 from __future__ import annotations
 
-from ...ir import Document, AttributeEntity, TextEntity, BBox
+from typing import Optional
+
+from ...ir import Document, BBox
 from ..primitives.rectangle import detect_rectangles
+from .text_utils import count_texts_in
+
+
+_MIN_TABLE_W = 60.0
+_MIN_TABLE_H = 50.0
+_MIN_TEXTS = 4
 
 
 def detect_table_regions(doc: Document, container: BBox,
                          ) -> list[BBox]:
-    """Find candidate table regions inside *container*.
+    """Find candidate table regions inside *container* (convenience wrapper).
 
-    Strategy:
-      1. Look for large rectangles (the outer table border).
-      2. Accept rects that are ≥ 60u wide and ≥ 80u tall
-         (large enough for a multi-row table).
-      3. Verify that the rect contains at least 4 text entities
-         (enough for a minimal 2×2 grid).
+    Uses Strategy B (large rectangle + text count) scoped to *container*.
+    This is the legacy API for PANEL_LAYOUT equipment table detection.
     """
     candidates: list[BBox] = []
     for r in detect_rectangles(doc):
@@ -27,30 +36,12 @@ def detect_table_regions(doc: Document, container: BBox,
         if not (container.x <= bb.x <= container.x + container.w and
                 container.y <= bb.y <= container.y + container.h):
             continue
-        if bb.w < 60 or bb.h < 80:
+        if bb.w < _MIN_TABLE_W or bb.h < _MIN_TABLE_H:
             continue
-        text_count = _count_texts_in(doc, bb)
-        if text_count >= 4:
+        text_count = count_texts_in(doc, bb)
+        if text_count >= _MIN_TEXTS:
             candidates.append(bb)
     return candidates
-
-
-def _count_texts_in(doc: Document, bbox: BBox) -> int:
-    count = 0
-    for e in doc.entities:
-        if not isinstance(e, (TextEntity, AttributeEntity)):
-            continue
-        t = (e.text or '').strip()
-        if not t:
-            continue
-        cf = getattr(e, 'custom_fields', None) or {}
-        ex = cf.get('x')
-        ey = cf.get('y')
-        if ex is None or ey is None:
-            continue
-        if bbox.x <= ex <= bbox.x + bbox.w and bbox.y <= ey <= bbox.y + bbox.h:
-            count += 1
-    return count
 
 
 __all__ = ['detect_table_regions']

@@ -128,7 +128,30 @@ After meaningful code changes, refresh the index (verify the exact subcommand wi
 - `myenv/`, `myenv312/`, `__pycache__/`, `*.pyc`, `*.docx`, `cable.db*` are gitignored.
 
 
-### Known Issues
+### Quick validation
+
+Use the small test DWG set for quick validation (full-scale scans take too long):
+
+```bash
+source myenv312/bin/activate
+python -m cable_engine.cli scan \
+    --input ~/Documents/work/nengzhong/testPdf/dwgAndPdf/ \
+    --db /tmp/test_cable.db
+```
+
+Or test position tree + usage table for a single file:
+
+```python
+from cable_engine.loaders.dwg_loader import DWGLoader
+from cable_engine.layout.position.builder import build_position_tree
+from cable_engine.layout.stage import _layout_tree_to_dict
+
+doc = DWGLoader().load('~/Documents/work/nengzhong/testPdf/dwgAndPdf/10-W978-B768ⅡZ-D0201-05.dwg')
+tree = build_position_tree(doc)
+d = _layout_tree_to_dict(tree)
+```
+
+## Known Issues
 - **V5 P0 only handles DWG**, not PDF. The PDF Loader exists but the pipeline skips it. PDF support returns in V5 P1 when the IR + GraphBuilder are extended for OCR-detected text.
 - **`3T-YW` cable label not in `cables` index** — only `3T-YW-B+` / `3T-YW-B-` / `3T-YW-C+` / `3T-YW-C-` (the per-core labels) appear as TEXT entities. The bare `3T-YW` label is inside an anonymous block. V5's pattern (`[A-Za-z0-9]{2,8}-[A-Za-z0-9]{1,8}`) is correctly stricter than V4's, so this is correct behavior, not a bug.
 - **Loop index over-matches** — `M1` / `M2` / `10D` / `-OF-12` are classified as loops because they match the broad `_LOOP_TEXT_PATTERN`. Better filtering (reject `M\d+`, `-…`, etc.) is a future tightening; doesn't affect the cable↔terminal chain that the viewer renders.

@@ -620,203 +620,28 @@ class CircuitLoopAnalyzer:
 class CableScheduleAnalyzer:
     """Analyzer for cable schedules (电缆清册 / 接线表 / 电缆联系图).
 
-    These drawings are typically tabular: each row is a cable, columns
-    carry cable_id, conductor_no, terminal_from, terminal_to, etc.
-
-    Strategy (V6.7):
-      1. Group text entities by Y-coordinate (row detection).
-      2. Within each row, sort by X (column detection).
-      3. Detect header row via known Chinese keywords.
-      4. Parse data rows into topology records.
-
-    If table parsing fails (no header detected), falls back to simple
-    cable-ID extraction.
+    Delegates table parsing to :class:`table.parsers.schedule.ScheduleParser`,
+    keeping cable-ID fallback for drawings that don't have a structured table.
     """
 
-    #: Cable-ID regex for fallback
-    _CABLE_ID_LIKE = re.compile(r'\b([A-Za-z0-9]{2,8}-[A-Za-z0-9]{1,8})\b')
-
-    #: Y-tolerance for grouping into the same row (document units)
-    _ROW_TOL = 3.0
-
-    #: Known Chinese column headers in cable schedule tables.
-    #: Each entry: (keyword, target_field, is_cable_id, is_conductor)
-    _HEADERS: list[tuple[re.Pattern, str, bool, bool]] = [
-        # 电缆编号 / 编号 / 序号 -> cable_id
-        (re.compile(r'电缆编号|电缆编[号碼]|编[号號]|序号|序號|电缆(?:名称|ID|编号)'), 'cable_id', True, False),
-        # 电缆型号 / 型号 / 规格 -> cable_type (stored as circuit_desc)
-        (re.compile(r'电缆型号|型号|规格|电[缆线]型号'), 'circuit_desc', False, False),
-        # 起点 / 起点柜 / 起点端子 -> strip_name
-        (re.compile(r'起点(?:柜|端子)?|起始|始端|来源|來[源渊]|本端'), 'strip_name', False, False),
-        # 终点 / 终点柜 / 终点端子 -> terminal_no_remote
-        (re.compile(r'终点(?:柜|端子)?|終点|末端|目标|目的|对端'), 'terminal_no_remote', False, False),
-        # 芯数 / 线芯 -> conductor_no
-        (re.compile(r'芯数|线芯|线[芯心]数|芯线数|缆芯'), 'conductor_no', False, True),
-        # 回路编号 / 回路 -> loop_id
-        (re.compile(r'回路(?:编号|编[号號])?|回[路線]编号'), 'loop_id', False, False),
-        # 备注 -> circuit_desc (if not cable_type)
-        (re.compile(r'备注|注|说明|說[明文]'), 'circuit_desc', False, False),
-        # 柜体 / 柜 / 机柜 -> cabinet_name
-        (re.compile(r'柜体|机柜|安装位置|所在柜|所属柜'), 'cabinet_name', False, False),
-    ]
-
     def analyze(self, doc: Document) -> list[dict]:
-        text_entities = [
-            e for e in doc.entities
+        from ..layout.table.parsers.schedule import (
+            extract_cable_ids_fallback,
+            parse_schedule_table,
+        )
+
+        result = parse_schedule_table(doc)
+        if result is not None:
+            return result
+
+        texts = [
+            (e.text or '').strip()
+            for e in doc.entities
             if isinstance(e, (TextEntity, AttributeEntity)) and (e.text or '').strip()
         ]
-        if not text_entities:
-            return []
-
-        # Step 1: Try table-based parsing
-        records = self._parse_table(text_entities)
-        if records:
-            return records
-
-        # Step 2: Fallback — extract distinct cable IDs
-        return self._extract_cable_ids(text_entities)
-
-    def _parse_table(self, entities: list) -> list[dict]:
-        """Attempt to detect and parse a cable schedule table.
-
-        Returns records if successful, empty list otherwise.
-        """
-        # Group entities by Y coordinate
-        rows: dict[float, list] = {}
-        for e in entities:
-            x, y = self._entity_xy(e)
-            if x is None or y is None:
-                continue
-            bucket = round(y / self._ROW_TOL) * self._ROW_TOL
-            rows.setdefault(bucket, []).append((x, y, e.text.strip()))
-
-        if not rows:
-            return []
-
-        # Sort rows by Y (descending = top to bottom in CAD), sort cells by X
-        sorted_rows: list[list[tuple[float, str]]] = []
-        for y_bucket in sorted(rows.keys(), reverse=True):
-            cells = sorted(rows[y_bucket], key=lambda c: c[0])
-            sorted_rows.append([(c[0], c[2]) for c in cells])
-
-        if len(sorted_rows) < 2:
-            return []
-
-        # Detect header row — look for Chinese column keywords
-        header_idx = None
-        header_by_x: list[str] = []
-        for i, row in enumerate(sorted_rows):
-            texts = [t for _, t in row]
-            joined = ' '.join(texts)
-            # Check if any header keyword matches
-            for pat, field, _, _ in self._HEADERS:
-                if pat.search(joined):
-                    header_idx = i
-                    header_by_x = [t for _, t in row]
-                    break
-            if header_idx is not None:
-                break
-
-        if header_idx is None:
-            return []  # No table header detected
-
-        # Map column positions to topology fields
-        col_map: list[tuple[int, str, bool, bool]] = []  # (col_idx, field, is_cable_id, is_conductor)
-        for ci, header_text in enumerate(header_by_x):
-            for pat, field, is_cid, is_cond in self._HEADERS:
-                if pat.search(header_text):
-                    col_map.append((ci, field, is_cid, is_cond))
-                    break
-
-        if not col_map:
-            return []
-
-        # Find cable_id column — required
-        cid_col = next((c for c in col_map if c[2]), None)
-        if cid_col is None:
-            return []
-
-        # Parse data rows (everything after header)
-        records: list[dict] = []
-        for row in sorted_rows[header_idx + 1:]:
-            cell_texts = [t for _, t in row]
-            cid = cell_texts[cid_col[0]] if cid_col[0] < len(cell_texts) else ''
-            cid = cid.strip()
-            if not cid or not self._CABLE_ID_LIKE.fullmatch(cid):
-                continue
-
-            rec: dict = {
-                'cable_id': cid,
-                'conductor_no': None,
-                'strip_name': None,
-                'terminal_no': None,
-                'terminal_no_remote': None,
-                'cabinet_name': None,
-                'cabinet_name_remote': None,
-                'circuit_desc': None,
-                'loop_id': None,
-                'source_type': 'cable_schedule',
-            }
-
-            for col_idx, field, is_cid, is_cond in col_map:
-                if is_cid:
-                    continue  # already set
-                val = cell_texts[col_idx].strip() if col_idx < len(cell_texts) else ''
-                if not val:
-                    continue
-                if is_cond:
-                    # Try to parse as integer
-                    try:
-                        rec['conductor_no'] = int(val)
-                    except ValueError:
-                        rec['circuit_desc'] = (rec.get('circuit_desc') or '') + f' {val}'
-                elif field == 'strip_name':
-                    rec['strip_name'] = val
-                elif field == 'terminal_no_remote':
-                    rec['terminal_no_remote'] = val
-                elif field == 'cabinet_name':
-                    rec['cabinet_name'] = val
-                elif field == 'loop_id':
-                    rec['loop_id'] = val
-                elif field == 'circuit_desc':
-                    existing = rec.get('circuit_desc') or ''
-                    rec['circuit_desc'] = (existing + ' ' + val).strip()
-
-            records.append(rec)
-
-        return records
-
-    def _extract_cable_ids(self, entities: list) -> list[dict]:
-        """Fallback: extract distinct cable IDs from text."""
-        seen: set[str] = set()
-        for e in entities:
-            t = (e.text or '').strip()
-            for m in self._CABLE_ID_LIKE.finditer(t):
-                seen.add(m.group(1))
-        return [
-            {
-                'cable_id': cid,
-                'conductor_no': None,
-                'strip_name': None,
-                'terminal_no': None,
-                'terminal_no_remote': None,
-                'cabinet_name': None,
-                'cabinet_name_remote': None,
-                'circuit_desc': None,
-                'loop_id': None,
-                'source_type': 'cable_schedule',
-            }
-            for cid in sorted(seen)
-        ]
-
-    @staticmethod
-    def _entity_xy(e) -> tuple[Optional[float], Optional[float]]:
-        cf = getattr(e, 'custom_fields', None) or {}
-        x = cf.get('x') if isinstance(cf, dict) else None
-        y = cf.get('y') if isinstance(cf, dict) else None
-        if x is not None and y is not None:
-            return (float(x), float(y))
-        return (None, None)
+        return extract_cable_ids_fallback(
+            [(0.0, 0.0, t) for t in texts]
+        )
 
 
 # ===================================================================

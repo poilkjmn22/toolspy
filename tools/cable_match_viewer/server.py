@@ -861,7 +861,17 @@ function renderLayoutTree(layout) {
   if (!cabinets.length) return '';
 
   let html = '<div class="section"><h3>屏面布置图</h3>';
-  html += '<div style="font-size:12px;">';
+
+  // Equipment tables (设备表 / 材料表) — from meta.equipment_tables
+  const tables = layout.meta && layout.meta.equipment_tables;
+  const anyTable = tables && tables.length;
+
+  if (anyTable) {
+    html += '<div style="display:flex;gap:8px;flex-wrap:wrap;">';
+    html += '<div style="flex:1;min-width:280px;font-size:12px;">';
+  } else {
+    html += '<div style="font-size:12px;">';
+  }
 
   for (const cab of cabinets) {
     const cabFace = cab.data && cab.data.face;
@@ -872,6 +882,36 @@ function renderLayoutTree(layout) {
     html += `<div style="margin:4px 0;padding:6px 8px;background:#fff;border:1px solid #e0e0e0;border-radius:4px;">
       <div style="font-weight:600;color:#1565c0;">${label}</div>`;
     html += _renderNodes(cab.children || [], 1);
+    html += '</div>';
+  }
+
+  html += '</div>';
+
+  // Equipment tables on the right
+  if (anyTable) {
+    html += '<div style="flex:0 0 360px;font-size:11px;">';
+    for (const tbl of tables) {
+      const cabLabel = tbl.cabinet || '';
+      const hdr = tbl.header || [];
+      const rows = tbl.rows || [];
+      html += `<div style="margin:4px 0;padding:6px 8px;background:#fff;border:1px solid #e0e0e0;border-radius:4px;">
+        <div style="font-weight:600;color:#e65100;margin-bottom:4px;">${escHtml(cabLabel)} 设备表</div>`;
+      html += '<table style="width:100%;border-collapse:collapse;">';
+      html += '<tr style="background:#f5f5f5;font-weight:600;">';
+      for (const h of hdr) {
+        html += `<th style="padding:1px 3px;border:1px solid #ddd;white-space:nowrap;">${escHtml(h)}</th>`;
+      }
+      html += '</tr>';
+      for (const row of rows) {
+        html += '<tr>';
+        for (let ci = 0; ci < hdr.length; ci++) {
+          const val = (ci < row.length) ? row[ci] : '';
+          html += `<td style="padding:1px 3px;border:1px solid #ddd;">${escHtml(val)}</td>`;
+        }
+        html += '</tr>';
+      }
+      html += '</table></div>';
+    }
     html += '</div>';
   }
 
@@ -941,6 +981,21 @@ function renderPositionTree(position) {
     for (const tr of table.rows) {
       html += `<tr><td style="padding:2px 4px;border:1px solid #ddd;">${escHtml(tr.cell_label)}</td>
         <td style="padding:2px 4px;border:1px solid #ddd;">${escHtml(tr.equipment)}</td>
+        <td style="padding:2px 4px;border:1px solid #ddd;">${tr.qty}</td>
+        <td style="padding:2px 4px;border:1px solid #ddd;">${escHtml(tr.remark)}</td></tr>`;
+    }
+    html += '</table></div>';
+  }
+
+  const material = meta.material_table || null;
+  if (material && material.rows && material.rows.length) {
+    html += '<div style="margin-top:8px;"><div style="font-size:11px;font-weight:600;color:#e65100;">设备材料表</div>';
+    html += '<table style="width:100%;border-collapse:collapse;font-size:11px;margin-top:4px;">';
+    html += '<tr style="background:#f5f5f5;font-weight:600;"><th style="padding:2px 4px;border:1px solid #ddd;">序号</th><th style="padding:2px 4px;border:1px solid #ddd;">名称</th><th style="padding:2px 4px;border:1px solid #ddd;">单位</th><th style="padding:2px 4px;border:1px solid #ddd;">数量</th><th style="padding:2px 4px;border:1px solid #ddd;">备注</th></tr>';
+    for (const tr of material.rows) {
+      html += `<tr><td style="padding:2px 4px;border:1px solid #ddd;">${escHtml(tr.index)}</td>
+        <td style="padding:2px 4px;border:1px solid #ddd;">${escHtml(tr.name)}</td>
+        <td style="padding:2px 4px;border:1px solid #ddd;">${escHtml(tr.unit)}</td>
         <td style="padding:2px 4px;border:1px solid #ddd;">${tr.qty}</td>
         <td style="padding:2px 4px;border:1px solid #ddd;">${escHtml(tr.remark)}</td></tr>`;
     }

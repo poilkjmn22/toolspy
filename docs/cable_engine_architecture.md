@@ -612,6 +612,8 @@ renderLayoutTree(layout)  → HTML
 
 ### 7.5 V9 TableParser — Equipment Table Parser
 
+See also the dedicated design doc [`docs/table_parsing_algorithm.md`](table_parsing_algorithm.md) — this section gives a high-level summary.
+
 The `layout/table/` package extracts structured row data from **equipment tables (设备表 / 材料表)** on the right side of PANEL_LAYOUT drawings, and injects business metadata (model, description, quantity) into matching DeviceCandidates.
 
 #### 7.5.1 Data Model

@@ -14,6 +14,7 @@ Structure analyzers answer "what spatial pattern are they in".
 
 from __future__ import annotations
 
+import re
 from typing import Optional
 
 from .primitives.rectangle import DetectedRect, detect_rectangles
@@ -158,18 +159,52 @@ def _apply_grouping_v2(
 def _detect_equipment_table(
     doc: Document, cab: LayoutNode,
 ) -> Optional[TableArea]:
-    """Detect and parse an equipment table inside or near *cab*.
+    """Detect and parse an equipment table near *cab*.
 
+    Tries:
+      A — title-text-based (设备表 / 材料表 / 设备材料表)
+      B — enclosing rectangle
     Returns the first valid table found; ``None`` if none detected.
     """
     search_bbox = BBox(
-        cab.bbox.x, cab.bbox.y,
-        cab.bbox.w + 200.0, cab.bbox.h,
+        cab.bbox.x, cab.bbox.y - 100.0,
+        cab.bbox.w + 200.0, cab.bbox.h + 100.0,
     )
+
+    # Strategy A: title-text-based with generous bbox
+    from cable_engine.ir import TextEntity, AttributeEntity
+    for e in doc.entities:
+        if not isinstance(e, (TextEntity, AttributeEntity)):
+            continue
+        raw = (e.text or '').strip()
+        clean = raw.replace(' ', '')
+        if not clean or not clean.endswith('表'):
+            continue
+        # Table titles are short and descriptive; reject device names
+        # like 电能表 / 电压表 / 电流表
+        if len(clean) > 6:
+            continue
+        if any(c in clean[:-1] for c in '电压电流功'):
+            continue
+        cf = getattr(e, 'custom_fields', None) or {}
+        ex = cf.get('x')
+        ey = cf.get('y')
+        if ex is None or ey is None:
+            continue
+        if not (search_bbox.x <= ex <= search_bbox.x + search_bbox.w and
+                search_bbox.y <= ey <= search_bbox.y + search_bbox.h):
+            continue
+        title_bbox = BBox(float(ex) - 120, float(ey) - 42, 240, 52)
+        table = parse_table_at(doc, title_bbox)
+        if table is not None and table.name_column_index >= 0:
+            return table
+
+    # Strategy B: enclosing rectangle
     for tbbox in detect_table_regions(doc, search_bbox):
         table = parse_table_at(doc, tbbox)
         if table is not None and table.name_column_index >= 0:
             return table
+
     return None
 
 
@@ -240,6 +275,40 @@ def _identify_front_back_fallback(cabinets: list[LayoutNode]) -> None:
             c.name = '背面'
 
 
+def _table_area_to_dict(table: Optional[TableArea]) -> Optional[dict]:
+    """Serialize a TableArea into a JSON-compatible dict.
+
+    Returns ``None`` if the table has no data rows.
+    Output shape::
+
+        {
+            'header': ['序号', '名称', '型号', '数量', '备注'],
+            'col_map': {0: 'name', 1: 'model', 2: 'qty', 3: 'desc'},
+            'rows': [['1', '设备A', 'XX-123', '1', '描述'], ...],
+        }
+    """
+    if table is None or not table.data_rows:
+        return None
+    role_at_position: dict[int, str] = {}
+    for role, attr in [('name', 'name_column_index'),
+                       ('model', 'model_column_index'),
+                       ('desc', 'desc_column_index'),
+                       ('qty', 'qty_column_index')]:
+        ci = getattr(table, attr, -1)
+        if ci >= 0:
+            role_at_position[ci] = role
+
+    rows = []
+    for row in table.data_rows:
+        vals = [row.cell_text(ci) for ci in range(len(table.header_columns))]
+        rows.append(vals)
+    return {
+        'header': table.header_columns,
+        'col_map': role_at_position,
+        'rows': rows,
+    }
+
+
 def build_layout_tree(doc: Document) -> LayoutTree:
     tree = LayoutTree()
 
@@ -256,6 +325,18 @@ def build_layout_tree(doc: Document) -> LayoutTree:
 
         # Attempt to detect equipment table for this cabinet.
         table = _detect_equipment_table(doc, cab)
+        table_dict = _table_area_to_dict(table)
+        if table_dict is not None:
+            cab_label = cab.name or cab.data.get('face', '')
+            existing = tree.meta.get('equipment_tables', [])
+            dup = any(t['header'] == table_dict['header']
+                      and t['rows'] == table_dict['rows']
+                      for t in existing)
+            if not dup:
+                tree.meta.setdefault('equipment_tables', []).append({
+                    'cabinet': cab_label,
+                    **table_dict,
+                })
 
         if area_nodes:
             for area in area_nodes:
