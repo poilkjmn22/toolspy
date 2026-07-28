@@ -3,14 +3,14 @@
 ## 1. 系统概述
 
 ```
-DWG 文件 → DWGLoader (dwgread -O JSON) → Document IR → TopologyStage → cable.db (SQLite)
-                                                                          ↓
-                                                        tools/cable_match_viewer/ (aiohttp)
-                                                                          ↓
-                                                   LayoutStage → panel_layout (SQLite)
+DWG 文件 → DWGLoader (dwgread -O JSON) → Document IR → ClassificationStage → TopologyStage → cable.db (SQLite)
+                                                                                                       ↓
+                                                                                     tools/cable_match_viewer/ (aiohttp)
+                                                                                                       ↓
+                                                                                                LayoutStage → panel_layout (SQLite)
 ```
 
-单一 `TopologyStage` 负责文档分类、柜体分析和分析器分发。V8 引入了 **GeometryGraph**（纯几何图结构）来替代 V7 过程式的 `_cabinet_path_trace()` 算法。V8.2 在 LayoutStage 中引入了基于 **CandidatePool** + **DBSCAN** 的设备检测管线。V9 在此基础上新增四层能力：**Structure Analyzers**（结构分析器，替代内联评分函数）、**TableParser**（表格解析器，注入设备业务元数据）、**SpatialGraph**（空间关系图，捕获节点间的几何关系）和 **SemanticScore**（多证据融合引擎，替代前缀匹配）。
+`ClassificationStage` 最先运行，将文档分类为业务类型。`TopologyStage` 随后根据分类结果分发到相应的分析器。`LayoutStage` 仅对 `PANEL_LAYOUT`/`PANEL_POSITION` 文档构建布局/屏位树。V8 引入了 **GeometryGraph**（纯几何图结构）来替代 V7 过程式的 `_cabinet_path_trace()` 算法。V8.2 在 LayoutStage 中引入了基于 **CandidatePool** + **DBSCAN** 的设备检测管线。V9 在此基础上新增四层能力：**Structure Analyzers**（结构分析器，替代内联评分函数）、**TableParser**（表格解析器，注入设备业务元数据）、**SpatialGraph**（空间关系图，捕获节点间的几何关系）和 **SemanticScore**（多证据融合引擎，替代前缀匹配）。
 
 ## 2. 文档分类
 
@@ -38,8 +38,10 @@ DWG 文件 → DWGLoader (dwgread -O JSON) → Document IR → TopologyStage →
 ## 3. 管线处理流程
 
 ```
-加载器 → Document IR → TopologyStage.run()
-                          ├─ 文档分类
+加载器 → Document IR → ClassificationStage.run()
+                               │  分类 → ctx.classification
+                               ▼
+                         TopologyStage.run()
                           ├─ [仅回路图] 柜体分析
                           ├─ 分析器分发
                           │   ├─ CircuitLoopAnalyzer（回路图） ← V8 GeometryGraph
@@ -48,16 +50,20 @@ DWG 文件 → DWGLoader (dwgread -O JSON) → Document IR → TopologyStage →
                           └─ 批量 SQLite 写入
                               ↓
                          LayoutStage.run()
-                          └─ [仅屏面布置图] build_layout_tree()
-                               └─ upsert_panel_layout (SQLite)
-                               
-                           tools/cable_match_viewer/
-                            └─ GET /api/document/{hash}/layout
+                          ├─ [屏面布置图] build_layout_tree() → panel_layout (SQLite)
+                          └─ [屏位布置图] build_position_tree() → panel_position (SQLite)
+
+                            tools/cable_match_viewer/
+                             ├─ GET /api/document/{hash}/layout
+                             └─ GET /api/document/{hash}/position
 ```
+
+**ClassificationStage**（`cable_engine/classifier/stage.py`）：
+1. **分类**：通过 `CompositeClassifier` 分类文档 → `ctx.classification`。
 
 `TopologyStage.run()`（`cable_engine/graph/builder.py`）：
 
-1. **分类**：通过 `CompositeClassifier` 分类文档。
+1. **读取** `ctx.classification`（由 ClassificationStage 设置）。
 2. **删除**：删除此文档的现有拓扑 + 柜体数据。
 3. **柜体分析**（仅回路图）：
    - `CabinetRegionAnalyzer.analyze()` 检测虚线矩形边界。
@@ -403,7 +409,7 @@ TerminalStripAnalyzer.analyze(doc)
 
 ### 7.4 LayoutStage — 屏面布置图布局树 (V9)
 
-`LayoutStage`（`cable_engine/layout/stage.py`）在 **TopologyStage 之后**运行，仅对 `PANEL_LAYOUT` 分类的文档进行处理。其构建一个分层的 **LayoutTree**（空间包含树，描述屏面布置图的物理结构），以 JSON 格式持久化到 `panel_layout` 表。
+`LayoutStage`（`cable_engine/layout/stage.py`）在 **TopologyStage 之后**运行，仅处理 `ctx.classification` 为 `PANEL_LAYOUT` 或 `PANEL_POSITION` 的文档。其构建分层的 **LayoutTree**（空间包含树），以 JSON 格式持久化。
 
 ```
 LayoutStage.run(ctx)
@@ -1072,7 +1078,9 @@ cable_engine/
 │   ├── composite.py             # CompositeClassifier
 │   ├── keyword.py               # KeywordClassifier
 │   ├── geometry.py              # GeometryClassifier
-│   └── layout.py                # LayoutClassifier
+│   ├── layout.py                # LayoutClassifier
+│   ├── stage.py                 # ClassificationStage（早期管线阶段）
+│   └── base.py                  # BusinessType, Classification 数据类
 ├── electrical/                  # ← V8: GeometryGraph + 查询
 │   ├── __init__.py              # 公开 API 导出
 │   ├── geometry_graph.py        # GeometryGraph, GeoNode, GeoEdge,
@@ -1170,7 +1178,7 @@ tools/cable_match_viewer/
 | **最近标签解析** | 遍历所有候选 NO/ObjTerm.Name 标签，选择到 CIRCLE 中心欧几里得距离最短的——不是空间查找顺序（网格/插入顺序）。 |
 | **按 ID 合并近邻节点** | 低 ID 的 WIRE_VERTEX（在 Pass 3 中创建，晚于 Pass 2 的 CIRCLE/TAG）合并到相同位置的高 ID TAG 中。合并后的节点保留 TAG 类型和导线边——CIRCLE 连接步骤检查"是否有导线边"而非节点类型。 |
 | **柜体 bbox 标签过滤** | 当锚点圆圈位于柜体内时，排除该柜体 bbox 之外的标签——防止同一张图纸上相邻柜体的标签被误选。 |
-| **LayoutStage 后于 TopologyStage** | 布局树需要先有分类结果。将 LayoutStage 放在第二顺位避免了在检测管线中重复分类。 |
+| **ClassificationStage 作为独立的早期阶段** | 分类逻辑从 TopologyStage 中剥离为一个明确的早期阶段。TopologyStage 和 LayoutStage 都读取 `ctx.classification`——无需重复分类。新增依赖分类结果的下游阶段无需编写任何分类代码。 |
 | **基于面积的图幅边框排除** | 图幅边框排除使用面积比（>90%），而非基于尺寸（最大尺寸的 70%）。防止过滤掉占据图幅大部分的合理大型柜体。 |
 | **柜体高宽比过滤 (1.5-5.0)** | 柜体正面高窄（h/w≈3:1）；排除图幅边框（h/w≈0.7）和宽内框。 |
 | **基于矩形柜体优先于配对垂直线** | 当两种来源产生重叠候选时，合并优先选择基于矩形的；配对垂直线仅作为开放柜体的回退方案。 |

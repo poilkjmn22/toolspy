@@ -3,14 +3,14 @@
 ## 1. System Overview
 
 ```
-DWG file → DWGLoader (dwgread -O JSON) → Document IR → TopologyStage → cable.db (SQLite)
-                                                                    ↓
-                                                  tools/cable_match_viewer/ (aiohttp)
-                                                                    ↓
-                                                             LayoutStage → panel_layout (SQLite)
+DWG file → DWGLoader (dwgread -O JSON) → Document IR → ClassificationStage → TopologyStage → cable.db (SQLite)
+                                                                                              ↓
+                                                                            tools/cable_match_viewer/ (aiohttp)
+                                                                                              ↓
+                                                                                       LayoutStage → panel_layout (SQLite)
 ```
 
-A single `TopologyStage` orchestrates classification, cabinet analysis, and analyzer dispatch. V8 introduces a **GeometryGraph** — a pure graph layer — to replace the V7 procedural `_cabinet_path_trace()` algorithm. V8.2 introduces a **CandidatePool + DBSCAN** device detection pipeline in LayoutStage. V9 adds four layers on top: **Structure Analyzers** (replacing inline score functions), **TableParser** (injecting device business metadata), **SpatialGraph** (spatial relations between layout nodes), and **SemanticScore** (multi-evidence fusion for group semantic types).
+`ClassificationStage` runs first, classifying the document into a business type. `TopologyStage` then dispatches to the appropriate analyzer based on the classification result. `LayoutStage` builds layout/position trees only for `PANEL_LAYOUT`/`PANEL_POSITION` documents. V8 introduces a **GeometryGraph** — a pure graph layer — to replace the V7 procedural `_cabinet_path_trace()` algorithm. V8.2 introduces a **CandidatePool + DBSCAN** device detection pipeline in LayoutStage. V9 adds four layers on top: **Structure Analyzers** (replacing inline score functions), **TableParser** (injecting device business metadata), **SpatialGraph** (spatial relations between layout nodes), and **SemanticScore** (multi-evidence fusion for group semantic types).
 
 ## 2. Document Classification
 
@@ -38,26 +38,32 @@ Seven business types:
 ## 3. Pipeline
 
 ```
-Loader → Document IR → TopologyStage.run()
-                         ├─ Classification
-                         ├─ [CIRCUIT_LOOP only] Cabinet analysis
-                         ├─ Analyzer dispatch
-                         │   ├─ CircuitLoopAnalyzer (回路图)  ← V8 GeometryGraph
-                         │   ├─ TerminalStripAnalyzer (端子排图)
-                         │   └─ CableScheduleAnalyzer (电缆清册)
-                         └─ Batch SQLite write
-                             ↓
-                        LayoutStage.run()
-                         └─ [PANEL_LAYOUT only] build_layout_tree()
-                              └─ upsert_panel_layout (SQLite)
-                              
-                          tools/cable_match_viewer/
-                           └─ GET /api/document/{hash}/layout
+Loader → Document IR → ClassificationStage.run()
+                               │  classify → ctx.classification
+                               ▼
+                         TopologyStage.run()
+                          ├─ [CIRCUIT_LOOP only] Cabinet analysis
+                          ├─ Analyzer dispatch
+                          │   ├─ CircuitLoopAnalyzer (回路图)  ← V8 GeometryGraph
+                          │   ├─ TerminalStripAnalyzer (端子排图)
+                          │   └─ CableScheduleAnalyzer (电缆清册)
+                          └─ Batch SQLite write
+                              ↓
+                         LayoutStage.run()
+                          ├─ [PANEL_LAYOUT] build_layout_tree() → panel_layout (SQLite)
+                          └─ [PANEL_POSITION] build_position_tree() → panel_position (SQLite)
+
+                           tools/cable_match_viewer/
+                            ├─ GET /api/document/{hash}/layout
+                            └─ GET /api/document/{hash}/position
 ```
+
+**ClassificationStage** (`cable_engine/classifier/stage.py`):
+1. **Classify** document via `CompositeClassifier` → `ctx.classification`.
 
 `TopologyStage.run()` (`cable_engine/graph/builder.py`):
 
-1. **Classify** document via `CompositeClassifier`.
+1. **Read** `ctx.classification` (set by ClassificationStage).
 2. **Delete** existing topology + cabinet rows for this document hash.
 3. **Cabinet analysis** (circuit_loop only):
    - `CabinetRegionAnalyzer.analyze()` detects dashed-rectangle boundaries.
@@ -404,7 +410,7 @@ A stub analyzer for cable schedule documents (`CABLE_SCHEDULE` type). For each c
 
 ### 7.4 LayoutStage — Panel Layout Tree (屏面布置图) (V9)
 
-`LayoutStage` (`cable_engine/layout/stage.py`) runs **after** `TopologyStage` and only for `PANEL_LAYOUT` classified documents. It builds a hierarchical **LayoutTree** — a spatial containment tree capturing the physical structure of a panel face drawing — and persists it as JSON to the `panel_layout` table.
+`LayoutStage` (`cable_engine/layout/stage.py`) runs **after** `TopologyStage` and only processes documents whose `ctx.classification` is `PANEL_LAYOUT` or `PANEL_POSITION`. It builds a hierarchical **LayoutTree** — a spatial containment tree capturing panel structure — and persists it as JSON.
 
 ```
 LayoutStage.run(ctx)
@@ -921,7 +927,9 @@ cable_engine/
 │   ├── composite.py             # CompositeClassifier
 │   ├── keyword.py               # KeywordClassifier
 │   ├── geometry.py              # GeometryClassifier
-│   └── layout.py                # LayoutClassifier
+│   ├── layout.py                # LayoutClassifier
+│   ├── stage.py                 # ClassificationStage (early pipeline stage)
+│   └── base.py                  # BusinessType, Classification dataclass
 ├── electrical/                  # ← V8: GeometryGraph + Query
 │   ├── __init__.py              # Public API exports
 │   ├── geometry_graph.py        # GeometryGraph, GeoNode, GeoEdge,
@@ -1020,7 +1028,7 @@ tools/cable_match_viewer/
 | **Closest-tag resolution** | Iterate all candidate NO/ObjTerm.Name tags, pick shortest Euclidean distance to CIRCLE center — not spatial-lookup order (which is grid/insertion order). |
 | **`merge_close_nodes` by ID** | Lower-ID WIRE_VERTEX (created in Pass 3 after CIRCLE/TAG in Pass 2) merges into higher-ID TAG at same position. Merged node keeps TAG type but retains wire edges — CIRCLE connection step checks "has wire edges" not node_type. |
 | **Cabinet bbox tag filter** | When anchor circle is inside a cabinet, tags outside that cabinet's bbox are excluded — prevents picking up tags from neighboring cabinets on the same drawing. |
-| **LayoutStage after TopologyStage** | Layout tree needs classification decision first. Placing LayoutStage second avoids re-classifying in the detection pipeline. |
+| **ClassificationStage as separate early stage** | Classification is moved out of TopologyStage into an explicit early stage. Both TopologyStage and LayoutStage read `ctx.classification` — no re-classification needed. Adding a new downstream stage that depends on classification requires zero classifier code. |
 | **Area-based page-border rejection** | Page border rejection uses area ratio (>90%) not dimension-based (70% of max dimension). Prevents filtering of legitimate large cabinets that span most of the drawing. |
 | **Cabinet aspect-ratio filter (1.5-5.0)** | Cabinet faces are tall/narrow (h/w≈3:1); rejects page borders (h/w≈0.7) and wide inner frames. |
 | **Rect-based cabinet preferred over paired-vertical** | Merge picks rect-based when both sources produce overlapping candidates; paired-vertical is only fallback for open-face cabinets. |

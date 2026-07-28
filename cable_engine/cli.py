@@ -22,6 +22,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from cable_engine.classifier import ClassificationStage
 from cable_engine.graph import TopologyStage
 from cable_engine.ir import DocumentType
 from cable_engine.layout.stage import LayoutStage
@@ -58,12 +59,14 @@ def _discover_documents(input_dir: Path):
 
 
 def _pipeline_for(store: CableStore) -> Pipeline:
-    """V6 pipeline: Loader (already done) -> TopologyStage -> LayoutStage.
-    TopologyStage dispatches to the appropriate analyzer. LayoutStage
-    runs after classification is known so it only processes
-    panel_layout documents.
+    """Pipeline: ClassificationStage -> TopologyStage -> LayoutStage.
+
+    ClassificationStage classifies the Document and sets ctx.classification.
+    TopologyStage dispatches to the appropriate analyzer based on it.
+    LayoutStage builds layout/position trees only for PANEL_LAYOUT/PANEL_POSITION.
     """
     return Pipeline([
+        ClassificationStage(),
         TopologyStage(store),
         LayoutStage(store),
     ])

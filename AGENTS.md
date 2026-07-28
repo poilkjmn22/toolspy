@@ -38,6 +38,7 @@ Key change from V5/V6: V7.0 replaces all V6 fallback methods (icon y-bucket, geo
     - `document.py` — Document, DocumentType
   - `loaders/` — DWGLoader (dwgread -O JSON + ezdxf fallback)
   - `pipeline/` — Context + Stage + Pipeline
+  - `classifier/` — ClassificationStage (early stage, runs before TopologyStage)
   - `graph/` — V7.0 TopologyStage (replaces V5 GraphBuilderStage)
     - `builder.py` — `TopologyStage` + `CircuitLoopAnalyzer` with `_cabinet_path_trace`
     - `cabinet.py` — `CabinetRegionAnalyzer` + `CabinetGridIndex`

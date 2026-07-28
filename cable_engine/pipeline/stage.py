@@ -54,7 +54,7 @@ class Context:
     document: Any = None                     # cable_engine.ir.Document
 
     # ---------- V6.5 outputs ----------
-    # Business classification set by TopologyStage's DocumentClassifier.
+    # Business classification set by ClassificationStage (early stage).
     classification: Optional['Classification'] = None
 
     # ---------- LayoutTree (V8.5) ----------
@@ -84,8 +84,9 @@ class Context:
 class Stage(ABC):
     """Abstract base class. Subclass and implement `run`.
 
-    A Stage is a single-responsibility unit. Examples (V6):
-      - TopologyStage (Document IR -> cable_topology rows via dispatch).
+    A Stage is a single-responsibility unit. Examples:
+      - ClassificationStage (classify Document -> ctx.classification).
+      - TopologyStage (cable_topology rows via per-class analyzer dispatch).
 
     Each Stage's `run` method:
       - Reads from self.reads or ctx (whichever's clearer)

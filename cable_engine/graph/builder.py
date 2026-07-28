@@ -24,7 +24,7 @@ from ..ir import (
     DocumentType, GeometryEntity, LineGeometry, TextEntity,
 )
 from ..ir.entities import BBox, Point
-from ..classifier import CompositeClassifier, BusinessType, Classification
+from ..classifier import BusinessType
 from ..pipeline.stage import Context, Stage
 
 
@@ -678,9 +678,8 @@ class TopologyStage(Stage):
 
     name = 'topology_builder'
 
-    def __init__(self, store, classifier: Optional[CompositeClassifier] = None) -> None:
+    def __init__(self, store) -> None:
         self._store = store
-        self._classifier = classifier or CompositeClassifier()
 
     def run(self, ctx: Context) -> Context:
         doc = ctx.document
@@ -688,12 +687,12 @@ class TopologyStage(Stage):
             ctx.error_msg = 'no document to build topology from'
             return ctx
 
-        # V6.5: classify via the ensemble (replaces _classify_document).
-        classification = self._classifier.classify(doc)
-        doc.classification = classification
+        classification = ctx.classification
+        if classification is None:
+            ctx.error_msg = 'classification not set — run ClassificationStage first'
+            return ctx
         doc_type = classification.primary.value
         ctx.document_type = doc_type
-        ctx.classification = classification
 
         self._store.delete_topology_for_document(doc.content_hash)
 

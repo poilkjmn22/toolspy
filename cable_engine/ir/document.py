@@ -63,7 +63,7 @@ class Document:
     `entities` is the FLAT list of every entity extracted from the
     document (text, line, polyline, symbol, future YOLO detections).
 
-    `classification` (V6.5+) is set by TopologyStage's DocumentClassifier.
+    `classification` is set by ClassificationStage (pipeline stage).
     None until the classification stage runs.
     """
     document_type: DocumentType

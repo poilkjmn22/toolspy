@@ -34,6 +34,7 @@ from .keyword import KeywordClassifier
 from .geometry import GeometryClassifier
 from .layout import LayoutClassifier
 from .composite import CompositeClassifier
+from .stage import ClassificationStage
 
 
 def classify_document(doc) -> Classification:
@@ -50,5 +51,6 @@ __all__ = [
     'GeometryClassifier',
     'LayoutClassifier',
     'CompositeClassifier',
+    'ClassificationStage',
     'classify_document',
 ]
